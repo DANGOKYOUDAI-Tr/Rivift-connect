@@ -114,6 +114,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helve
 .toast i { font-size: 20px; }
 @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
     </style>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head>
 <body>
     <!-- アプリ全体のコンテナ -->
@@ -195,13 +196,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helve
     <div id="toast-container"></div>
 
 <script>
-// =======================================================================
-// アプリケーションの状態管理 (v3.1 Final Fix)
-// =======================================================================
-let currentUser = null; // { email, displayName, keys: { publicKey, privateKey }, icon }
-let activeConversation = null; // { partnerEmail, type: 'chat' | 'mail' }
+let currentUser = null;
+let activeConversation = null;
 const STAMPS = [ 'https://api.iconify.design/fluent-emoji/thumbs-up.svg', 'https://api.iconify.design/fluent-emoji/ok-hand.svg', 'https://api.iconify.design/fluent-emoji/smiling-face-with-heart-eyes.svg', 'https://api.iconify.design/fluent-emoji/rolling-on-the-floor-laughing.svg', 'https://api.iconify.design/fluent-emoji/face-with-tears-of-joy.svg', 'https://api.iconify.design/fluent-emoji/thinking-face.svg', 'https://api.iconify.design/fluent-emoji/partying-face.svg', 'https://api.iconify.design/fluent-emoji/rocket.svg' ];
 const NOTIFICATION_SOUND = new Audio('https://cdn.jsdelivr.net/gh/k-logic/sounds@main/misc/notification_high-intensity.wav');
+let hasUserInteracted = false;
 
 const DOM = {
     authView: document.getElementById('auth-view'), authForm: document.getElementById('auth-form'), authEmail: document.getElementById('auth-email'), authDisplayName: document.getElementById('auth-display-name'), authPassword: document.getElementById('auth-password'), authPasswordConfirm: document.getElementById('auth-password-confirm'), authBtn: document.getElementById('auth-btn'), authToggleLink: document.getElementById('auth-toggle-link'),
@@ -220,33 +219,43 @@ const DOM = {
     toastContainer: document.getElementById('toast-container'),
 };
 
-// =======================================================================
-// リアルタイム通信 (BroadcastChannel) - 修正版
-// =======================================================================
-const channel = new BroadcastChannel('rivift_connect_v7_final_fix');
-channel.onmessage = async ({ data: { type, payload } }) => {
-    if (!currentUser) return;
+const SERVER_URL = "https://rivift-connect-server.onrender.com";
+let socket;
 
-    if (type === 'db_updated' && payload.from !== currentUser.email) {
-        renderAllSidebars();
-        if (activeConversation && [payload.user1, payload.user2].includes(activeConversation.partnerEmail)) {
-            await startConversation(activeConversation.partnerEmail, 'chat', true);
-        }
-    } else if (type === 'private_message' && payload.to === currentUser.email) {
-        await handleIncomingMessage(payload);
-    } else if (type === 'read_receipt' && payload.to === currentUser.email) {
-        handleReadReceipt(payload);
+function connectToServer() {
+    if (socket && socket.connected) {
+        socket.emit('login', { email: currentUser.email });
+        return;
     }
-};
 
-function notifyDbUpdate(user1, user2 = null) {
-    renderAllSidebars();
-    channel.postMessage({ type: 'db_updated', payload: { from: currentUser.email, user1, user2 } });
+    socket = io(SERVER_URL);
+
+    socket.on("connect", () => {
+        console.log("サーバーに接続しました！ ID:", socket.id);
+        if (currentUser) {
+            socket.emit('login', { email: currentUser.email });
+        }
+    });
+
+    socket.on('private_message', async (payload) => {
+        if (currentUser && payload.to === currentUser.email) {
+            await handleIncomingMessage(payload);
+        }
+    });
+    
+    socket.on('read_receipt', (payload) => {
+        if (currentUser && payload.to === currentUser.email) {
+            handleReadReceipt(payload);
+        }
+    });
+
+    socket.on('db_updated_notification', (payload) => {
+        if (currentUser && payload.from !== currentUser.email) {
+            renderAllSidebars();
+        }
+    });
 }
 
-// =======================================================================
-// 暗号化コア機能
-// =======================================================================
 async function getKeyFromPassword(password, salt) { const encoder = new TextEncoder(); const keyMaterial = await window.crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']); return window.crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, keyMaterial, { "name": "AES-GCM", "length": 256 }, true, ["encrypt", "decrypt"]); }
 async function encryptWithPassword(password, dataToEncrypt) { const salt = window.crypto.getRandomValues(new Uint8Array(16)); const iv = window.crypto.getRandomValues(new Uint8Array(12)); const key = await getKeyFromPassword(password, salt); const encoder = new TextEncoder(); const encryptedData = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoder.encode(JSON.stringify(dataToEncrypt))); return { salt: arrayBufferToBase64(salt), iv: arrayBufferToBase64(iv), encryptedData: arrayBufferToBase64(encryptedData) }; }
 async function decryptWithPassword(password, encryptedPayload) { try { const salt = base64ToArrayBuffer(encryptedPayload.salt); const iv = base64ToArrayBuffer(encryptedPayload.iv); const encryptedData = base64ToArrayBuffer(encryptedPayload.encryptedData); const key = await getKeyFromPassword(password, salt); const decryptedData = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, encryptedData); const decoder = new TextDecoder(); return JSON.parse(decoder.decode(decryptedData)); } catch (e) { return null; } }
@@ -256,41 +265,15 @@ async function decryptMessagePayload(privateKey, encryptedMessage) { try { const
 function arrayBufferToBase64(buffer) { let binary = ''; const bytes = new Uint8Array(buffer); for (let i = 0; i < bytes.byteLength; i++) { binary += String.fromCharCode(bytes[i]); } return window.btoa(binary); }
 function base64ToArrayBuffer(base64) { const binary_string = window.atob(base64); const len = binary_string.length; const bytes = new Uint8Array(len); for (let i = 0; i < len; i++) { bytes[i] = binary_string.charCodeAt(i); } return bytes.buffer; }
 
-// =======================================================================
-// データ管理 (localStorage) - 構造を修正
-// =======================================================================
-const DB_KEY = 'rivift_connect_data_v7_final_fix';
+const DB_KEY = 'rivift_connect_data_v8_online';
 function getDB() { return JSON.parse(localStorage.getItem(DB_KEY) || '{}'); }
 function saveDB(db) { localStorage.setItem(DB_KEY, JSON.stringify(db)); }
 
-async function createUser(email, displayName, password, icon) {
-    const db = getDB();
-    if (!db.users) db.users = {};
-    if (db.users[email]) return false;
-    const keys = await generateUserKeys();
-    const privateKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.privateKey);
-    const encryptedPrivateKeyPayload = await encryptWithPassword(password, privateKeyJwk);
-    const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.publicKey);
-    db.users[email] = { displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon, friends: [], requests: [], sentRequests: [] };
-    saveDB(db);
-    return true;
-}
-async function loginUser(email, password) {
-    const db = getDB();
-    const userData = db.users?.[email];
-    if (!userData) return null;
-    const privateKeyJwk = await decryptWithPassword(password, userData.encryptedPrivateKeyPayload);
-    if (!privateKeyJwk) return null;
-    const publicKey = await window.crypto.subtle.importKey("jwk", userData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
-    const privateKey = await window.crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"]);
-    return { email, displayName: userData.displayName, keys: { publicKey, privateKey }, icon: userData.icon };
-}
+async function createUser(email, displayName, password, icon) { const db = getDB(); if (!db.users) db.users = {}; if (db.users[email]) return false; const keys = await generateUserKeys(); const privateKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.privateKey); const encryptedPrivateKeyPayload = await encryptWithPassword(password, privateKeyJwk); const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.publicKey); db.users[email] = { displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon, friends: [], requests: [], sentRequests: [] }; saveDB(db); return true; }
+async function loginUser(email, password) { const db = getDB(); const userData = db.users?.[email]; if (!userData) return null; const privateKeyJwk = await decryptWithPassword(password, userData.encryptedPrivateKeyPayload); if (!privateKeyJwk) return null; const publicKey = await window.crypto.subtle.importKey("jwk", userData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]); const privateKey = await window.crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"]); return { email, displayName: userData.displayName, keys: { publicKey, privateKey }, icon: userData.icon }; }
 function getMessageHistory(user1, user2) { const db = getDB(); const chatID = [user1, user2].sort().join('__'); return db.chats?.[chatID] || []; }
 function saveMessageToHistory(user1, user2, message) { const db = getDB(); const chatID = [user1, user2].sort().join('__'); if (!db.chats) db.chats = {}; if (!db.chats[chatID]) db.chats[chatID] = []; db.chats[chatID].push(message); saveDB(db); }
 
-// =======================================================================
-// UI描画 & イベントハンドラ
-// =======================================================================
 function switchView(viewId) { DOM.authView.classList.toggle('active', viewId === 'auth-view'); DOM.mainView.classList.toggle('active', viewId === 'main-view'); }
 function switchContentView(viewId) { DOM.welcomeView.classList.toggle('active', viewId === 'welcome-view'); DOM.conversationView.classList.toggle('active', viewId === 'conversation-view'); }
 
@@ -311,7 +294,7 @@ DOM.authForm.onsubmit = async (e) => {
         showIconSelectionModal(email, displayName, password);
     } else {
         const user = await loginUser(email, password);
-        if (user) { currentUser = user; initializeAppUI(); } else { showToast('メールアドレスまたはパスワードが違います。', 'error'); }
+        if (user) { currentUser = user; connectToServer(); initializeAppUI(); } else { showToast('メールアドレスまたはパスワードが違います。', 'error'); }
     }
 };
 
@@ -325,7 +308,7 @@ function showIconSelectionModal(email, displayName, password) {
             await createUser(email, displayName, password, selectedIcon);
             closeModal();
             const user = await loginUser(email, password);
-            if (user) { currentUser = user; initializeAppUI(); showToast(`ようこそ、${displayName}さん！`, 'success'); }
+            if (user) { currentUser = user; connectToServer(); initializeAppUI(); showToast(`ようこそ、${displayName}さん！`, 'success'); }
         }}]
     });
     document.querySelectorAll('.default-icon').forEach(el => el.onclick = () => { document.querySelector('.default-icon.selected')?.classList.remove('selected'); el.classList.add('selected'); selectedIcon = el.dataset.icon; });
@@ -333,7 +316,7 @@ function showIconSelectionModal(email, displayName, password) {
 
 function initializeAppUI() { DOM.currentUserDisplayName.innerText = currentUser.displayName; DOM.currentUserIcon.style.backgroundImage = `url(${currentUser.icon || ''})`; renderAllSidebars(); switchView('main-view'); switchContentView('welcome-view'); }
 function renderAllSidebars() { renderContactList(); renderFriendRequests(); renderSentRequests(); }
-DOM.logoutBtn.onclick = () => { currentUser = null; activeConversation = null; switchView('auth-view'); DOM.authEmail.value = ''; DOM.authPassword.value = ''; };
+DOM.logoutBtn.onclick = () => { if (socket) socket.disconnect(); currentUser = null; activeConversation = null; switchView('auth-view'); DOM.authEmail.value = ''; DOM.authPassword.value = ''; };
 
 function renderContactList() {
     const db = getDB();
@@ -384,47 +367,25 @@ function renderSentRequests() {
 }
 
 DOM.addFriendBtn.onclick = () => showModal({ title: '友達を追加', content: `<input type="email" id="add-friend-email" placeholder="相手のメールアドレス">`, actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '送信', class: 'primary-btn', action: () => sendFriendRequest(document.getElementById('add-friend-email').value) }] });
-function sendFriendRequest(friendEmail) {
+async function sendFriendRequest(friendEmail) {
     if (!friendEmail || friendEmail === currentUser.email) return;
     const db = getDB();
     if (!db.users[friendEmail]) return showToast("そのユーザーは存在しません。", "error");
     if (db.users[currentUser.email].friends.includes(friendEmail)) return showToast("既に友達です。", "info");
     if (db.users[currentUser.email].sentRequests?.includes(friendEmail)) return showToast("既に申請を送信済みです。", "info");
-    db.users[friendEmail].requests = db.users[friendEmail].requests || [];
-    if (!db.users[friendEmail].requests.includes(currentUser.email)) {
-        db.users[friendEmail].requests.push(currentUser.email);
-        db.users[currentUser.email].sentRequests = db.users[currentUser.email].sentRequests || [];
-        db.users[currentUser.email].sentRequests.push(friendEmail);
-        saveDB(db);
-        notifyDbUpdate(currentUser.email, friendEmail);
-        showToast(`「${friendEmail}」に友達申請を送りました。`, "success");
-    }
+    
+    // サーバーに申請を送信
+    const publicKey = await window.crypto.subtle.exportKey("jwk", currentUser.keys.publicKey);
+    socket.emit('friend_request', {
+        from: { email: currentUser.email, displayName: currentUser.displayName, icon: currentUser.icon, publicKeyJwk: publicKey },
+        to: friendEmail
+    });
+    showToast(`「${friendEmail}」に友達申請を送りました。`, "success");
     closeModal();
 }
-function acceptRequest(fromEmail) {
-    const db = getDB();
-    db.users[currentUser.email].requests = db.users[currentUser.email].requests.filter(e => e !== fromEmail);
-    if (!db.users[currentUser.email].friends.includes(fromEmail)) db.users[currentUser.email].friends.push(fromEmail);
-    if (db.users[fromEmail] && !db.users[fromEmail].friends.includes(currentUser.email)) db.users[fromEmail].friends.push(currentUser.email);
-    if (db.users[fromEmail]) db.users[fromEmail].sentRequests = db.users[fromEmail].sentRequests?.filter(e => e !== currentUser.email);
-    saveDB(db);
-    notifyDbUpdate(currentUser.email, fromEmail);
-}
-function rejectRequest(fromEmail) {
-    const db = getDB();
-    db.users[currentUser.email].requests = db.users[currentUser.email].requests.filter(email => email !== fromEmail);
-    if (db.users[fromEmail]) db.users[fromEmail].sentRequests = db.users[fromEmail].sentRequests?.filter(e => e !== currentUser.email);
-    saveDB(db);
-    notifyDbUpdate(currentUser.email, fromEmail);
-}
-function cancelRequest(toEmail) {
-    const db = getDB();
-    db.users[currentUser.email].sentRequests = db.users[currentUser.email].sentRequests.filter(e => e !== toEmail);
-    if (db.users[toEmail]) db.users[toEmail].requests = db.users[toEmail].requests.filter(e => e !== currentUser.email);
-    saveDB(db);
-    notifyDbUpdate(currentUser.email, toEmail);
-    showToast('申請をキャンセルしました。', 'info');
-}
+function acceptRequest(fromEmail) { /* サーバー処理のため、クライアント側では不要 */ }
+function rejectRequest(fromEmail) { /* サーバー処理のため、クライアント側では不要 */ }
+function cancelRequest(toEmail) { /* サーバー処理のため、クライアント側では不要 */ }
 
 DOM.newMailBtn.onclick = () => showModal({ title: 'メールを作成', content: `<input type="email" id="mail-to" placeholder="宛先"><input type="text" id="mail-subject" placeholder="件名"><textarea id="mail-body" placeholder="本文"></textarea>`, actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '送信', class: 'primary-btn', action: sendMail } ] });
 async function sendMail() {
@@ -461,11 +422,7 @@ async function startConversation(partnerEmail, type, isRefresh = false) {
     for (const msg of history) {
         let body = null;
         const msgType = msg.from === currentUser.email ? 'sent' : 'received';
-
-        // ★★★ 修正点1：履歴のメッセージは全て自分用に暗号化されているので、自分の秘密鍵で復号する ★★★
-        if (msg.encryptedBodyForSelf) {
-            body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBodyForSelf));
-        }
+        body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBodyForSelf));
         
         if (body) {
             displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
@@ -494,31 +451,19 @@ async function sendMessage(type, content) {
 
     const messagePayload = { type, content };
     
-    // ★★★ 修正点2：相手用と自分用に2回暗号化する ★★★
     const recipientPublicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
     const encryptedBodyForRecipient = await encryptMessage(recipientPublicKey, messagePayload);
-    
-    // 自分自身の公開鍵で、自分が見るための履歴を暗号化
     const encryptedBodyForSelf = await encryptMessage(currentUser.keys.publicKey, messagePayload);
     
-    const msgForRecipient = {
+    const msg = {
         id: Date.now(), from: currentUser.email, to: partnerEmail,
         encryptedBody: arrayBufferToBase64(encryptedBodyForRecipient),
         timestamp: Date.now()
     };
     
-    channel.postMessage({ type: 'private_message', payload: msgForRecipient });
-    displayMessage(currentUser.email, messagePayload, 'sent', false, msgForRecipient.timestamp, msgForRecipient.id);
-    
-    // ★★★ 修正点3：DBには自分用の暗号化データを保存 ★★★
-    saveMessageToHistory(currentUser.email, partnerEmail, { 
-        from: msgForRecipient.from,
-        to: msgForRecipient.to,
-        id: msgForRecipient.id,
-        timestamp: msgForRecipient.timestamp,
-        encryptedBodyForSelf: arrayBufferToBase64(encryptedBodyForSelf),
-        read: true // 自分が送ったものは常に既読
-    });
+    socket.emit('private_message', msg);
+    displayMessage(currentUser.email, messagePayload, 'sent', false, msg.timestamp, msg.id);
+    saveMessageToHistory(currentUser.email, partnerEmail, { ...msg, encryptedBodyForSelf: arrayBufferToBase64(encryptedBodyForSelf), read: true });
 
     if (type === 'text') DOM.messageInput.value = '';
 }
@@ -526,32 +471,25 @@ async function sendMessage(type, content) {
 async function handleIncomingMessage(payload) {
     const db = getDB();
     const fromEmail = payload.from;
-    
     const decryptedPayload = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(payload.encryptedBody));
     if (!decryptedPayload) return;
 
     if (decryptedPayload.type === 'mail') {
         showToast(`新着メール from ${db.users[fromEmail]?.displayName || fromEmail}: ${decryptedPayload.content.subject}`, 'info');
-        NOTIFICATION_SOUND.play();
+        if(hasUserInteracted) NOTIFICATION_SOUND.play();
         return;
     }
     
     const isChatOpen = fromEmail === activeConversation?.partnerEmail;
-    
-    // ★★★ 修正点4：受信したメッセージも自分用に暗号化して保存する ★★★
     const encryptedBodyForSelf = await encryptMessage(currentUser.keys.publicKey, decryptedPayload);
-    saveMessageToHistory(fromEmail, payload.to, {
-        ...payload, 
-        encryptedBodyForSelf: arrayBufferToBase64(encryptedBodyForSelf),
-        read: isChatOpen
-    });
+    saveMessageToHistory(fromEmail, payload.to, { ...payload, encryptedBodyForSelf: arrayBufferToBase64(encryptedBodyForSelf), read: isChatOpen });
     
     if (isChatOpen) {
         displayMessage(fromEmail, decryptedPayload, 'received', false, payload.timestamp, payload.id);
         updateReadStatusInDB(fromEmail, true);
     } else {
         showToast(`新着メッセージ from ${db.users[fromEmail]?.displayName || fromEmail}`, 'info');
-        NOTIFICATION_SOUND.play();
+        if(hasUserInteracted) NOTIFICATION_SOUND.play();
     }
     renderContactList();
 }
@@ -559,22 +497,32 @@ async function handleIncomingMessage(payload) {
 function handleReadReceipt(payload) {
     if (payload.from === activeConversation?.partnerEmail) {
         document.querySelectorAll('.message.sent .read-status').forEach(el => { el.innerText = '既読'; });
-        updateReadStatusInDB(currentUser.email, payload.from, false);
+        updateReadStatusInDB(currentUser.email, payload.from, false, true);
     }
 }
 
-function updateReadStatusInDB(partner, shouldNotify = false) {
+function updateReadStatusInDB(partner, shouldNotify = false, isReceipt = false) {
     const db = getDB();
     const chatID = [currentUser.email, partner].sort().join('__');
     const history = db.chats?.[chatID] || [];
     let changed = false;
-    history.forEach(msg => { if (msg.to === currentUser.email && !msg.read) { msg.read = true; changed = true; } });
+    
+    const propertyToUpdate = isReceipt ? 'from' : 'to';
+    const emailToMatch = isReceipt ? partner : currentUser.email;
+
+    history.forEach(msg => { 
+        if (msg[propertyToUpdate] === emailToMatch && !msg.read) {
+            msg.read = true; 
+            changed = true; 
+        } 
+    });
+
     if (changed) {
         saveDB(db);
         if (shouldNotify) {
-            channel.postMessage({ type: 'read_receipt', payload: { from: currentUser.email, to: partner } });
+            socket.emit('read_receipt', { from: currentUser.email, to: partner });
         }
-        notifyDbUpdate(currentUser.email, partner);
+        renderContactList();
     }
 }
 
@@ -610,6 +558,7 @@ function displayMessage(from, body, type, read = false, timestamp, id = null) {
 
 function showModal({ title, content, actions }) { DOM.modalContent.innerHTML = `<h3>${title}</h3><div class="modal-body">${content}</div>`; const actionsEl = document.createElement('div'); actionsEl.className = 'modal-actions'; actions.forEach(a => { const btn = document.createElement('button'); btn.innerText = a.text; btn.className = a.class; btn.onclick = a.action; actionsEl.appendChild(btn); }); DOM.modalContent.appendChild(actionsEl); DOM.modalOverlay.classList.remove('hidden'); }
 function closeModal() { DOM.modalOverlay.classList.add('hidden'); }
+document.body.addEventListener('click', () => { hasUserInteracted = true; }, { once: true });
 DOM.modalOverlay.addEventListener('click', (e) => { if (e.target === DOM.modalOverlay) closeModal(); });
 
 DOM.currentUserIcon.parentElement.addEventListener('click', () => {

@@ -1,50 +1,74 @@
-// server.js
-
-// 必要な部品をインポートする
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 
-// Expressアプリを作成
 const app = express();
 const server = http.createServer(app);
-
-// Socket.IOサーバーを作成
-const io = new Server(server, {
-    cors: {
-        origin: "*", // どのWebページからの接続も許可する（テスト用）
-        methods: ["GET", "POST"]
-    }
-});
-
-// サーバーが接続を待ち受ける「ポート」番号を決める
-// Renderみたいなサービスは自動でポートを決めてくれるので、それに従う
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 const PORT = process.env.PORT || 3000;
 
-// 「/」にアクセスがあったら、「Hello, Rivift Connect Server!」と表示する
-// これで、サーバーがちゃんと動いてるか確認できる
-app.get('/', (req, res) => {
-    res.send('<h1>Hello, Rivift Connect Server!</h1>');
-});
+// ★★★ サーバー内に、全ユーザー情報を記憶する「中央の電話帳」を用意する ★★★
+let db = {
+    users: {}, // { email: { displayName, icon, publicKeyJwk, friends:[], requests:[], sentRequests:[] } }
+    sockets: {} // { email: socketId }
+};
 
-// 誰かがサーバーに接続してきた時の処理
+app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.0 is Active!</h1>'));
+
 io.on('connection', (socket) => {
-    console.log('a user connected:', socket.id);
+    console.log('ユーザーが接続:', socket.id);
 
-    // クライアント（君のHTML）から 'private_message' という伝言が来たら
+    // ログイン時に、そのユーザーのemailとsocket.idを紐付ける
+    socket.on('login', (data) => {
+        console.log(`ログイン: ${data.email} as ${socket.id}`);
+        db.sockets[data.email] = socket.id;
+        socket.email = data.email; // socket自体にもemailを持たせる
+    });
+
+    // 友達申請を中継する
+    socket.on('friend_request', (payload) => {
+        const recipientSocketId = db.sockets[payload.to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('friend_request_received', payload);
+        }
+    });
+
+    // 申請承認を中継する
+    socket.on('request_accepted', (payload) => {
+        const recipientSocketId = db.sockets[payload.to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('request_accepted_notification', payload);
+        }
+    });
+    
+    // ★★★ サーバーがメッセージを中継する処理 ★★★
     socket.on('private_message', (payload) => {
-        // そのメッセージを、指定された相手にだけ送り返す
-        // to: 相手のsocket.id, payload: メッセージ本体
-        io.to(payload.to).emit('private_message', payload);
+        const recipientSocketId = db.sockets[payload.to];
+        if (recipientSocketId) {
+            // 送信者と、暗号化されたメッセージをそのまま相手に送る
+            io.to(recipientSocketId).emit('private_message', {
+                from: payload.from,
+                encryptedBody: payload.encryptedBody,
+                timestamp: payload.timestamp
+            });
+        }
     });
 
-    // 誰かが接続を切った時の処理
+    // 既読情報を中継する
+    socket.on('read_receipt', (payload) => {
+        const recipientSocketId = db.sockets[payload.to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('read_receipt', { from: payload.from });
+        }
+    });
+
+    // 接続が切れたら、電話帳から削除
     socket.on('disconnect', () => {
-        console.log('user disconnected:', socket.id);
+        console.log('ユーザーが切断:', socket.id);
+        if (socket.email) {
+            delete db.sockets[socket.email];
+        }
     });
 });
 
-// サーバーを起動する
-server.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
