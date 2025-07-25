@@ -196,8 +196,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helve
     <div id="toast-container"></div>
 
 <script>
-let currentUser = null;
-let activeConversation = null;
+// =======================================================================
+// アプリケーションの状態管理 (v3.1 Final Fix)
+// =======================================================================
+let currentUser = null; // { email, displayName, keys: { publicKey, privateKey }, icon }
+let activeConversation = null; // { partnerEmail, type: 'chat' | 'mail' }
 const STAMPS = [ 'https://api.iconify.design/fluent-emoji/thumbs-up.svg', 'https://api.iconify.design/fluent-emoji/ok-hand.svg', 'https://api.iconify.design/fluent-emoji/smiling-face-with-heart-eyes.svg', 'https://api.iconify.design/fluent-emoji/rolling-on-the-floor-laughing.svg', 'https://api.iconify.design/fluent-emoji/face-with-tears-of-joy.svg', 'https://api.iconify.design/fluent-emoji/thinking-face.svg', 'https://api.iconify.design/fluent-emoji/partying-face.svg', 'https://api.iconify.design/fluent-emoji/rocket.svg' ];
 const NOTIFICATION_SOUND = new Audio('https://cdn.jsdelivr.net/gh/k-logic/sounds@main/misc/notification_high-intensity.wav');
 let hasUserInteracted = false;
@@ -219,46 +222,34 @@ const DOM = {
     toastContainer: document.getElementById('toast-container'),
 };
 
-const SERVER_URL = "https://rivift-connect-server.onrender.com";
-let socket;
+// =======================================================================
+// リアルタイム通信 (BroadcastChannel) - 修正版
+// =======================================================================
+const channel = new BroadcastChannel('rivift_connect_v7_final_fix');
+channel.onmessage = async ({ data: { type, payload } }) => {
+    if (!currentUser) return;
 
-function connectToServer() {
-    if (socket && socket.connected) {
-        socket.emit('login', { email: currentUser.email });
-        return;
+    if (type === 'db_updated' && payload.from !== currentUser.email) {
+        await refreshCurrentUserState();
+        renderAllSidebars();
+        if (activeConversation && [payload.user1, payload.user2].includes(activeConversation.partnerEmail)) {
+            await startConversation(activeConversation.partnerEmail, 'chat', true);
+        }
+    } else if (type === 'private_message' && payload.to === currentUser.email) {
+        await handleIncomingMessage(payload);
+    } else if (type === 'read_receipt' && payload.to === currentUser.email) {
+        handleReadReceipt(payload);
     }
-    socket = io(SERVER_URL);
+};
 
-    socket.on("connect", () => {
-        console.log("サーバーに接続しました！ ID:", socket.id);
-        if (currentUser) {
-            socket.emit('login', { email: currentUser.email });
-        }
-    });
-
-    socket.on('private_message', async (payload) => {
-        if (currentUser && payload.from !== currentUser.email) {
-            await handleIncomingMessage(payload);
-        }
-    });
-    
-    socket.on('read_receipt', (payload) => {
-        if (currentUser && payload.from !== currentUser.email) {
-            handleReadReceipt(payload);
-        }
-    });
-
-    socket.on('db_updated_notification', async () => {
-        if (currentUser) {
-            await refreshCurrentUserState();
-            renderAllSidebars();
-            if (activeConversation) {
-                await startConversation(activeConversation.partnerEmail, 'chat', true);
-            }
-        }
-    });
+function notifyDbUpdate(user1, user2 = null) {
+    renderAllSidebars();
+    channel.postMessage({ type: 'db_updated', payload: { from: currentUser.email, user1, user2 } });
 }
 
+// =======================================================================
+// 暗号化コア機能
+// =======================================================================
 async function getKeyFromPassword(password, salt) { const encoder = new TextEncoder(); const keyMaterial = await window.crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']); return window.crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, keyMaterial, { "name": "AES-GCM", "length": 256 }, true, ["encrypt", "decrypt"]); }
 async function encryptWithPassword(password, dataToEncrypt) { const salt = window.crypto.getRandomValues(new Uint8Array(16)); const iv = window.crypto.getRandomValues(new Uint8Array(12)); const key = await getKeyFromPassword(password, salt); const encoder = new TextEncoder(); const encryptedData = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoder.encode(JSON.stringify(dataToEncrypt))); return { salt: arrayBufferToBase64(salt), iv: arrayBufferToBase64(iv), encryptedData: arrayBufferToBase64(encryptedData) }; }
 async function decryptWithPassword(password, encryptedPayload) { try { const salt = base64ToArrayBuffer(encryptedPayload.salt); const iv = base64ToArrayBuffer(encryptedPayload.iv); const encryptedData = base64ToArrayBuffer(encryptedPayload.encryptedData); const key = await getKeyFromPassword(password, salt); const decryptedData = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, encryptedData); const decoder = new TextDecoder(); return JSON.parse(decoder.decode(decryptedData)); } catch (e) { return null; } }
@@ -268,64 +259,62 @@ async function decryptMessagePayload(privateKey, encryptedMessage) { try { const
 function arrayBufferToBase64(buffer) { let binary = ''; const bytes = new Uint8Array(buffer); for (let i = 0; i < bytes.byteLength; i++) { binary += String.fromCharCode(bytes[i]); } return window.btoa(binary); }
 function base64ToArrayBuffer(base64) { const binary_string = window.atob(base64); const len = binary_string.length; const bytes = new Uint8Array(len); for (let i = 0; i < len; i++) { bytes[i] = binary_string.charCodeAt(i); } return bytes.buffer; }
 
-async function api(endpoint, payload) {
-    try {
-        const res = await fetch(`${SERVER_URL}/${endpoint}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        if (!res.ok) throw new Error(`API Error: ${res.statusText}`);
-        return res.json();
-    } catch (error) {
-        console.error(`API call to ${endpoint} failed:`, error);
-        showToast("サーバーとの通信に失敗しました。", "error");
-        return null;
-    }
-}
+// =======================================================================
+// データ管理 (localStorage) - 構造を修正
+// =======================================================================
+const DB_KEY = 'rivift_connect_data_v8_final';
+function getDB() { return JSON.parse(localStorage.getItem(DB_KEY) || '{}'); }
+function saveDB(db) { localStorage.setItem(DB_KEY, JSON.stringify(db)); }
 
-async function refreshCurrentUserState() {
-    if (!currentUser) return;
-    const result = await api('getUserData', { email: currentUser.email });
-    if (result && result.userData) {
-        currentUser.friends = result.userData.friends;
-        currentUser.requests = result.userData.requests;
-        currentUser.sentRequests = result.userData.sentRequests;
-        currentUser.displayName = result.userData.displayName;
-        currentUser.icon = result.userData.icon;
-    }
+async function createUser(email, displayName, password, icon) {
+    const db = getDB();
+    if (!db.users) db.users = {};
+    if (db.users[email]) return false;
+    const keys = await generateUserKeys();
+    const privateKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.privateKey);
+    const encryptedPrivateKeyPayload = await encryptWithPassword(password, privateKeyJwk);
+    const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.publicKey);
+    db.users[email] = { displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon, friends: [], requests: [], sentRequests: [] };
+    saveDB(db);
+    return true;
 }
+async function loginUser(email, password) {
+    const db = getDB();
+    const userData = db.users?.[email];
+    if (!userData) return null;
+    const privateKeyJwk = await decryptWithPassword(password, userData.encryptedPrivateKeyPayload);
+    if (!privateKeyJwk) return null;
+    const publicKey = await window.crypto.subtle.importKey("jwk", userData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
+    const privateKey = await window.crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"]);
+    return { email, displayName: userData.displayName, keys: { publicKey, privateKey }, icon: userData.icon };
+}
+function getMessageHistory(user1, user2) { const db = getDB(); const chatID = [user1, user2].sort().join('__'); return db.chats?.[chatID] || []; }
+function saveMessageToHistory(user1, user2, message) { const db = getDB(); const chatID = [user1, user2].sort().join('__'); if (!db.chats) db.chats = {}; if (!db.chats[chatID]) db.chats[chatID] = []; db.chats[chatID].push(message); saveDB(db); }
 
+// =======================================================================
+// UI描画 & イベントハンドラ
+// =======================================================================
 function switchView(viewId) { DOM.authView.classList.toggle('active', viewId === 'auth-view'); DOM.mainView.classList.toggle('active', viewId === 'main-view'); }
 function switchContentView(viewId) { DOM.welcomeView.classList.toggle('active', viewId === 'welcome-view'); DOM.conversationView.classList.toggle('active', viewId === 'conversation-view'); }
 
 let isRegisterMode = false;
 DOM.authToggleLink.onclick = (e) => { e.preventDefault(); isRegisterMode = !isRegisterMode; DOM.authDisplayName.classList.toggle('hidden', !isRegisterMode); DOM.authPasswordConfirm.classList.toggle('hidden', !isRegisterMode); DOM.authBtn.innerText = isRegisterMode ? '新規作成' : 'ログイン'; DOM.authToggleLink.innerText = isRegisterMode ? 'ログイン画面へ' : 'アカウントを新規作成'; };
-
 DOM.authForm.onsubmit = async (e) => {
     e.preventDefault();
     const email = DOM.authEmail.value;
     const password = DOM.authPassword.value;
     if (!email || !password) return;
     if (isRegisterMode) {
-        const result = await api('getUserData', { email });
-        if (result && result.userData) return showToast("このメールアドレスは既に使用されています。", "error");
+        const db = getDB();
+        if (db.users && db.users[email]) return showToast("このメールアドレスは既に使用されています。", "error");
         const displayName = DOM.authDisplayName.value;
         const confirmPass = DOM.authPasswordConfirm.value;
         if (!displayName) return showToast('表示名を入力してください。', 'error');
         if (password !== confirmPass) return showToast('パスワードが一致しません。', 'error');
         showIconSelectionModal(email, displayName, password);
     } else {
-        const { userData } = await api('getUserData', { email });
-        if (!userData) return showToast('メールアドレスまたはパスワードが違います。', 'error');
-        const privateKeyJwk = await decryptWithPassword(password, userData.encryptedPrivateKeyPayload);
-        if (!privateKeyJwk) return showToast('メールアドレスまたはパスワードが違います。', 'error');
-
-        const publicKey = await window.crypto.subtle.importKey("jwk", userData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
-        const privateKey = await window.crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"]);
-        currentUser = { email, displayName: userData.displayName, keys: { publicKey, privateKey }, icon: userData.icon, friends: userData.friends, requests: userData.requests, sentRequests: userData.sentRequests };
-        connectToServer();
-        initializeAppUI();
+        const user = await loginUser(email, password);
+        if (user) { currentUser = user; initializeAppUI(); } else { showToast('メールアドレスまたはパスワードが違います。', 'error'); }
     }
 };
 
@@ -336,21 +325,10 @@ function showIconSelectionModal(email, displayName, password) {
     showModal({
         title: 'アイコンを選択', content: `<div id="icon-select-grid">${iconGridHtml}</div>`,
         actions: [{ text: '作成完了', class: 'primary-btn', action: async () => {
-            const keys = await generateUserKeys();
-            const privateKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.privateKey);
-            const encryptedPrivateKeyPayload = await encryptWithPassword(password, privateKeyJwk);
-            const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.publicKey);
-            
-            const result = await api('createUser', { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon: selectedIcon });
-            if (result && result.success) {
-                closeModal();
-                showToast(`ようこそ、${displayName}さん！ログインしてください。`, 'success');
-                DOM.authEmail.value = email;
-                DOM.authPassword.value = '';
-                DOM.authToggleLink.click();
-            } else {
-                showToast("アカウント作成に失敗しました。", "error");
-            }
+            await createUser(email, displayName, password, selectedIcon);
+            closeModal();
+            const user = await loginUser(email, password);
+            if (user) { currentUser = user; initializeAppUI(); showToast(`ようこそ、${displayName}さん！`, 'success'); }
         }}]
     });
     document.querySelectorAll('.default-icon').forEach(el => el.onclick = () => { document.querySelector('.default-icon.selected')?.classList.remove('selected'); el.classList.add('selected'); selectedIcon = el.dataset.icon; });
@@ -358,79 +336,135 @@ function showIconSelectionModal(email, displayName, password) {
 
 function initializeAppUI() { DOM.currentUserDisplayName.innerText = currentUser.displayName; DOM.currentUserIcon.style.backgroundImage = `url(${currentUser.icon || ''})`; renderAllSidebars(); switchView('main-view'); switchContentView('welcome-view'); }
 function renderAllSidebars() { renderContactList(); renderFriendRequests(); renderSentRequests(); }
-DOM.logoutBtn.onclick = () => { if (socket) socket.disconnect(); currentUser = null; activeConversation = null; switchView('auth-view'); DOM.authEmail.value = ''; DOM.authPassword.value = ''; };
+DOM.logoutBtn.onclick = () => { currentUser = null; activeConversation = null; switchView('auth-view'); DOM.authEmail.value = ''; DOM.authPassword.value = ''; };
 
-async function renderContactList() {
-    if (!currentUser?.friends) return;
-    const { usersData } = await api('getUsersData', { emails: currentUser.friends });
+async function refreshCurrentUserState() {
+    const db = getDB();
+    const userData = db.users?.[currentUser.email];
+    if (userData) {
+        currentUser.friends = userData.friends;
+        currentUser.requests = userData.requests;
+        currentUser.sentRequests = userData.sentRequests;
+        currentUser.displayName = userData.displayName;
+        currentUser.icon = userData.icon;
+    }
+}
+
+function renderContactList() {
+    const db = getDB();
+    if (!db.users?.[currentUser.email]) return;
+    const friends = db.users[currentUser.email].friends || [];
     DOM.contactList.innerHTML = '';
-    for (const email in usersData) {
-        const friendData = usersData[email];
+    friends.forEach(email => {
+        const friendData = db.users[email];
+        if (!friendData) return;
+        const history = getMessageHistory(currentUser.email, email);
+        const unreadCount = history.filter(msg => msg.to === currentUser.email && !msg.read).length;
         const li = document.createElement('li');
         li.dataset.email = email;
         li.innerHTML = `<div class="profile-icon" style="background-image: url(${friendData.icon || ''})"></div>
-            <div class="contact-info"><span class="display-name">${friendData.displayName}</span><span class="last-message"></span></div>`;
+            <div class="contact-info"><span class="display-name">${friendData.displayName}</span><span class="last-message"></span></div>
+            ${unreadCount > 0 ? `<span class="unread-badge">${unreadCount}</span>` : ''}`;
         if (activeConversation?.partnerEmail === email) li.classList.add('active');
         li.onclick = () => startConversation(email, 'chat');
         DOM.contactList.appendChild(li);
-    }
+    });
 }
-async function renderFriendRequests() {
-    if (!currentUser?.requests) return;
-    DOM.requestsBadge.classList.toggle('visible', currentUser.requests.length > 0);
-    DOM.requestsBadge.innerText = currentUser.requests.length || '';
+function renderFriendRequests() {
+    const db = getDB();
+    if (!db.users?.[currentUser.email]) return;
+    const requests = db.users[currentUser.email].requests || [];
+    DOM.requestsBadge.classList.toggle('visible', requests.length > 0);
+    DOM.requestsBadge.innerText = requests.length || '';
     DOM.requestList.innerHTML = '';
-    if (currentUser.requests.length > 0) {
-        const { usersData } = await api('getUsersData', { emails: currentUser.requests });
-        for (const fromEmail in usersData) {
-            const li = document.createElement('li');
-            li.innerHTML = `<span>${usersData[fromEmail].displayName}</span><div class="request-actions"><button class="accept-btn" title="承認"><i class="fa-solid fa-circle-check"></i></button><button class="reject-btn" title="拒否"><i class="fa-solid fa-circle-xmark"></i></button></div>`;
-            li.querySelector('.accept-btn').onclick = () => socket.emit('accept_friend_request', { from: currentUser.email, to: fromEmail });
-            li.querySelector('.reject-btn').onclick = () => socket.emit('reject_friend_request', { from: currentUser.email, to: fromEmail });
-            DOM.requestList.appendChild(li);
-        }
-    }
+    requests.forEach(fromEmail => {
+        const li = document.createElement('li');
+        li.innerHTML = `<span>${db.users[fromEmail]?.displayName || fromEmail}</span><div class="request-actions"><button class="accept-btn" title="承認"><i class="fa-solid fa-circle-check"></i></button><button class="reject-btn" title="拒否"><i class="fa-solid fa-circle-xmark"></i></button></div>`;
+        li.querySelector('.accept-btn').onclick = () => acceptRequest(fromEmail);
+        li.querySelector('.reject-btn').onclick = () => rejectRequest(fromEmail);
+        DOM.requestList.appendChild(li);
+    });
 }
-async function renderSentRequests() {
-    if (!currentUser?.sentRequests) return;
+function renderSentRequests() {
+    const db = getDB();
+    if (!db.users?.[currentUser.email]) return;
+    const sentRequests = db.users[currentUser.email].sentRequests || [];
     DOM.sentRequestList.innerHTML = '';
-    if (currentUser.sentRequests.length > 0) {
-        const { usersData } = await api('getUsersData', { emails: currentUser.sentRequests });
-        for (const toEmail in usersData) {
-            const li = document.createElement('li');
-            li.innerHTML = `<span>${usersData[toEmail].displayName}</span><div class="request-actions"><button class="cancel-btn" title="キャンセル"><i class="fa-solid fa-trash-can"></i></button></div>`;
-            li.querySelector('.cancel-btn').onclick = () => socket.emit('cancel_friend_request', { from: currentUser.email, to: toEmail });
-            DOM.sentRequestList.appendChild(li);
-        }
-    }
+    sentRequests.forEach(toEmail => {
+        const li = document.createElement('li');
+        li.innerHTML = `<span>${db.users[toEmail]?.displayName || toEmail}</span><div class="request-actions"><button class="cancel-btn" title="キャンセル"><i class="fa-solid fa-trash-can"></i></button></div>`;
+        li.querySelector('.cancel-btn').onclick = () => cancelRequest(toEmail);
+        DOM.sentRequestList.appendChild(li);
+    });
 }
 
 DOM.addFriendBtn.onclick = () => showModal({ title: '友達を追加', content: `<input type="email" id="add-friend-email" placeholder="相手のメールアドレス">`, actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '送信', class: 'primary-btn', action: () => sendFriendRequest(document.getElementById('add-friend-email').value) }] });
-async function sendFriendRequest(friendEmail) {
+function sendFriendRequest(friendEmail) {
     if (!friendEmail || friendEmail === currentUser.email) return;
-    const { userData } = await api('getUserData', { email: friendEmail });
-    if (!userData) return showToast("そのユーザーは存在しません。", "error");
-    if (currentUser.friends.includes(friendEmail)) return showToast("既に友達です。", "info");
-    if (currentUser.sentRequests?.includes(friendEmail)) return showToast("既に申請を送信済みです。", "info");
-    
-    socket.emit('send_friend_request', { from: currentUser.email, to: friendEmail });
-    
-    currentUser.sentRequests.push(friendEmail);
-    renderSentRequests();
-
-    showToast(`「${friendEmail}」に友達申請を送りました。`, "success");
+    const db = getDB();
+    if (!db.users[friendEmail]) return showToast("そのユーザーは存在しません。", "error");
+    if (db.users[currentUser.email].friends.includes(friendEmail)) return showToast("既に友達です。", "info");
+    if (db.users[currentUser.email].sentRequests?.includes(friendEmail)) return showToast("既に申請を送信済みです。", "info");
+    db.users[friendEmail].requests = db.users[friendEmail].requests || [];
+    if (!db.users[friendEmail].requests.includes(currentUser.email)) {
+        db.users[friendEmail].requests.push(currentUser.email);
+        db.users[currentUser.email].sentRequests = db.users[currentUser.email].sentRequests || [];
+        db.users[currentUser.email].sentRequests.push(friendEmail);
+        saveDB(db);
+        notifyDbUpdate(currentUser.email, friendEmail);
+        showToast(`「${friendEmail}」に友達申請を送りました。`, "success");
+    }
     closeModal();
+}
+function acceptRequest(fromEmail) {
+    const db = getDB();
+    db.users[currentUser.email].requests = db.users[currentUser.email].requests.filter(e => e !== fromEmail);
+    if (!db.users[currentUser.email].friends.includes(fromEmail)) db.users[currentUser.email].friends.push(fromEmail);
+    if (db.users[fromEmail] && !db.users[fromEmail].friends.includes(currentUser.email)) db.users[fromEmail].friends.push(currentUser.email);
+    if (db.users[fromEmail]) db.users[fromEmail].sentRequests = db.users[fromEmail].sentRequests?.filter(e => e !== currentUser.email);
+    saveDB(db);
+    notifyDbUpdate(currentUser.email, fromEmail);
+}
+function rejectRequest(fromEmail) {
+    const db = getDB();
+    db.users[currentUser.email].requests = db.users[currentUser.email].requests.filter(email => email !== fromEmail);
+    if (db.users[fromEmail]) db.users[fromEmail].sentRequests = db.users[fromEmail].sentRequests?.filter(e => e !== currentUser.email);
+    saveDB(db);
+    notifyDbUpdate(currentUser.email, fromEmail);
+}
+function cancelRequest(toEmail) {
+    const db = getDB();
+    db.users[currentUser.email].sentRequests = db.users[currentUser.email].sentRequests.filter(e => e !== toEmail);
+    if (db.users[toEmail]) db.users[toEmail].requests = db.users[toEmail].requests.filter(e => e !== currentUser.email);
+    saveDB(db);
+    notifyDbUpdate(currentUser.email, toEmail);
+    showToast('申請をキャンセルしました。', 'info');
 }
 
 DOM.newMailBtn.onclick = () => showModal({ title: 'メールを作成', content: `<input type="email" id="mail-to" placeholder="宛先"><input type="text" id="mail-subject" placeholder="件名"><textarea id="mail-body" placeholder="本文"></textarea>`, actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '送信', class: 'primary-btn', action: sendMail } ] });
-async function sendMail() { /* サーバー処理のため省略可能だが、念のため残す */ }
+async function sendMail() {
+    const to = document.getElementById('mail-to').value;
+    const subject = document.getElementById('mail-subject').value;
+    const body = document.getElementById('mail-body').value;
+    if (!to || !subject || !body) return showToast("全ての項目を入力してください。", "error");
+    const db = getDB();
+    const recipientData = db.users[to];
+    if (!recipientData) return showToast("宛先が見つかりません。", "error");
+    const publicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
+    const mailContent = { type: 'mail', subject, body };
+    const encryptedBody = await encryptMessage(publicKey, mailContent);
+    channel.postMessage({ type: 'private_message', payload: { from: currentUser.email, to, encryptedBody: arrayBufferToBase64(encryptedBody) } });
+    showToast(`「${to}」にメールを送信しました。`, "success");
+    closeModal();
+}
 
 async function startConversation(partnerEmail, type, isRefresh = false) {
     if (!isRefresh) {
         activeConversation = { partnerEmail, type };
     }
     renderContactList();
-    const { userData: partnerData } = await api('getUserData', { email: partnerEmail });
+    const db = getDB();
+    const partnerData = db.users[partnerEmail];
     if (!partnerData) return switchContentView('welcome-view');
 
     DOM.chatPartnerDisplayName.innerText = partnerData.displayName;
@@ -438,11 +472,12 @@ async function startConversation(partnerEmail, type, isRefresh = false) {
     switchContentView('conversation-view');
     DOM.messages.innerHTML = '';
     
-    const { history } = await api('getMessageHistory', { user1: currentUser.email, user2: partnerEmail });
+    const history = getMessageHistory(currentUser.email, partnerEmail);
     for (const msg of history) {
         let body = null;
         const msgType = msg.from === currentUser.email ? 'sent' : 'received';
-        body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBody));
+        
+        body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBodyForSelf));
         
         if (body) {
             displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
@@ -450,7 +485,7 @@ async function startConversation(partnerEmail, type, isRefresh = false) {
             displayMessage(msg.from, { type: 'text', content: '[このメッセージは表示できません]' }, msgType, msg.read, msg.timestamp, msg.id);
         }
     }
-    socket.emit('read_receipt', { from: currentUser.email, to: partnerEmail });
+    updateReadStatusInDB(partnerEmail, true);
 }
 
 DOM.messageForm.onsubmit = (e) => { e.preventDefault(); sendMessage('text', DOM.messageInput.value); };
@@ -465,65 +500,113 @@ async function sendMessage(type, content) {
     if (type === 'text' && content.trim() === '') return;
     
     const partnerEmail = activeConversation.partnerEmail;
-    const { userData: recipientData } = await api('getUserData', {email: partnerEmail});
+    const db = getDB();
+    const recipientData = db.users[partnerEmail];
     if (!recipientData) return showToast("送信先が見つかりません", "error");
 
     const messagePayload = { type, content };
-    const recipientPublicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
-    const encryptedBody = await encryptMessage(recipientPublicKey, messagePayload);
     
-    const msg = {
+    const recipientPublicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
+    const encryptedBodyForRecipient = await encryptMessage(recipientPublicKey, messagePayload);
+    
+    const msgForRecipient = {
         id: Date.now(), from: currentUser.email, to: partnerEmail,
-        encryptedBody: arrayBufferToBase64(encryptedBody),
+        encryptedBody: arrayBufferToBase64(encryptedBodyForRecipient),
         timestamp: Date.now()
     };
     
-    socket.emit('private_message', msg);
-    displayMessage(currentUser.email, messagePayload, 'sent', false, msg.timestamp, msg.id);
+    channel.postMessage({ type: 'private_message', payload: msgForRecipient });
+    displayMessage(currentUser.email, messagePayload, 'sent', false, msgForRecipient.timestamp, msgForRecipient.id);
+    
+    const encryptedBodyForSelf = await encryptMessage(currentUser.keys.publicKey, messagePayload);
+    saveMessageToHistory(currentUser.email, partnerEmail, { 
+        from: msgForRecipient.from,
+        to: msgForRecipient.to,
+        id: msgForRecipient.id,
+        timestamp: msgForRecipient.timestamp,
+        encryptedBodyForSelf: arrayBufferToBase64(encryptedBodyForSelf),
+        read: true 
+    });
+
     if (type === 'text') DOM.messageInput.value = '';
 }
 
 async function handleIncomingMessage(payload) {
+    const db = getDB();
     const fromEmail = payload.from;
+    
     const decryptedPayload = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(payload.encryptedBody));
     if (!decryptedPayload) return;
 
     if (decryptedPayload.type === 'mail') {
-        const { usersData } = await api('getUsersData', { emails: [fromEmail] });
-        showToast(`新着メール from ${usersData[fromEmail]?.displayName || fromEmail}: ${decryptedPayload.content.subject}`, 'info');
-        if (hasUserInteracted) NOTIFICATION_SOUND.play();
+        showToast(`新着メール from ${db.users[fromEmail]?.displayName || fromEmail}: ${decryptedPayload.content.subject}`, 'info');
+        if(hasUserInteracted) NOTIFICATION_SOUND.play();
         return;
     }
     
     const isChatOpen = fromEmail === activeConversation?.partnerEmail;
+    
+    const encryptedBodyForSelf = await encryptMessage(currentUser.keys.publicKey, decryptedPayload);
+    saveMessageToHistory(fromEmail, payload.to, {
+        ...payload, 
+        encryptedBodyForSelf: arrayBufferToBase64(encryptedBodyForSelf),
+        read: isChatOpen
+    });
+    
     if (isChatOpen) {
         displayMessage(fromEmail, decryptedPayload, 'received', false, payload.timestamp, payload.id);
-        socket.emit('read_receipt', { from: currentUser.email, to: fromEmail });
+        updateReadStatusInDB(fromEmail, true);
     } else {
-        const { usersData } = await api('getUsersData', { emails: [fromEmail] });
-        showToast(`新着メッセージ from ${usersData[fromEmail]?.displayName || fromEmail}`, 'info');
-        if (hasUserInteracted) NOTIFICATION_SOUND.play();
+        showToast(`新着メッセージ from ${db.users[fromEmail]?.displayName || fromEmail}`, 'info');
+        if(hasUserInteracted) NOTIFICATION_SOUND.play();
     }
     renderContactList();
 }
 
-async function handleReadReceipt(payload) {
+function handleReadReceipt(payload) {
     if (payload.from === activeConversation?.partnerEmail) {
         document.querySelectorAll('.message.sent .read-status').forEach(el => { el.innerText = '既読'; });
-        const { history } = await api('getMessageHistory', { user1: currentUser.email, user2: payload.from });
-        renderContactList();
+        updateReadStatusInDB(currentUser.email, payload.from, false, true);
     }
 }
 
-async function displayMessage(from, body, type, read = false, timestamp, id = null) {
+function updateReadStatusInDB(partner, shouldNotify = false, isReceipt = false) {
+    const db = getDB();
+    const chatID = [currentUser.email, partner].sort().join('__');
+    const history = db.chats?.[chatID] || [];
+    let changed = false;
+    
+    history.forEach(msg => {
+        // isReceiptがtrueなら、自分が送ったメッセージを既読にする
+        // falseなら、自分が受け取ったメッセージを既読にする
+        if (isReceipt) {
+            if (msg.from === currentUser.email && !msg.read) {
+                msg.read = true; changed = true;
+            }
+        } else {
+            if (msg.to === currentUser.email && !msg.read) {
+                msg.read = true; changed = true;
+            }
+        }
+    });
+
+    if (changed) {
+        saveDB(db);
+        if (shouldNotify) {
+            channel.postMessage({ type: 'read_receipt', payload: { from: currentUser.email, to: partner } });
+        }
+        // DB更新を自分の他のタブに通知する
+        notifyDbUpdate(currentUser.email, partner);
+    }
+}
+
+function displayMessage(from, body, type, read = false, timestamp, id = null) {
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${type}`;
     if (id) msgDiv.dataset.messageId = id;
-    
-    const { usersData } = await api('getUsersData', {emails: [from]});
-    const senderData = usersData[from];
+    const db = getDB();
+    const senderData = db.users[from];
     const senderIcon = (type === 'sent' ? currentUser.icon : senderData?.icon) || '';
-    
     let bubbleContent = '';
     if (typeof body !== 'object' || body === null) body = { type: 'text', content: '[メッセージ形式エラー]' };
 
@@ -563,23 +646,27 @@ DOM.currentUserIcon.parentElement.addEventListener('click', () => {
     fileInput.onchange = () => { if (fileInput.files && fileInput.files[0]) { const reader = new FileReader(); reader.onload = (e) => { preview.style.backgroundImage = `url(${e.target.result})`; preview.dataset.newIcon = e.target.result; }; reader.readAsDataURL(fileInput.files[0]); } };
 });
 
-async function saveProfile() {
+function saveProfile() {
+    const db = getDB();
     const newDisplayName = document.getElementById('profile-display-name').value;
     const preview = document.getElementById('icon-preview');
     const newIcon = preview.dataset.newIcon;
     let updated = false;
     if (newDisplayName && newDisplayName !== currentUser.displayName) {
+        db.users[currentUser.email].displayName = newDisplayName;
         currentUser.displayName = newDisplayName;
         DOM.currentUserDisplayName.innerText = newDisplayName;
         updated = true;
     }
     if (newIcon) {
+        db.users[currentUser.email].icon = newIcon;
         currentUser.icon = newIcon;
         DOM.currentUserIcon.style.backgroundImage = `url(${newIcon})`;
         updated = true;
     }
     if (updated) {
-        socket.emit('update_profile', {email: currentUser.email, newDisplayName, newIcon});
+        saveDB(db);
+        notifyDbUpdate(currentUser.email);
     }
     closeModal();
 }
