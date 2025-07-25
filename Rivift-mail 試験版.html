@@ -227,7 +227,6 @@ function connectToServer() {
         socket.emit('login', { email: currentUser.email });
         return;
     }
-
     socket = io(SERVER_URL);
 
     socket.on("connect", () => {
@@ -238,20 +237,24 @@ function connectToServer() {
     });
 
     socket.on('private_message', async (payload) => {
-        if (currentUser && payload.to === currentUser.email) {
+        if (currentUser && payload.from !== currentUser.email) {
             await handleIncomingMessage(payload);
         }
     });
     
     socket.on('read_receipt', (payload) => {
-        if (currentUser && payload.to === currentUser.email) {
+        if (currentUser && payload.from !== currentUser.email) {
             handleReadReceipt(payload);
         }
     });
 
-    socket.on('db_updated_notification', (payload) => {
-        if (currentUser && payload.from !== currentUser.email) {
+    socket.on('db_updated_notification', async () => {
+        if (currentUser) {
+            await refreshCurrentUserState();
             renderAllSidebars();
+            if (activeConversation) {
+                await startConversation(activeConversation.partnerEmail, 'chat', true);
+            }
         }
     });
 }
@@ -265,36 +268,64 @@ async function decryptMessagePayload(privateKey, encryptedMessage) { try { const
 function arrayBufferToBase64(buffer) { let binary = ''; const bytes = new Uint8Array(buffer); for (let i = 0; i < bytes.byteLength; i++) { binary += String.fromCharCode(bytes[i]); } return window.btoa(binary); }
 function base64ToArrayBuffer(base64) { const binary_string = window.atob(base64); const len = binary_string.length; const bytes = new Uint8Array(len); for (let i = 0; i < len; i++) { bytes[i] = binary_string.charCodeAt(i); } return bytes.buffer; }
 
-const DB_KEY = 'rivift_connect_data_v8_online';
-function getDB() { return JSON.parse(localStorage.getItem(DB_KEY) || '{}'); }
-function saveDB(db) { localStorage.setItem(DB_KEY, JSON.stringify(db)); }
+async function api(endpoint, payload) {
+    try {
+        const res = await fetch(`${SERVER_URL}/${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!res.ok) throw new Error(`API Error: ${res.statusText}`);
+        return res.json();
+    } catch (error) {
+        console.error(`API call to ${endpoint} failed:`, error);
+        showToast("サーバーとの通信に失敗しました。", "error");
+        return null;
+    }
+}
 
-async function createUser(email, displayName, password, icon) { const db = getDB(); if (!db.users) db.users = {}; if (db.users[email]) return false; const keys = await generateUserKeys(); const privateKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.privateKey); const encryptedPrivateKeyPayload = await encryptWithPassword(password, privateKeyJwk); const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.publicKey); db.users[email] = { displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon, friends: [], requests: [], sentRequests: [] }; saveDB(db); return true; }
-async function loginUser(email, password) { const db = getDB(); const userData = db.users?.[email]; if (!userData) return null; const privateKeyJwk = await decryptWithPassword(password, userData.encryptedPrivateKeyPayload); if (!privateKeyJwk) return null; const publicKey = await window.crypto.subtle.importKey("jwk", userData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]); const privateKey = await window.crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"]); return { email, displayName: userData.displayName, keys: { publicKey, privateKey }, icon: userData.icon }; }
-function getMessageHistory(user1, user2) { const db = getDB(); const chatID = [user1, user2].sort().join('__'); return db.chats?.[chatID] || []; }
-function saveMessageToHistory(user1, user2, message) { const db = getDB(); const chatID = [user1, user2].sort().join('__'); if (!db.chats) db.chats = {}; if (!db.chats[chatID]) db.chats[chatID] = []; db.chats[chatID].push(message); saveDB(db); }
+async function refreshCurrentUserState() {
+    if (!currentUser) return;
+    const result = await api('getUserData', { email: currentUser.email });
+    if (result && result.userData) {
+        currentUser.friends = result.userData.friends;
+        currentUser.requests = result.userData.requests;
+        currentUser.sentRequests = result.userData.sentRequests;
+        currentUser.displayName = result.userData.displayName;
+        currentUser.icon = result.userData.icon;
+    }
+}
 
 function switchView(viewId) { DOM.authView.classList.toggle('active', viewId === 'auth-view'); DOM.mainView.classList.toggle('active', viewId === 'main-view'); }
 function switchContentView(viewId) { DOM.welcomeView.classList.toggle('active', viewId === 'welcome-view'); DOM.conversationView.classList.toggle('active', viewId === 'conversation-view'); }
 
 let isRegisterMode = false;
 DOM.authToggleLink.onclick = (e) => { e.preventDefault(); isRegisterMode = !isRegisterMode; DOM.authDisplayName.classList.toggle('hidden', !isRegisterMode); DOM.authPasswordConfirm.classList.toggle('hidden', !isRegisterMode); DOM.authBtn.innerText = isRegisterMode ? '新規作成' : 'ログイン'; DOM.authToggleLink.innerText = isRegisterMode ? 'ログイン画面へ' : 'アカウントを新規作成'; };
+
 DOM.authForm.onsubmit = async (e) => {
     e.preventDefault();
     const email = DOM.authEmail.value;
     const password = DOM.authPassword.value;
     if (!email || !password) return;
     if (isRegisterMode) {
-        const db = getDB();
-        if (db.users && db.users[email]) return showToast("このメールアドレスは既に使用されています。", "error");
+        const result = await api('getUserData', { email });
+        if (result && result.userData) return showToast("このメールアドレスは既に使用されています。", "error");
         const displayName = DOM.authDisplayName.value;
         const confirmPass = DOM.authPasswordConfirm.value;
         if (!displayName) return showToast('表示名を入力してください。', 'error');
         if (password !== confirmPass) return showToast('パスワードが一致しません。', 'error');
         showIconSelectionModal(email, displayName, password);
     } else {
-        const user = await loginUser(email, password);
-        if (user) { currentUser = user; connectToServer(); initializeAppUI(); } else { showToast('メールアドレスまたはパスワードが違います。', 'error'); }
+        const { userData } = await api('getUserData', { email });
+        if (!userData) return showToast('メールアドレスまたはパスワードが違います。', 'error');
+        const privateKeyJwk = await decryptWithPassword(password, userData.encryptedPrivateKeyPayload);
+        if (!privateKeyJwk) return showToast('メールアドレスまたはパスワードが違います。', 'error');
+
+        const publicKey = await window.crypto.subtle.importKey("jwk", userData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
+        const privateKey = await window.crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"]);
+        currentUser = { email, displayName: userData.displayName, keys: { publicKey, privateKey }, icon: userData.icon, friends: userData.friends, requests: userData.requests, sentRequests: userData.sentRequests };
+        connectToServer();
+        initializeAppUI();
     }
 };
 
@@ -305,10 +336,21 @@ function showIconSelectionModal(email, displayName, password) {
     showModal({
         title: 'アイコンを選択', content: `<div id="icon-select-grid">${iconGridHtml}</div>`,
         actions: [{ text: '作成完了', class: 'primary-btn', action: async () => {
-            await createUser(email, displayName, password, selectedIcon);
-            closeModal();
-            const user = await loginUser(email, password);
-            if (user) { currentUser = user; connectToServer(); initializeAppUI(); showToast(`ようこそ、${displayName}さん！`, 'success'); }
+            const keys = await generateUserKeys();
+            const privateKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.privateKey);
+            const encryptedPrivateKeyPayload = await encryptWithPassword(password, privateKeyJwk);
+            const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.publicKey);
+            
+            const result = await api('createUser', { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon: selectedIcon });
+            if (result && result.success) {
+                closeModal();
+                showToast(`ようこそ、${displayName}さん！ログインしてください。`, 'success');
+                DOM.authEmail.value = email;
+                DOM.authPassword.value = '';
+                DOM.authToggleLink.click();
+            } else {
+                showToast("アカウント作成に失敗しました。", "error");
+            }
         }}]
     });
     document.querySelectorAll('.default-icon').forEach(el => el.onclick = () => { document.querySelector('.default-icon.selected')?.classList.remove('selected'); el.classList.add('selected'); selectedIcon = el.dataset.icon; });
@@ -318,99 +360,77 @@ function initializeAppUI() { DOM.currentUserDisplayName.innerText = currentUser.
 function renderAllSidebars() { renderContactList(); renderFriendRequests(); renderSentRequests(); }
 DOM.logoutBtn.onclick = () => { if (socket) socket.disconnect(); currentUser = null; activeConversation = null; switchView('auth-view'); DOM.authEmail.value = ''; DOM.authPassword.value = ''; };
 
-function renderContactList() {
-    const db = getDB();
-    if (!db.users?.[currentUser.email]) return;
-    const friends = db.users[currentUser.email].friends || [];
+async function renderContactList() {
+    if (!currentUser?.friends) return;
+    const { usersData } = await api('getUsersData', { emails: currentUser.friends });
     DOM.contactList.innerHTML = '';
-    friends.forEach(email => {
-        const friendData = db.users[email];
-        if (!friendData) return;
-        const history = getMessageHistory(currentUser.email, email);
-        const unreadCount = history.filter(msg => msg.to === currentUser.email && !msg.read).length;
+    for (const email in usersData) {
+        const friendData = usersData[email];
         const li = document.createElement('li');
         li.dataset.email = email;
         li.innerHTML = `<div class="profile-icon" style="background-image: url(${friendData.icon || ''})"></div>
-            <div class="contact-info"><span class="display-name">${friendData.displayName}</span><span class="last-message"></span></div>
-            ${unreadCount > 0 ? `<span class="unread-badge">${unreadCount}</span>` : ''}`;
+            <div class="contact-info"><span class="display-name">${friendData.displayName}</span><span class="last-message"></span></div>`;
         if (activeConversation?.partnerEmail === email) li.classList.add('active');
         li.onclick = () => startConversation(email, 'chat');
         DOM.contactList.appendChild(li);
-    });
+    }
 }
-function renderFriendRequests() {
-    const db = getDB();
-    if (!db.users?.[currentUser.email]) return;
-    const requests = db.users[currentUser.email].requests || [];
-    DOM.requestsBadge.classList.toggle('visible', requests.length > 0);
-    DOM.requestsBadge.innerText = requests.length || '';
+async function renderFriendRequests() {
+    if (!currentUser?.requests) return;
+    DOM.requestsBadge.classList.toggle('visible', currentUser.requests.length > 0);
+    DOM.requestsBadge.innerText = currentUser.requests.length || '';
     DOM.requestList.innerHTML = '';
-    requests.forEach(fromEmail => {
-        const li = document.createElement('li');
-        li.innerHTML = `<span>${db.users[fromEmail]?.displayName || fromEmail}</span><div class="request-actions"><button class="accept-btn" title="承認"><i class="fa-solid fa-circle-check"></i></button><button class="reject-btn" title="拒否"><i class="fa-solid fa-circle-xmark"></i></button></div>`;
-        li.querySelector('.accept-btn').onclick = () => acceptRequest(fromEmail);
-        li.querySelector('.reject-btn').onclick = () => rejectRequest(fromEmail);
-        DOM.requestList.appendChild(li);
-    });
+    if (currentUser.requests.length > 0) {
+        const { usersData } = await api('getUsersData', { emails: currentUser.requests });
+        for (const fromEmail in usersData) {
+            const li = document.createElement('li');
+            li.innerHTML = `<span>${usersData[fromEmail].displayName}</span><div class="request-actions"><button class="accept-btn" title="承認"><i class="fa-solid fa-circle-check"></i></button><button class="reject-btn" title="拒否"><i class="fa-solid fa-circle-xmark"></i></button></div>`;
+            li.querySelector('.accept-btn').onclick = () => socket.emit('accept_friend_request', { from: currentUser.email, to: fromEmail });
+            li.querySelector('.reject-btn').onclick = () => socket.emit('reject_friend_request', { from: currentUser.email, to: fromEmail });
+            DOM.requestList.appendChild(li);
+        }
+    }
 }
-function renderSentRequests() {
-    const db = getDB();
-    if (!db.users?.[currentUser.email]) return;
-    const sentRequests = db.users[currentUser.email].sentRequests || [];
+async function renderSentRequests() {
+    if (!currentUser?.sentRequests) return;
     DOM.sentRequestList.innerHTML = '';
-    sentRequests.forEach(toEmail => {
-        const li = document.createElement('li');
-        li.innerHTML = `<span>${db.users[toEmail]?.displayName || toEmail}</span><div class="request-actions"><button class="cancel-btn" title="キャンセル"><i class="fa-solid fa-trash-can"></i></button></div>`;
-        li.querySelector('.cancel-btn').onclick = () => cancelRequest(toEmail);
-        DOM.sentRequestList.appendChild(li);
-    });
+    if (currentUser.sentRequests.length > 0) {
+        const { usersData } = await api('getUsersData', { emails: currentUser.sentRequests });
+        for (const toEmail in usersData) {
+            const li = document.createElement('li');
+            li.innerHTML = `<span>${usersData[toEmail].displayName}</span><div class="request-actions"><button class="cancel-btn" title="キャンセル"><i class="fa-solid fa-trash-can"></i></button></div>`;
+            li.querySelector('.cancel-btn').onclick = () => socket.emit('cancel_friend_request', { from: currentUser.email, to: toEmail });
+            DOM.sentRequestList.appendChild(li);
+        }
+    }
 }
 
 DOM.addFriendBtn.onclick = () => showModal({ title: '友達を追加', content: `<input type="email" id="add-friend-email" placeholder="相手のメールアドレス">`, actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '送信', class: 'primary-btn', action: () => sendFriendRequest(document.getElementById('add-friend-email').value) }] });
 async function sendFriendRequest(friendEmail) {
     if (!friendEmail || friendEmail === currentUser.email) return;
-    const db = getDB();
-    if (!db.users[friendEmail]) return showToast("そのユーザーは存在しません。", "error");
-    if (db.users[currentUser.email].friends.includes(friendEmail)) return showToast("既に友達です。", "info");
-    if (db.users[currentUser.email].sentRequests?.includes(friendEmail)) return showToast("既に申請を送信済みです。", "info");
+    const { userData } = await api('getUserData', { email: friendEmail });
+    if (!userData) return showToast("そのユーザーは存在しません。", "error");
+    if (currentUser.friends.includes(friendEmail)) return showToast("既に友達です。", "info");
+    if (currentUser.sentRequests?.includes(friendEmail)) return showToast("既に申請を送信済みです。", "info");
     
-    // サーバーに申請を送信
-    const publicKey = await window.crypto.subtle.exportKey("jwk", currentUser.keys.publicKey);
-    socket.emit('friend_request', {
-        from: { email: currentUser.email, displayName: currentUser.displayName, icon: currentUser.icon, publicKeyJwk: publicKey },
-        to: friendEmail
-    });
+    socket.emit('send_friend_request', { from: currentUser.email, to: friendEmail });
+    
+    currentUser.sentRequests.push(friendEmail);
+    renderSentRequests();
+
     showToast(`「${friendEmail}」に友達申請を送りました。`, "success");
     closeModal();
 }
-function acceptRequest(fromEmail) { /* サーバー処理のため、クライアント側では不要 */ }
-function rejectRequest(fromEmail) { /* サーバー処理のため、クライアント側では不要 */ }
-function cancelRequest(toEmail) { /* サーバー処理のため、クライアント側では不要 */ }
 
 DOM.newMailBtn.onclick = () => showModal({ title: 'メールを作成', content: `<input type="email" id="mail-to" placeholder="宛先"><input type="text" id="mail-subject" placeholder="件名"><textarea id="mail-body" placeholder="本文"></textarea>`, actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '送信', class: 'primary-btn', action: sendMail } ] });
-async function sendMail() {
-    const to = document.getElementById('mail-to').value;
-    const subject = document.getElementById('mail-subject').value;
-    const body = document.getElementById('mail-body').value;
-    if (!to || !subject || !body) return showToast("全ての項目を入力してください。", "error");
-    const db = getDB();
-    const recipientData = db.users[to];
-    if (!recipientData) return showToast("宛先が見つかりません。", "error");
-    const publicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
-    const mailContent = { type: 'mail', subject, body };
-    const encryptedBody = await encryptMessage(publicKey, mailContent);
-    channel.postMessage({ type: 'private_message', payload: { from: currentUser.email, to, encryptedBody: arrayBufferToBase64(encryptedBody) } });
-    showToast(`「${to}」にメールを送信しました。`, "success");
-    closeModal();
-}
+async function sendMail() { /* サーバー処理のため省略可能だが、念のため残す */ }
 
 async function startConversation(partnerEmail, type, isRefresh = false) {
     if (!isRefresh) {
         activeConversation = { partnerEmail, type };
     }
     renderContactList();
-    const db = getDB();
-    const partnerData = db.users[partnerEmail];
+    const { userData: partnerData } = await api('getUserData', { email: partnerEmail });
     if (!partnerData) return switchContentView('welcome-view');
 
     DOM.chatPartnerDisplayName.innerText = partnerData.displayName;
@@ -418,11 +438,11 @@ async function startConversation(partnerEmail, type, isRefresh = false) {
     switchContentView('conversation-view');
     DOM.messages.innerHTML = '';
     
-    const history = getMessageHistory(currentUser.email, partnerEmail);
+    const { history } = await api('getMessageHistory', { user1: currentUser.email, user2: partnerEmail });
     for (const msg of history) {
         let body = null;
         const msgType = msg.from === currentUser.email ? 'sent' : 'received';
-        body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBodyForSelf));
+        body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBody));
         
         if (body) {
             displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
@@ -430,7 +450,7 @@ async function startConversation(partnerEmail, type, isRefresh = false) {
             displayMessage(msg.from, { type: 'text', content: '[このメッセージは表示できません]' }, msgType, msg.read, msg.timestamp, msg.id);
         }
     }
-    updateReadStatusInDB(partnerEmail, true);
+    socket.emit('read_receipt', { from: currentUser.email, to: partnerEmail });
 }
 
 DOM.messageForm.onsubmit = (e) => { e.preventDefault(); sendMessage('text', DOM.messageInput.value); };
@@ -445,94 +465,65 @@ async function sendMessage(type, content) {
     if (type === 'text' && content.trim() === '') return;
     
     const partnerEmail = activeConversation.partnerEmail;
-    const db = getDB();
-    const recipientData = db.users[partnerEmail];
+    const { userData: recipientData } = await api('getUserData', {email: partnerEmail});
     if (!recipientData) return showToast("送信先が見つかりません", "error");
 
     const messagePayload = { type, content };
-    
     const recipientPublicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
-    const encryptedBodyForRecipient = await encryptMessage(recipientPublicKey, messagePayload);
-    const encryptedBodyForSelf = await encryptMessage(currentUser.keys.publicKey, messagePayload);
+    const encryptedBody = await encryptMessage(recipientPublicKey, messagePayload);
     
     const msg = {
         id: Date.now(), from: currentUser.email, to: partnerEmail,
-        encryptedBody: arrayBufferToBase64(encryptedBodyForRecipient),
+        encryptedBody: arrayBufferToBase64(encryptedBody),
         timestamp: Date.now()
     };
     
     socket.emit('private_message', msg);
     displayMessage(currentUser.email, messagePayload, 'sent', false, msg.timestamp, msg.id);
-    saveMessageToHistory(currentUser.email, partnerEmail, { ...msg, encryptedBodyForSelf: arrayBufferToBase64(encryptedBodyForSelf), read: true });
-
     if (type === 'text') DOM.messageInput.value = '';
 }
 
 async function handleIncomingMessage(payload) {
-    const db = getDB();
     const fromEmail = payload.from;
     const decryptedPayload = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(payload.encryptedBody));
     if (!decryptedPayload) return;
 
     if (decryptedPayload.type === 'mail') {
-        showToast(`新着メール from ${db.users[fromEmail]?.displayName || fromEmail}: ${decryptedPayload.content.subject}`, 'info');
-        if(hasUserInteracted) NOTIFICATION_SOUND.play();
+        const { usersData } = await api('getUsersData', { emails: [fromEmail] });
+        showToast(`新着メール from ${usersData[fromEmail]?.displayName || fromEmail}: ${decryptedPayload.content.subject}`, 'info');
+        if (hasUserInteracted) NOTIFICATION_SOUND.play();
         return;
     }
     
     const isChatOpen = fromEmail === activeConversation?.partnerEmail;
-    const encryptedBodyForSelf = await encryptMessage(currentUser.keys.publicKey, decryptedPayload);
-    saveMessageToHistory(fromEmail, payload.to, { ...payload, encryptedBodyForSelf: arrayBufferToBase64(encryptedBodyForSelf), read: isChatOpen });
-    
     if (isChatOpen) {
         displayMessage(fromEmail, decryptedPayload, 'received', false, payload.timestamp, payload.id);
-        updateReadStatusInDB(fromEmail, true);
+        socket.emit('read_receipt', { from: currentUser.email, to: fromEmail });
     } else {
-        showToast(`新着メッセージ from ${db.users[fromEmail]?.displayName || fromEmail}`, 'info');
-        if(hasUserInteracted) NOTIFICATION_SOUND.play();
+        const { usersData } = await api('getUsersData', { emails: [fromEmail] });
+        showToast(`新着メッセージ from ${usersData[fromEmail]?.displayName || fromEmail}`, 'info');
+        if (hasUserInteracted) NOTIFICATION_SOUND.play();
     }
     renderContactList();
 }
 
-function handleReadReceipt(payload) {
+async function handleReadReceipt(payload) {
     if (payload.from === activeConversation?.partnerEmail) {
         document.querySelectorAll('.message.sent .read-status').forEach(el => { el.innerText = '既読'; });
-        updateReadStatusInDB(currentUser.email, payload.from, false, true);
-    }
-}
-
-function updateReadStatusInDB(partner, shouldNotify = false, isReceipt = false) {
-    const db = getDB();
-    const chatID = [currentUser.email, partner].sort().join('__');
-    const history = db.chats?.[chatID] || [];
-    let changed = false;
-    
-    const propertyToUpdate = isReceipt ? 'from' : 'to';
-    const emailToMatch = isReceipt ? partner : currentUser.email;
-
-    history.forEach(msg => { 
-        if (msg[propertyToUpdate] === emailToMatch && !msg.read) {
-            msg.read = true; 
-            changed = true; 
-        } 
-    });
-
-    if (changed) {
-        saveDB(db);
-        if (shouldNotify) {
-            socket.emit('read_receipt', { from: currentUser.email, to: partner });
-        }
+        const { history } = await api('getMessageHistory', { user1: currentUser.email, user2: payload.from });
         renderContactList();
     }
 }
 
-function displayMessage(from, body, type, read = false, timestamp, id = null) {
+async function displayMessage(from, body, type, read = false, timestamp, id = null) {
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${type}`;
     if (id) msgDiv.dataset.messageId = id;
-    const db = getDB();
-    const senderData = db.users[from];
+    
+    const { usersData } = await api('getUsersData', {emails: [from]});
+    const senderData = usersData[from];
     const senderIcon = (type === 'sent' ? currentUser.icon : senderData?.icon) || '';
+    
     let bubbleContent = '';
     if (typeof body !== 'object' || body === null) body = { type: 'text', content: '[メッセージ形式エラー]' };
 
@@ -572,27 +563,23 @@ DOM.currentUserIcon.parentElement.addEventListener('click', () => {
     fileInput.onchange = () => { if (fileInput.files && fileInput.files[0]) { const reader = new FileReader(); reader.onload = (e) => { preview.style.backgroundImage = `url(${e.target.result})`; preview.dataset.newIcon = e.target.result; }; reader.readAsDataURL(fileInput.files[0]); } };
 });
 
-function saveProfile() {
-    const db = getDB();
+async function saveProfile() {
     const newDisplayName = document.getElementById('profile-display-name').value;
     const preview = document.getElementById('icon-preview');
     const newIcon = preview.dataset.newIcon;
     let updated = false;
     if (newDisplayName && newDisplayName !== currentUser.displayName) {
-        db.users[currentUser.email].displayName = newDisplayName;
         currentUser.displayName = newDisplayName;
         DOM.currentUserDisplayName.innerText = newDisplayName;
         updated = true;
     }
     if (newIcon) {
-        db.users[currentUser.email].icon = newIcon;
         currentUser.icon = newIcon;
         DOM.currentUserIcon.style.backgroundImage = `url(${newIcon})`;
         updated = true;
     }
     if (updated) {
-        saveDB(db);
-        notifyDbUpdate(currentUser.email);
+        socket.emit('update_profile', {email: currentUser.email, newDisplayName, newIcon});
     }
     closeModal();
 }

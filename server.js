@@ -1,72 +1,171 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
+const cors = require('cors');
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
-const PORT = process.env.PORT || 3000;
+app.use(cors());
+app.use(express.json({limit: '10mb'}));
 
-// ★★★ サーバー内に、全ユーザー情報を記憶する「中央の電話帳」を用意する ★★★
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
+
+const PORT = process.env.PORT || 3001;
+
 let db = {
-    users: {}, // { email: { displayName, icon, publicKeyJwk, friends:[], requests:[], sentRequests:[] } }
-    sockets: {} // { email: socketId }
+    users: {},
+    chats: {}
 };
 
-app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.0 is Active!</h1>'));
+let onlineUsers = {};
+
+app.get('/', (req, res) => {
+    res.send('<h1>Rivift Connect Server v4.0 Final Fix is Active!</h1>');
+});
+
+app.post('/createUser', (req, res) => {
+    const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon } = req.body;
+    if (db.users[email]) {
+        return res.status(400).json({ error: 'User already exists' });
+    }
+    db.users[email] = { displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon, friends: [], requests: [], sentRequests: [] };
+    res.json({ success: true });
+});
+
+app.post('/getUserData', (req, res) => {
+    const { email } = req.body;
+    const userData = db.users[email];
+    if (userData) {
+        res.json({ userData: {
+            displayName: userData.displayName,
+            icon: userData.icon,
+            publicKeyJwk: userData.publicKeyJwk,
+            friends: userData.friends,
+            requests: userData.requests,
+            sentRequests: userData.sentRequests
+        }});
+    } else {
+        res.status(404).json({ error: 'User not found' });
+    }
+});
+
+app.post('/getUsersData', (req, res) => {
+    const { emails } = req.body;
+    const usersData = {};
+    emails.forEach(email => {
+        if (db.users[email]) {
+            usersData[email] = {
+                displayName: db.users[email].displayName,
+                icon: db.users[email].icon
+            };
+        }
+    });
+    res.json({ usersData });
+});
 
 io.on('connection', (socket) => {
-    console.log('ユーザーが接続:', socket.id);
-
-    // ログイン時に、そのユーザーのemailとsocket.idを紐付ける
     socket.on('login', (data) => {
-        console.log(`ログイン: ${data.email} as ${socket.id}`);
-        db.sockets[data.email] = socket.id;
-        socket.email = data.email; // socket自体にもemailを持たせる
+        onlineUsers[data.email] = socket.id;
+        socket.email = data.email;
     });
 
-    // 友達申請を中継する
-    socket.on('friend_request', (payload) => {
-        const recipientSocketId = db.sockets[payload.to];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('friend_request_received', payload);
+    socket.on('send_friend_request', ({ from, to }) => {
+        if (db.users[to] && db.users[from] && !db.users[to].requests.includes(from)) {
+            db.users[to].requests.push(from);
+            db.users[from].sentRequests.push(to);
+            const recipientSocketId = onlineUsers[to];
+            if (recipientSocketId) {
+                io.to(recipientSocketId).emit('db_updated_notification', { from });
+            }
+            const senderSocketId = onlineUsers[from];
+             if (senderSocketId) {
+                io.to(senderSocketId).emit('db_updated_notification', { from });
+            }
         }
     });
 
-    // 申請承認を中継する
-    socket.on('request_accepted', (payload) => {
-        const recipientSocketId = db.sockets[payload.to];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('request_accepted_notification', payload);
+    socket.on('accept_friend_request', ({ from, to }) => {
+        if (db.users[from] && db.users[to]) {
+            db.users[from].requests = db.users[from].requests.filter(e => e !== to);
+            if (!db.users[from].friends.includes(to)) db.users[from].friends.push(to);
+            db.users[to].sentRequests = db.users[to].sentRequests.filter(e => e !== from);
+            if (!db.users[to].friends.includes(from)) db.users[to].friends.push(from);
+            
+            const fromSocketId = onlineUsers[from];
+            if (fromSocketId) io.to(fromSocketId).emit('db_updated_notification', { from: to });
+            const toSocketId = onlineUsers[to];
+            if (toSocketId) io.to(toSocketId).emit('db_updated_notification', { from });
+        }
+    });
+
+    socket.on('reject_friend_request', ({ from, to }) => {
+        if (db.users[from] && db.users[to]) {
+            db.users[from].requests = db.users[from].requests.filter(e => e !== to);
+            db.users[to].sentRequests = db.users[to].sentRequests.filter(e => e !== from);
+            const fromSocketId = onlineUsers[from];
+            if (fromSocketId) io.to(fromSocketId).emit('db_updated_notification', { from: to });
+            const toSocketId = onlineUsers[to];
+            if (toSocketId) io.to(toSocketId).emit('db_updated_notification', { from });
+        }
+    });
+
+    socket.on('cancel_friend_request', ({ from, to }) => {
+        if (db.users[from] && db.users[to]) {
+            db.users[from].sentRequests = db.users[from].sentRequests.filter(e => e !== to);
+            db.users[to].requests = db.users[to].requests.filter(e => e !== from);
+            const fromSocketId = onlineUsers[from];
+            if (fromSocketId) io.to(fromSocketId).emit('db_updated_notification', { from: to });
+            const toSocketId = onlineUsers[to];
+            if (toSocketId) io.to(toSocketId).emit('db_updated_notification', { from });
         }
     });
     
-    // ★★★ サーバーがメッセージを中継する処理 ★★★
     socket.on('private_message', (payload) => {
-        const recipientSocketId = db.sockets[payload.to];
+        const chatID = [payload.from, payload.to].sort().join('__');
+        if (!db.chats[chatID]) db.chats[chatID] = [];
+        db.chats[chatID].push(payload);
+
+        const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) {
-            // 送信者と、暗号化されたメッセージをそのまま相手に送る
-            io.to(recipientSocketId).emit('private_message', {
-                from: payload.from,
-                encryptedBody: payload.encryptedBody,
-                timestamp: payload.timestamp
-            });
+            io.to(recipientSocketId).emit('private_message', payload);
         }
     });
 
-    // 既読情報を中継する
     socket.on('read_receipt', (payload) => {
-        const recipientSocketId = db.sockets[payload.to];
+        const chatID = [payload.from, payload.to].sort().join('__');
+        if (db.chats[chatID]) {
+            db.chats[chatID].forEach(msg => {
+                if (msg.to === payload.from) msg.read = true;
+            });
+        }
+        const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) {
             io.to(recipientSocketId).emit('read_receipt', { from: payload.from });
         }
     });
 
-    // 接続が切れたら、電話帳から削除
+    socket.on('update_profile', ({email, newDisplayName, newIcon}) => {
+        if (db.users[email]) {
+            if (newDisplayName) db.users[email].displayName = newDisplayName;
+            if (newIcon) db.users[email].icon = newIcon;
+            
+            db.users[email].friends.forEach(friendEmail => {
+                const friendSocketId = onlineUsers[friendEmail];
+                if (friendSocketId) {
+                    io.to(friendSocketId).emit('db_updated_notification', { from: email });
+                }
+            });
+        }
+    });
+
     socket.on('disconnect', () => {
-        console.log('ユーザーが切断:', socket.id);
         if (socket.email) {
-            delete db.sockets[socket.email];
+            delete onlineUsers[socket.email];
         }
     });
 });
