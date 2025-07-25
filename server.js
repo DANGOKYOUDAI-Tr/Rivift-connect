@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
-const { MongoClient, ObjectId } = require('mongodb');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 app.use(cors());
@@ -16,10 +16,11 @@ let db;
 let usersCollection;
 let chatsCollection;
 
-(async () => {
+// ★★★ ここからが修正部分！ ★★★
+async function connectToDatabase() {
     if (!MONGO_URI) {
-        console.error("MONGO_URI not found in environment variables.");
-        return;
+        console.error("MONGO_URI not found in environment variables. Server cannot start.");
+        process.exit(1); // MONGO_URIがなければサーバーを起動しない
     }
     try {
         const client = new MongoClient(MONGO_URI);
@@ -27,18 +28,22 @@ let chatsCollection;
         db = client.db("rivift-connect-db");
         usersCollection = db.collection("users");
         chatsCollection = db.collection("chats");
-        console.log('Connected to MongoDB Atlas');
+        console.log('Successfully connected to MongoDB Atlas');
     } catch (e) {
         console.error("Failed to connect to MongoDB Atlas", e);
+        process.exit(1); // 接続に失敗した場合もサーバーを起動しない
     }
-})();
+}
+// ★★★ ここまでが修正部分！ ★★★
+
 
 let onlineUsers = {};
 
 app.get('/', (req, res) => {
-    res.send('<h1>Rivift Connect Server v4.3 is Active!</h1>');
+    res.send('<h1>Rivift Connect Server v4.3 Final Fix 2 is Active!</h1>');
 });
 
+// ... (ここから下のAPI部分は、前回のコードと全く同じ)
 app.post('/createUser', async (req, res) => {
     try {
         const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon } = req.body;
@@ -106,7 +111,6 @@ io.on('connection', (socket) => {
     socket.on('send_friend_request', async ({ from, to }) => {
         await usersCollection.updateOne({ _id: to }, { $addToSet: { requests: from } });
         await usersCollection.updateOne({ _id: from }, { $addToSet: { sentRequests: to } });
-        
         const recipientSocketId = onlineUsers[to];
         if (recipientSocketId) io.to(recipientSocketId).emit('db_updated_notification');
         io.to(socket.id).emit('db_updated_notification');
@@ -115,7 +119,6 @@ io.on('connection', (socket) => {
     socket.on('accept_friend_request', async ({ from, to }) => {
         await usersCollection.updateOne({ _id: from }, { $pull: { requests: to }, $addToSet: { friends: to } });
         await usersCollection.updateOne({ _id: to }, { $pull: { sentRequests: from }, $addToSet: { friends: from } });
-
         const recipientSocketId = onlineUsers[to];
         if (recipientSocketId) io.to(recipientSocketId).emit('db_updated_notification');
         io.to(socket.id).emit('db_updated_notification');
@@ -124,7 +127,6 @@ io.on('connection', (socket) => {
     socket.on('reject_friend_request', async ({ from, to }) => {
         await usersCollection.updateOne({ _id: from }, { $pull: { requests: to } });
         await usersCollection.updateOne({ _id: to }, { $pull: { sentRequests: from } });
-        
         const recipientSocketId = onlineUsers[to];
         if (recipientSocketId) io.to(recipientSocketId).emit('db_updated_notification');
         io.to(socket.id).emit('db_updated_notification');
@@ -133,7 +135,6 @@ io.on('connection', (socket) => {
     socket.on('cancel_friend_request', async ({ from, to }) => {
         await usersCollection.updateOne({ _id: from }, { $pull: { sentRequests: to } });
         await usersCollection.updateOne({ _id: to }, { $pull: { requests: from } });
-
         const recipientSocketId = onlineUsers[to];
         if (recipientSocketId) io.to(recipientSocketId).emit('db_updated_notification');
         io.to(socket.id).emit('db_updated_notification');
@@ -146,7 +147,6 @@ io.on('connection', (socket) => {
             { $push: { messages: payload }, $setOnInsert: { users: [payload.from, payload.to] } },
             { upsert: true }
         );
-
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('private_message', payload);
     });
@@ -158,7 +158,6 @@ io.on('connection', (socket) => {
             { $set: { "messages.$[elem].read": true } },
             { arrayFilters: [ { "elem.to": payload.from, "elem.from": payload.to } ] }
         );
-        
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('read_receipt', { from: payload.from });
     });
@@ -167,7 +166,6 @@ io.on('connection', (socket) => {
         const updateData = {};
         if (newDisplayName) updateData.displayName = newDisplayName;
         if (newIcon) updateData.icon = newIcon;
-        
         const result = await usersCollection.updateOne({ _id: email }, { $set: updateData });
         if (result.modifiedCount > 0) {
             const user = await usersCollection.findOne({_id: email});
@@ -184,4 +182,12 @@ io.on('connection', (socket) => {
     });
 });
 
-server.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+
+// ★★★ ここからが修正部分！ ★★★
+// サーバーを起動する前に、必ずDB接続を完了させる
+connectToDatabase().then(() => {
+    server.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+}).catch(err => {
+    console.error("Failed to start server:", err);
+});
+// ★★★ ここまでが修正部分！ ★★★
