@@ -53,26 +53,6 @@ app.post('/getUserData', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/getUsersData', async (req, res) => {
-    try {
-        const { emails } = req.body;
-        const usersData = {};
-        if (emails && emails.length > 0) {
-            const users = await usersCollection.find({ _id: { $in: emails } }).toArray();
-            users.forEach(user => {
-                usersData[user._id] = {
-                    displayName: user.displayName,
-                    icon: user.icon,
-                    publicKeyJwk: user.publicKeyJwk
-                };
-            });
-        }
-        res.json({ usersData });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error while fetching multiple users data.' });
-    }
-});
-
 app.post('/getSidebarData', async (req, res) => {
     try {
         const { email } = req.body;
@@ -145,7 +125,7 @@ io.on('connection', (socket) => {
     
     socket.on('private_message', async (payload) => {
         const chatID = [payload.from, payload.to].sort().join('__');
-        await chatsCollection.updateOne({ _id: chatID }, { $push: { messages: payload }, $setOnInsert: { users: [payload.from, payload.to] } }, { upsert: true });
+        await chatsCollection.updateOne({ _id: chatID }, { $push: { messages: payload } }, { upsert: true });
         
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('private_message', payload);
@@ -171,8 +151,6 @@ io.on('connection', (socket) => {
             { $set: { 
                 "messages.$.type": "deleted",
                 "messages.$.content": "メッセージが削除されました",
-                "messages.$.encryptedBody": null,
-                "messages.$.encryptedBodyForSelf": null
             }}
         );
         notifyUsers([from, to]);
