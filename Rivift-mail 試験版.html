@@ -463,7 +463,7 @@ async function startConversation(partnerEmail, type, isRefresh = false) {
     if (!isRefresh) {
         activeConversation = { partnerEmail, type };
     }
-    renderContactList();
+    await renderContactList();
     const { userData: partnerData } = await api('getUserData', { email: partnerEmail });
     if (!partnerData) return switchContentView('welcome-view');
 
@@ -473,15 +473,17 @@ async function startConversation(partnerEmail, type, isRefresh = false) {
     DOM.messages.innerHTML = '';
     
     const { history } = await api('getMessageHistory', { user1: currentUser.email, user2: partnerEmail });
-    for (const msg of history) {
-        let body = null;
-        const msgType = msg.from === currentUser.email ? 'sent' : 'received';
-        body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBody));
-        
-        if (body) {
-            displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
-        } else {
-            displayMessage(msg.from, { type: 'text', content: '[このメッセージは表示できません]' }, msgType, msg.read, msg.timestamp, msg.id);
+    if (history) {
+        for (const msg of history) {
+            let body = null;
+            const msgType = msg.from === currentUser.email ? 'sent' : 'received';
+            body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBody));
+            
+            if (body) {
+                displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
+            } else {
+                displayMessage(msg.from, { type: 'text', content: '[このメッセージは表示できません]' }, msgType, msg.read, msg.timestamp, msg.id);
+            }
         }
     }
     socket.emit('read_receipt', { from: currentUser.email, to: partnerEmail });

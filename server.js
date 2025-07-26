@@ -16,11 +16,10 @@ let db;
 let usersCollection;
 let chatsCollection;
 
-// ★★★ ここからが修正部分！ ★★★
 async function connectToDatabase() {
     if (!MONGO_URI) {
         console.error("MONGO_URI not found in environment variables. Server cannot start.");
-        process.exit(1); // MONGO_URIがなければサーバーを起動しない
+        process.exit(1);
     }
     try {
         const client = new MongoClient(MONGO_URI);
@@ -31,11 +30,9 @@ async function connectToDatabase() {
         console.log('Successfully connected to MongoDB Atlas');
     } catch (e) {
         console.error("Failed to connect to MongoDB Atlas", e);
-        process.exit(1); // 接続に失敗した場合もサーバーを起動しない
+        process.exit(1);
     }
 }
-// ★★★ ここまでが修正部分！ ★★★
-
 
 let onlineUsers = {};
 
@@ -43,7 +40,6 @@ app.get('/', (req, res) => {
     res.send('<h1>Rivift Connect Server v4.3 Final Fix 2 is Active!</h1>');
 });
 
-// ... (ここから下のAPI部分は、前回のコードと全く同じ)
 app.post('/createUser', async (req, res) => {
     try {
         const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon } = req.body;
@@ -99,6 +95,23 @@ app.post('/getMessageHistory', async (req, res) => {
         res.json({ history });
     } catch (error) {
         res.status(500).json({ error: 'Server error while fetching message history.' });
+    }
+});
+
+app.post('/saveMessage', async (req, res) => {
+    try {
+        const { user1, user2, message } = req.body;
+        const chatID = [user1, user2].sort().join('__');
+        
+        const db = await getDB();
+        if (!db.chats) db.chats = {};
+        if (!db.chats[chatID]) db.chats[chatID] = [];
+        db.chats[chatID].push(message);
+        await saveDB(db);
+
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Server error while saving message.' });
     }
 });
 
@@ -182,12 +195,8 @@ io.on('connection', (socket) => {
     });
 });
 
-
-// ★★★ ここからが修正部分！ ★★★
-// サーバーを起動する前に、必ずDB接続を完了させる
 connectToDatabase().then(() => {
     server.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
 }).catch(err => {
     console.error("Failed to start server:", err);
 });
-// ★★★ ここまでが修正部分！ ★★★
