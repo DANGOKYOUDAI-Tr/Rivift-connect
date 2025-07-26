@@ -230,7 +230,6 @@ function connectToServer() {
     socket = io(SERVER_URL);
 
     socket.on("connect", () => {
-        console.log("サーバーに接続しました！ ID:", socket.id);
         if (currentUser) socket.emit('login', { email: currentUser.email });
     });
     socket.on('private_message', async (payload) => {
@@ -325,47 +324,21 @@ function showIconSelectionModal(email, displayName, password) {
     const defaultIcons = [ 'https://api.iconify.design/ph:user-circle-thin.svg?color=white', 'https://api.iconify.design/ph:cat-thin.svg?color=white', 'https://api.iconify.design/ph:dog-thin.svg?color=white', 'https://api.iconify.design/ph:bird-thin.svg?color=white', 'https://api.iconify.design/ph:ghost-thin.svg?color=white', 'https://api.iconify.design/ph:rocket-launch-thin.svg?color=white', 'https://api.iconify.design/ph:planet-thin.svg?color=white', 'https://api.iconify.design/ph:game-controller-thin.svg?color=white' ];
     let selectedIcon = defaultIcons[0];
     const iconGridHtml = defaultIcons.map((icon, index) => `<img src="${icon}" class="default-icon ${index === 0 ? 'selected' : ''}" data-icon="${icon}">`).join('');
-    
     showModal({
         title: 'アイコンを選択', content: `<div id="icon-select-grid">${iconGridHtml}</div>`,
         actions: [{ text: '作成完了', class: 'primary-btn', action: async () => {
-            
-            const keys = await generateUserKeys();
-            const privateKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.privateKey);
-            const encryptedPrivateKeyPayload = await encryptWithPassword(password, privateKeyJwk);
-            const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.publicKey);
-            
-            const result = await api('createUser', { 
-                email, 
-                displayName, 
-                publicKeyJwk, 
-                encryptedPrivateKeyPayload, 
-                icon: selectedIcon 
-            });
-
+            const result = await api('createUser', { email, displayName, password, icon: selectedIcon });
             if (result && result.success) {
                 closeModal();
-
-                currentUser = {
-                    email,
-                    displayName,
-                    keys: keys,
-                    icon: selectedIcon,
-                    friends: [],
-                    requests: [],
-                    sentRequests: []
-                };
-                
-                connectToServer();
-                initializeAppUI();
-                showToast(`ようこそ、${displayName}さん！`, 'success');
-
+                showToast(`ようこそ、${displayName}さん！ログインしてください。`, 'success');
+                DOM.authEmail.value = email;
+                DOM.authPassword.value = '';
+                if (isRegisterMode) DOM.authToggleLink.click();
             } else {
                 showToast("アカウント作成に失敗しました。", "error");
             }
         }}]
     });
-
     document.querySelectorAll('.default-icon').forEach(el => el.onclick = () => { document.querySelector('.default-icon.selected')?.classList.remove('selected'); el.classList.add('selected'); selectedIcon = el.dataset.icon; });
 }
 
@@ -433,12 +406,9 @@ async function sendFriendRequest(friendEmail) {
     if (!userData) return showToast("そのユーザーは存在しません。", "error");
     if (currentUser.friends.includes(friendEmail)) return showToast("既に友達です。", "info");
     if (currentUser.sentRequests?.includes(friendEmail)) return showToast("既に申請を送信済みです。", "info");
-    
     socket.emit('send_friend_request', { from: currentUser.email, to: friendEmail });
-    
     currentUser.sentRequests.push(friendEmail);
     renderSentRequests();
-
     showToast(`「${friendEmail}」に友達申請を送りました。`, "success");
     closeModal();
 }
@@ -454,7 +424,7 @@ async function sendMail() {
     const publicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
     const mailContent = { type: 'mail', subject, body };
     const encryptedBody = await encryptMessage(publicKey, mailContent);
-    socket.emit('private_message', { from: currentUser.email, to, encryptedBody: arrayBufferToBase64(encryptedBody) });
+    socket.emit('private_message', { from: currentUser.email, to, encryptedBody: arrayBufferToBase64(encryptedBody), isMail: true });
     showToast(`「${to}」にメールを送信しました。`, "success");
     closeModal();
 }
@@ -463,26 +433,23 @@ async function startConversation(partnerEmail, type, isRefresh = false) {
     if (!isRefresh) {
         activeConversation = { partnerEmail, type };
     }
-    await renderContactList();
+    renderContactList();
     const { userData: partnerData } = await api('getUserData', { email: partnerEmail });
     if (!partnerData) return switchContentView('welcome-view');
-
     DOM.chatPartnerDisplayName.innerText = partnerData.displayName;
     DOM.chatPartnerIcon.style.backgroundImage = `url(${partnerData.icon || ''})`;
     switchContentView('conversation-view');
     DOM.messages.innerHTML = '';
-    
     const { history } = await api('getMessageHistory', { user1: currentUser.email, user2: partnerEmail });
-    if (history) {
+    if(history){
         for (const msg of history) {
             let body = null;
             const msgType = msg.from === currentUser.email ? 'sent' : 'received';
             body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBody));
-            
             if (body) {
-                displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
+                await displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
             } else {
-                displayMessage(msg.from, { type: 'text', content: '[このメッセージは表示できません]' }, msgType, msg.read, msg.timestamp, msg.id);
+                await displayMessage(msg.from, { type: 'text', content: '[このメッセージは表示できません]' }, msgType, msg.read, msg.timestamp, msg.id);
             }
         }
     }
@@ -499,23 +466,19 @@ document.querySelectorAll('#stamp-panel img').forEach(el => el.onclick = (e) => 
 async function sendMessage(type, content) {
     if (!activeConversation || !content) return;
     if (type === 'text' && content.trim() === '') return;
-    
     const partnerEmail = activeConversation.partnerEmail;
     const { userData: recipientData } = await api('getUserData', {email: partnerEmail});
     if (!recipientData) return showToast("送信先が見つかりません", "error");
-
     const messagePayload = { type, content };
     const recipientPublicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
     const encryptedBody = await encryptMessage(recipientPublicKey, messagePayload);
-    
     const msg = {
         id: Date.now(), from: currentUser.email, to: partnerEmail,
         encryptedBody: arrayBufferToBase64(encryptedBody),
         timestamp: Date.now()
     };
-    
     socket.emit('private_message', msg);
-    displayMessage(currentUser.email, messagePayload, 'sent', false, msg.timestamp, msg.id);
+    await displayMessage(currentUser.email, messagePayload, 'sent', false, msg.timestamp, msg.id);
     if (type === 'text') DOM.messageInput.value = '';
 }
 
@@ -530,36 +493,34 @@ async function handleIncomingMessage(payload) {
         if (hasUserInteracted) NOTIFICATION_SOUND.play();
         return;
     }
-    
     const isChatOpen = fromEmail === activeConversation?.partnerEmail;
     if (isChatOpen) {
-        displayMessage(fromEmail, decryptedPayload, 'received', false, payload.timestamp, payload.id);
+        await displayMessage(fromEmail, decryptedPayload, 'received', false, payload.timestamp, payload.id);
         socket.emit('read_receipt', { from: currentUser.email, to: fromEmail });
     } else {
         const { usersData } = await api('getUsersData', { emails: [fromEmail] });
         showToast(`新着メッセージ from ${usersData[fromEmail]?.displayName || fromEmail}`, 'info');
         if (hasUserInteracted) NOTIFICATION_SOUND.play();
     }
-    renderContactList();
+    await refreshCurrentUserState();
+    await renderContactList();
 }
 
 async function handleReadReceipt(payload) {
     if (payload.from === activeConversation?.partnerEmail) {
         document.querySelectorAll('.message.sent .read-status').forEach(el => { el.innerText = '既読'; });
-        await refreshCurrentUserState();
-        renderContactList();
     }
+    await refreshCurrentUserState(); // DBから最新の状態を取得
+    await renderContactList(); // 未読バッジなどを更新
 }
 
 async function displayMessage(from, body, type, read = false, timestamp, id = null) {
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${type}`;
     if (id) msgDiv.dataset.messageId = id;
-    
     const { usersData } = await api('getUsersData', {emails: [from]});
     const senderData = usersData[from];
     const senderIcon = (type === 'sent' ? currentUser.icon : senderData?.icon) || '';
-    
     let bubbleContent = '';
     if (typeof body !== 'object' || body === null) body = { type: 'text', content: '[メッセージ形式エラー]' };
 

@@ -37,7 +37,7 @@ async function connectToDatabase() {
 let onlineUsers = {};
 
 app.get('/', (req, res) => {
-    res.send('<h1>Rivift Connect Server v4.3 Final Fix 2 is Active!</h1>');
+    res.send('<h1>Rivift Connect Server v4.3 Final Fix is Active!</h1>');
 });
 
 app.post('/createUser', async (req, res) => {
@@ -76,7 +76,8 @@ app.post('/getUsersData', async (req, res) => {
             users.forEach(user => {
                 usersData[user._id] = {
                     displayName: user.displayName,
-                    icon: user.icon
+                    icon: user.icon,
+                    publicKeyJwk: user.publicKeyJwk
                 };
             });
         }
@@ -103,11 +104,14 @@ app.post('/saveMessage', async (req, res) => {
         const { user1, user2, message } = req.body;
         const chatID = [user1, user2].sort().join('__');
         
-        const db = await getDB();
-        if (!db.chats) db.chats = {};
-        if (!db.chats[chatID]) db.chats[chatID] = [];
-        db.chats[chatID].push(message);
-        await saveDB(db);
+        await chatsCollection.updateOne(
+            { _id: chatID },
+            { 
+                $push: { messages: message },
+                $setOnInsert: { users: [user1, user2] } 
+            },
+            { upsert: true }
+        );
 
         res.json({ success: true });
     } catch (error) {
@@ -154,12 +158,6 @@ io.on('connection', (socket) => {
     });
 
     socket.on('private_message', async (payload) => {
-        const chatID = [payload.from, payload.to].sort().join('__');
-        await chatsCollection.updateOne(
-            { _id: chatID },
-            { $push: { messages: payload }, $setOnInsert: { users: [payload.from, payload.to] } },
-            { upsert: true }
-        );
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('private_message', payload);
     });
