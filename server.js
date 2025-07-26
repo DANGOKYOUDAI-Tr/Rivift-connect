@@ -45,12 +45,24 @@ app.post('/createUser', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/getUserData', async (req, res) => {
+app.post('/getUsersData', async (req, res) => {
     try {
-        const { email } = req.body;
-        const userData = await usersCollection.findOne({ _id: email });
-        res.json({ userData });
-    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+        const { emails } = req.body;
+        const usersData = {};
+        if (emails && emails.length > 0) {
+            const users = await usersCollection.find({ _id: { $in: emails } }).toArray();
+            users.forEach(user => {
+                usersData[user._id] = {
+                    displayName: user.displayName,
+                    icon: user.icon,
+                    publicKeyJwk: user.publicKeyJwk 
+                };
+            });
+        }
+        res.json({ usersData });
+    } catch (error) {
+        res.status(500).json({ error: 'Server error while fetching multiple users data.' });
+    }
 });
 
 app.post('/getSidebarData', async (req, res) => {
