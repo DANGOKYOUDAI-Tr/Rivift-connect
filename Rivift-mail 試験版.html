@@ -222,14 +222,17 @@ const DOM = {
 const SERVER_URL = "https://rivift-connect-server.onrender.com";
 let socket;
 
+function showButtonSpinner(button) { button.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`; button.disabled = true; }
+function hideButtonSpinner(button, originalText) { button.innerHTML = originalText; button.disabled = false; }
+
 function connectToServer() {
     if (socket && socket.connected) {
         socket.emit('login', { email: currentUser.email });
         return;
     }
     socket = io(SERVER_URL);
-
     socket.on("connect", () => {
+        console.log("サーバーに接続しました！ ID:", socket.id);
         if (currentUser) socket.emit('login', { email: currentUser.email });
     });
     socket.on('private_message', async (payload) => {
@@ -241,7 +244,7 @@ function connectToServer() {
     socket.on('db_updated_notification', async () => {
         if (currentUser) {
             await refreshCurrentUserState();
-            renderAllSidebars();
+            await renderAllSidebars();
             if (activeConversation) await startConversation(activeConversation.partnerEmail, 'chat', true);
         }
     });
@@ -292,42 +295,57 @@ function switchContentView(viewId) { DOM.welcomeView.classList.toggle('active', 
 
 let isRegisterMode = false;
 DOM.authToggleLink.onclick = (e) => { e.preventDefault(); isRegisterMode = !isRegisterMode; DOM.authDisplayName.classList.toggle('hidden', !isRegisterMode); DOM.authPasswordConfirm.classList.toggle('hidden', !isRegisterMode); DOM.authBtn.innerText = isRegisterMode ? '新規作成' : 'ログイン'; DOM.authToggleLink.innerText = isRegisterMode ? 'ログイン画面へ' : 'アカウントを新規作成'; };
-
 DOM.authForm.onsubmit = async (e) => {
     e.preventDefault();
     const email = DOM.authEmail.value;
     const password = DOM.authPassword.value;
-    if (!email || !password) return;
-    if (isRegisterMode) {
-        const result = await api('getUserData', { email });
-        if (result && result.userData) return showToast("このメールアドレスは既に使用されています。", "error");
-        const displayName = DOM.authDisplayName.value;
-        const confirmPass = DOM.authPasswordConfirm.value;
-        if (!displayName) return showToast('表示名を入力してください。', 'error');
-        if (password !== confirmPass) return showToast('パスワードが一致しません。', 'error');
-        showIconSelectionModal(email, displayName, password);
-    } else {
-        const result = await api('getUserData', { email });
-        if (!result || !result.userData) return showToast('メールアドレスまたはパスワードが違います。', 'error');
-        const userData = result.userData;
-        const privateKeyJwk = await decryptWithPassword(password, userData.encryptedPrivateKeyPayload);
-        if (!privateKeyJwk) return showToast('メールアドレスまたはパスワードが違います。', 'error');
-        const publicKey = await window.crypto.subtle.importKey("jwk", userData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
-        const privateKey = await window.crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"]);
-        currentUser = { email, displayName: userData.displayName, keys: { publicKey, privateKey }, icon: userData.icon, friends: userData.friends, requests: userData.requests, sentRequests: userData.sentRequests };
-        connectToServer();
-        initializeAppUI();
+    const originalBtnText = DOM.authBtn.innerText;
+    showButtonSpinner(DOM.authBtn);
+
+    try {
+        if (!email || !password) throw new Error("入力してください");
+        if (isRegisterMode) {
+            const result = await api('getUserData', { email });
+            if (result && result.userData) throw new Error("このメールアドレスは既に使用されています。");
+            const displayName = DOM.authDisplayName.value;
+            const confirmPass = DOM.authPasswordConfirm.value;
+            if (!displayName) throw new Error('表示名を入力してください。');
+            if (password !== confirmPass) throw new Error('パスワードが一致しません。');
+            showIconSelectionModal(email, displayName, password);
+        } else {
+            const result = await api('getUserData', { email });
+            if (!result || !result.userData) throw new Error('メールアドレスまたはパスワードが違います。');
+            const userData = result.userData;
+            const privateKeyJwk = await decryptWithPassword(password, userData.encryptedPrivateKeyPayload);
+            if (!privateKeyJwk) throw new Error('メールアドレスまたはパスワードが違います。');
+            const publicKey = await window.crypto.subtle.importKey("jwk", userData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
+            const privateKey = await window.crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"]);
+            currentUser = { email, displayName: userData.displayName, keys: { publicKey, privateKey }, icon: userData.icon, friends: userData.friends, requests: userData.requests, sentRequests: userData.sentRequests };
+            connectToServer();
+            initializeAppUI();
+        }
+    } catch (error) {
+        showToast(error.message, "error");
+    } finally {
+        if (!isRegisterMode) hideButtonSpinner(DOM.authBtn, originalBtnText);
     }
 };
 
 function showIconSelectionModal(email, displayName, password) {
+    hideButtonSpinner(DOM.authBtn, '新規作成');
     const defaultIcons = [ 'https://api.iconify.design/ph:user-circle-thin.svg?color=white', 'https://api.iconify.design/ph:cat-thin.svg?color=white', 'https://api.iconify.design/ph:dog-thin.svg?color=white', 'https://api.iconify.design/ph:bird-thin.svg?color=white', 'https://api.iconify.design/ph:ghost-thin.svg?color=white', 'https://api.iconify.design/ph:rocket-launch-thin.svg?color=white', 'https://api.iconify.design/ph:planet-thin.svg?color=white', 'https://api.iconify.design/ph:game-controller-thin.svg?color=white' ];
     let selectedIcon = defaultIcons[0];
     const iconGridHtml = defaultIcons.map((icon, index) => `<img src="${icon}" class="default-icon ${index === 0 ? 'selected' : ''}" data-icon="${icon}">`).join('');
     showModal({
         title: 'アイコンを選択', content: `<div id="icon-select-grid">${iconGridHtml}</div>`,
-        actions: [{ text: '作成完了', class: 'primary-btn', action: async () => {
-            const result = await api('createUser', { email, displayName, password, icon: selectedIcon });
+        actions: [{ text: '作成完了', class: 'primary-btn', action: async (btn) => {
+            showButtonSpinner(btn);
+            const keys = await generateUserKeys();
+            const privateKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.privateKey);
+            const encryptedPrivateKeyPayload = await encryptWithPassword(password, privateKeyJwk);
+            const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.publicKey);
+            const result = await api('createUser', { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon: selectedIcon });
+            hideButtonSpinner(btn, '作成完了');
             if (result && result.success) {
                 closeModal();
                 showToast(`ようこそ、${displayName}さん！ログインしてください。`, 'success');
@@ -343,60 +361,57 @@ function showIconSelectionModal(email, displayName, password) {
 }
 
 function initializeAppUI() { DOM.currentUserDisplayName.innerText = currentUser.displayName; DOM.currentUserIcon.style.backgroundImage = `url(${currentUser.icon || ''})`; renderAllSidebars(); switchView('main-view'); switchContentView('welcome-view'); }
-function renderAllSidebars() { renderContactList(); renderFriendRequests(); renderSentRequests(); }
+async function renderAllSidebars() {
+    const { friends, requests, sentRequests, contactsData, unreadCounts } = await api('getSidebarData', { email: currentUser.email });
+    currentUser.friends = friends;
+    currentUser.requests = requests;
+    currentUser.sentRequests = sentRequests;
+    renderContactList(friends, contactsData, unreadCounts);
+    renderFriendRequests(requests, contactsData);
+    renderSentRequests(sentRequests, contactsData);
+}
 DOM.logoutBtn.onclick = () => { if (socket) socket.disconnect(); currentUser = null; activeConversation = null; switchView('auth-view'); DOM.authEmail.value = ''; DOM.authPassword.value = ''; };
 
-async function renderContactList() {
-    if (!currentUser?.friends) return;
+function renderContactList(friends, contactsData, unreadCounts) {
     DOM.contactList.innerHTML = '';
-    if (currentUser.friends.length > 0) {
-        const { usersData } = await api('getUsersData', { emails: currentUser.friends });
-        if (!usersData) return;
-        for (const email in usersData) {
-            const friendData = usersData[email];
-            const { history } = await api('getMessageHistory', { user1: currentUser.email, user2: email });
-            const unreadCount = history.filter(msg => msg.to === currentUser.email && !msg.read).length;
-            const li = document.createElement('li');
-            li.dataset.email = email;
-            li.innerHTML = `<div class="profile-icon" style="background-image: url(${friendData.icon || ''})"></div>
-                <div class="contact-info"><span class="display-name">${friendData.displayName}</span><span class="last-message"></span></div>
-                ${unreadCount > 0 ? `<span class="unread-badge">${unreadCount}</span>` : ''}`;
-            if (activeConversation?.partnerEmail === email) li.classList.add('active');
-            li.onclick = () => startConversation(email, 'chat');
-            DOM.contactList.appendChild(li);
-        }
-    }
+    friends.forEach(email => {
+        const friendData = contactsData[email];
+        if (!friendData) return;
+        const unreadCount = unreadCounts[email] || 0;
+        const li = document.createElement('li');
+        li.dataset.email = email;
+        li.innerHTML = `<div class="profile-icon" style="background-image: url(${friendData.icon || ''})"></div>
+            <div class="contact-info"><span class="display-name">${friendData.displayName}</span><span class="last-message"></span></div>
+            ${unreadCount > 0 ? `<span class="unread-badge">${unreadCount}</span>` : ''}`;
+        if (activeConversation?.partnerEmail === email) li.classList.add('active');
+        li.onclick = () => startConversation(email, 'chat');
+        DOM.contactList.appendChild(li);
+    });
 }
-async function renderFriendRequests() {
-    if (!currentUser?.requests) return;
-    DOM.requestsBadge.classList.toggle('visible', currentUser.requests.length > 0);
-    DOM.requestsBadge.innerText = currentUser.requests.length || '';
+function renderFriendRequests(requests, contactsData) {
+    DOM.requestsBadge.classList.toggle('visible', requests.length > 0);
+    DOM.requestsBadge.innerText = requests.length || '';
     DOM.requestList.innerHTML = '';
-    if (currentUser.requests.length > 0) {
-        const { usersData } = await api('getUsersData', { emails: currentUser.requests });
-        if (!usersData) return;
-        for (const fromEmail in usersData) {
-            const li = document.createElement('li');
-            li.innerHTML = `<span>${usersData[fromEmail].displayName}</span><div class="request-actions"><button class="accept-btn" title="承認"><i class="fa-solid fa-circle-check"></i></button><button class="reject-btn" title="拒否"><i class="fa-solid fa-circle-xmark"></i></button></div>`;
-            li.querySelector('.accept-btn').onclick = () => socket.emit('accept_friend_request', { from: currentUser.email, to: fromEmail });
-            li.querySelector('.reject-btn').onclick = () => socket.emit('reject_friend_request', { from: currentUser.email, to: fromEmail });
-            DOM.requestList.appendChild(li);
-        }
-    }
+    requests.forEach(fromEmail => {
+        const userData = contactsData[fromEmail];
+        if(!userData) return;
+        const li = document.createElement('li');
+        li.innerHTML = `<span>${userData.displayName}</span><div class="request-actions"><button class="accept-btn" title="承認"><i class="fa-solid fa-circle-check"></i></button><button class="reject-btn" title="拒否"><i class="fa-solid fa-circle-xmark"></i></button></div>`;
+        li.querySelector('.accept-btn').onclick = () => socket.emit('accept_friend_request', { from: currentUser.email, to: fromEmail });
+        li.querySelector('.reject-btn').onclick = () => socket.emit('reject_friend_request', { from: currentUser.email, to: fromEmail });
+        DOM.requestList.appendChild(li);
+    });
 }
-async function renderSentRequests() {
-    if (!currentUser?.sentRequests) return;
+function renderSentRequests(sentRequests, contactsData) {
     DOM.sentRequestList.innerHTML = '';
-    if (currentUser.sentRequests.length > 0) {
-        const { usersData } = await api('getUsersData', { emails: currentUser.sentRequests });
-        if (!usersData) return;
-        for (const toEmail in usersData) {
-            const li = document.createElement('li');
-            li.innerHTML = `<span>${usersData[toEmail].displayName}</span><div class="request-actions"><button class="cancel-btn" title="キャンセル"><i class="fa-solid fa-trash-can"></i></button></div>`;
-            li.querySelector('.cancel-btn').onclick = () => socket.emit('cancel_friend_request', { from: currentUser.email, to: toEmail });
-            DOM.sentRequestList.appendChild(li);
-        }
-    }
+    sentRequests.forEach(toEmail => {
+        const userData = contactsData[toEmail];
+        if(!userData) return;
+        const li = document.createElement('li');
+        li.innerHTML = `<span>${userData.displayName}</span><div class="request-actions"><button class="cancel-btn" title="キャンセル"><i class="fa-solid fa-trash-can"></i></button></div>`;
+        li.querySelector('.cancel-btn').onclick = () => socket.emit('cancel_friend_request', { from: currentUser.email, to: toEmail });
+        DOM.sentRequestList.appendChild(li);
+    });
 }
 
 DOM.addFriendBtn.onclick = () => showModal({ title: '友達を追加', content: `<input type="email" id="add-friend-email" placeholder="相手のメールアドレス">`, actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '送信', class: 'primary-btn', action: () => sendFriendRequest(document.getElementById('add-friend-email').value) }] });
@@ -407,8 +422,6 @@ async function sendFriendRequest(friendEmail) {
     if (currentUser.friends.includes(friendEmail)) return showToast("既に友達です。", "info");
     if (currentUser.sentRequests?.includes(friendEmail)) return showToast("既に申請を送信済みです。", "info");
     socket.emit('send_friend_request', { from: currentUser.email, to: friendEmail });
-    currentUser.sentRequests.push(friendEmail);
-    renderSentRequests();
     showToast(`「${friendEmail}」に友達申請を送りました。`, "success");
     closeModal();
 }
@@ -430,10 +443,8 @@ async function sendMail() {
 }
 
 async function startConversation(partnerEmail, type, isRefresh = false) {
-    if (!isRefresh) {
-        activeConversation = { partnerEmail, type };
-    }
-    renderContactList();
+    if (!isRefresh) activeConversation = { partnerEmail, type };
+    await renderAllSidebars();
     const { userData: partnerData } = await api('getUserData', { email: partnerEmail });
     if (!partnerData) return switchContentView('welcome-view');
     DOM.chatPartnerDisplayName.innerText = partnerData.displayName;
@@ -446,11 +457,8 @@ async function startConversation(partnerEmail, type, isRefresh = false) {
             let body = null;
             const msgType = msg.from === currentUser.email ? 'sent' : 'received';
             body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBody));
-            if (body) {
-                await displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
-            } else {
-                await displayMessage(msg.from, { type: 'text', content: '[このメッセージは表示できません]' }, msgType, msg.read, msg.timestamp, msg.id);
-            }
+            if (body) await displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
+            else await displayMessage(msg.from, { type: 'text', content: '[このメッセージは表示できません]' }, msgType, msg.read, msg.timestamp, msg.id);
         }
     }
     socket.emit('read_receipt', { from: currentUser.email, to: partnerEmail });
@@ -472,11 +480,7 @@ async function sendMessage(type, content) {
     const messagePayload = { type, content };
     const recipientPublicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
     const encryptedBody = await encryptMessage(recipientPublicKey, messagePayload);
-    const msg = {
-        id: Date.now(), from: currentUser.email, to: partnerEmail,
-        encryptedBody: arrayBufferToBase64(encryptedBody),
-        timestamp: Date.now()
-    };
+    const msg = { id: Date.now(), from: currentUser.email, to: partnerEmail, encryptedBody: arrayBufferToBase64(encryptedBody), timestamp: Date.now(), read: false };
     socket.emit('private_message', msg);
     await displayMessage(currentUser.email, messagePayload, 'sent', false, msg.timestamp, msg.id);
     if (type === 'text') DOM.messageInput.value = '';
@@ -486,7 +490,6 @@ async function handleIncomingMessage(payload) {
     const fromEmail = payload.from;
     const decryptedPayload = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(payload.encryptedBody));
     if (!decryptedPayload) return;
-
     if (decryptedPayload.type === 'mail') {
         const { usersData } = await api('getUsersData', { emails: [fromEmail] });
         showToast(`新着メール from ${usersData[fromEmail]?.displayName || fromEmail}: ${decryptedPayload.content.subject}`, 'info');
@@ -510,8 +513,6 @@ async function handleReadReceipt(payload) {
     if (payload.from === activeConversation?.partnerEmail) {
         document.querySelectorAll('.message.sent .read-status').forEach(el => { el.innerText = '既読'; });
     }
-    await refreshCurrentUserState(); // DBから最新の状態を取得
-    await renderContactList(); // 未読バッジなどを更新
 }
 
 async function displayMessage(from, body, type, read = false, timestamp, id = null) {
@@ -523,16 +524,13 @@ async function displayMessage(from, body, type, read = false, timestamp, id = nu
     const senderIcon = (type === 'sent' ? currentUser.icon : senderData?.icon) || '';
     let bubbleContent = '';
     if (typeof body !== 'object' || body === null) body = { type: 'text', content: '[メッセージ形式エラー]' };
-
     switch(body.type) {
         case 'image': bubbleContent = `<img src="${body.content}" class="message-image" alt="添付画像">`; break;
         case 'stamp': bubbleContent = `<img src="${body.content}" class="message-stamp" alt="スタンプ">`; break;
         case 'file': bubbleContent = `<a href="${body.content.dataUrl}" download="${body.content.name}" class="message-file"><i class="fa-solid fa-file-arrow-down"></i> <div><strong>${body.content.name}</strong><br><small>${body.content.type}</small></div></a>`; break;
         default: bubbleContent = (body.content || '').replace(/</g, "<").replace(/>/g, ">");
     }
-
-    msgDiv.innerHTML = `
-        <div class="profile-icon" style="background-image: url(${senderIcon})"></div>
+    msgDiv.innerHTML = `<div class="profile-icon" style="background-image: url(${senderIcon})"></div>
         <div class="message-content">
             <div class="bubble">${bubbleContent}</div>
             <div class="message-meta">
@@ -542,9 +540,19 @@ async function displayMessage(from, body, type, read = false, timestamp, id = nu
         </div>`;
     DOM.messages.appendChild(msgDiv);
     DOM.messages.scrollTop = DOM.messages.scrollHeight;
+    
+    if (type === 'sent') {
+        msgDiv.oncontextmenu = (e) => {
+            e.preventDefault();
+            showContextMenu(e, [{
+                label: "メッセージを削除",
+                action: () => socket.emit('delete_message', { from: currentUser.email, to: activeConversation.partnerEmail, messageId: id })
+            }]);
+        };
+    }
 }
 
-function showModal({ title, content, actions }) { DOM.modalContent.innerHTML = `<h3>${title}</h3><div class="modal-body">${content}</div>`; const actionsEl = document.createElement('div'); actionsEl.className = 'modal-actions'; actions.forEach(a => { const btn = document.createElement('button'); btn.innerText = a.text; btn.className = a.class; btn.onclick = a.action; actionsEl.appendChild(btn); }); DOM.modalContent.appendChild(actionsEl); DOM.modalOverlay.classList.remove('hidden'); }
+function showModal({ title, content, actions }) { DOM.modalContent.innerHTML = `<h3>${title}</h3><div class="modal-body">${content}</div>`; const actionsEl = document.createElement('div'); actionsEl.className = 'modal-actions'; actions.forEach(a => { const btn = document.createElement('button'); btn.innerText = a.text; btn.className = a.class; btn.onclick = () => a.action(btn); actionsEl.appendChild(btn); }); DOM.modalContent.appendChild(actionsEl); DOM.modalOverlay.classList.remove('hidden'); }
 function closeModal() { DOM.modalOverlay.classList.add('hidden'); }
 document.body.addEventListener('click', () => { hasUserInteracted = true; }, { once: true });
 DOM.modalOverlay.addEventListener('click', (e) => { if (e.target === DOM.modalOverlay) closeModal(); });
@@ -565,19 +573,9 @@ async function saveProfile() {
     const preview = document.getElementById('icon-preview');
     const newIcon = preview.dataset.newIcon;
     let updated = false;
-    if (newDisplayName && newDisplayName !== currentUser.displayName) {
-        currentUser.displayName = newDisplayName;
-        DOM.currentUserDisplayName.innerText = newDisplayName;
-        updated = true;
-    }
-    if (newIcon) {
-        currentUser.icon = newIcon;
-        DOM.currentUserIcon.style.backgroundImage = `url(${newIcon})`;
-        updated = true;
-    }
-    if (updated) {
-        socket.emit('update_profile', {email: currentUser.email, newDisplayName, newIcon});
-    }
+    if (newDisplayName && newDisplayName !== currentUser.displayName) updated = true;
+    if (newIcon) updated = true;
+    if (updated) socket.emit('update_profile', {email: currentUser.email, newDisplayName, newIcon});
     closeModal();
 }
 
@@ -588,6 +586,29 @@ function showToast(message, type = 'info') {
     toast.innerHTML = `<i class="fa-solid ${iconClass}"></i><p>${message}</p>`;
     DOM.toastContainer.appendChild(toast);
     setTimeout(() => toast.remove(), 4000);
+}
+
+function showContextMenu(e, items) {
+    const menu = document.createElement('div');
+    menu.className = 'context-menu'; // You'll need to style this
+    items.forEach(item => {
+        const el = document.createElement('div');
+        el.innerText = item.label;
+        el.onclick = () => {
+            item.action();
+            document.body.removeChild(menu);
+        };
+        menu.appendChild(el);
+    });
+    menu.style.position = 'fixed';
+    menu.style.left = `${e.clientX}px`;
+    menu.style.top = `${e.clientY}px`;
+    document.body.appendChild(menu);
+    const remover = () => {
+        if(document.body.contains(menu)) document.body.removeChild(menu);
+        window.removeEventListener('click', remover);
+    };
+    setTimeout(() => window.addEventListener('click', remover), 100);
 }
 </script>
 </body>
