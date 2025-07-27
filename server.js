@@ -159,6 +159,21 @@ io.on('connection', (socket) => {
         await usersCollection.updateOne({ _id: to }, { $pull: { sentRequests: from }, $addToSet: { friends: from } });
         notifyUsers([from, to]);
     });
+
+        socket.on('delete_friend', async ({ from, to }) => {
+        if (db.users[from] && db.users[to]) {
+            // お互いの友達リストから、お互いを削除する
+            await usersCollection.updateOne({ _id: from }, { $pull: { friends: to } });
+            await usersCollection.updateOne({ _id: to }, { $pull: { friends: from } });
+
+            // チャット履歴も完全に削除する
+            const chatID = [from, to].sort().join('__');
+            await chatsCollection.deleteOne({ _id: chatID });
+
+            // 関係者全員に、DBが更新されたことを通知する
+            notifyUsers([from, to]);
+        }
+    });
     
     socket.on('private_message', async (payload) => {
         const chatID = [payload.from, payload.to].sort().join('__');
