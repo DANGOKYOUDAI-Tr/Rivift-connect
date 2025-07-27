@@ -54,6 +54,50 @@ app.post('/getUserData', async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Server error' }); }
 });
 
+app.post('/getSidebarData', async (req, res) => {
+    try {
+        const { email } = req.body;
+        const user = await usersCollection.findOne({ _id: email });
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        
+        const contactEmails = [...user.friends, ...user.requests, ...user.sentRequests];
+        const uniqueEmails = [...new Set(contactEmails)];
+        
+        const contactsData = {};
+        if (uniqueEmails.length > 0) {
+            const users = await usersCollection.find({ _id: { $in: uniqueEmails } }).toArray();
+            users.forEach(u => {
+                contactsData[u._id] = { displayName: u.displayName, icon: u.icon };
+            });
+        }
+        
+        const unreadCounts = {};
+        if (user.friends.length > 0) {
+            for (const friendEmail of user.friends) {
+                const chatID = [email, friendEmail].sort().join('__');
+                const chat = await chatsCollection.findOne({ _id: chatID });
+                if (chat) {
+                    const count = chat.messages.filter(msg => msg.to === email && !msg.read).length;
+                    unreadCounts[friendEmail] = count;
+                } else {
+                    unreadCounts[friendEmail] = 0;
+                }
+            }
+        }
+        
+        res.json({
+            friends: user.friends,
+            requests: user.requests,
+            sentRequests: user.sentRequests,
+            contactsData,
+            unreadCounts
+        });
+    } catch (e) { 
+        console.error("getSidebarData error:", e);
+        res.status(500).json({ error: 'Server error' }); 
+    }
+});
+
 app.post('/getUsersData', async (req, res) => {
     try {
         const { emails } = req.body;
