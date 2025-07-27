@@ -15,7 +15,7 @@ const MONGO_URI = process.env.MONGO_URI;
 let usersCollection;
 let chatsCollection;
 
-(async () => {
+async function connectToDatabase() {
     if (!MONGO_URI) { console.error("MONGO_URI not found."); process.exit(1); }
     try {
         const client = new MongoClient(MONGO_URI);
@@ -23,26 +23,35 @@ let chatsCollection;
         const db = client.db("rivift-connect-db");
         usersCollection = db.collection("users");
         chatsCollection = db.collection("chats");
-        console.log('Connected to MongoDB Atlas');
+        console.log('Successfully connected to MongoDB Atlas');
     } catch (e) {
         console.error("Failed to connect to MongoDB Atlas", e);
         process.exit(1);
     }
-})();
+}
 
 let onlineUsers = {};
 
-app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v5.0 is Active!</h1>'));
+app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</h1>'));
 
 app.post('/createUser', async (req, res) => {
     try {
         const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon } = req.body;
-        if (await usersCollection.findOne({ _id: email })) {
+        const existingUser = await usersCollection.findOne({ _id: email });
+        if (existingUser) {
             return res.status(400).json({ error: 'User already exists' });
         }
         await usersCollection.insertOne({ _id: email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon, friends: [], requests: [], sentRequests: [] });
         res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/getUserData', async (req, res) => {
+    try {
+        const { email } = req.body;
+        const userData = await usersCollection.findOne({ _id: email });
+        res.json({ userData });
+    } catch (error) { res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/getUsersData', async (req, res) => {
@@ -52,62 +61,34 @@ app.post('/getUsersData', async (req, res) => {
         if (emails && emails.length > 0) {
             const users = await usersCollection.find({ _id: { $in: emails } }).toArray();
             users.forEach(user => {
-                usersData[user._id] = {
-                    displayName: user.displayName,
-                    icon: user.icon,
-                    publicKeyJwk: user.publicKeyJwk 
-                };
+                usersData[user._id] = { displayName: user.displayName, icon: user.icon, publicKeyJwk: user.publicKeyJwk };
             });
         }
         res.json({ usersData });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error while fetching multiple users data.' });
-    }
-});
-
-app.post('/getSidebarData', async (req, res) => {
-    try {
-        const { email } = req.body;
-        const user = await usersCollection.findOne({ _id: email });
-        if (!user) return res.status(404).json({ error: 'User not found' });
-        
-        const contactEmails = [...user.friends, ...user.requests, ...user.sentRequests];
-        const uniqueEmails = [...new Set(contactEmails)];
-        
-        const contactsData = {};
-        if (uniqueEmails.length > 0) {
-            const users = await usersCollection.find({ _id: { $in: uniqueEmails } }).toArray();
-            users.forEach(u => {
-                contactsData[u._id] = { displayName: u.displayName, icon: u.icon };
-            });
-        }
-        
-        const unreadCounts = {};
-        if (user.friends.length > 0) {
-            for (const friendEmail of user.friends) {
-                const chatID = [email, friendEmail].sort().join('__');
-                const count = await chatsCollection.countDocuments({ _id: chatID, "messages.to": email, "messages.read": false });
-                unreadCounts[friendEmail] = count;
-            }
-        }
-        
-        res.json({
-            friends: user.friends,
-            requests: user.requests,
-            sentRequests: user.sentRequests,
-            contactsData,
-            unreadCounts
-        });
-    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+    } catch (error) { res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/getMessageHistory', async (req, res) => {
     try {
         const { user1, user2 } = req.body;
         const chatID = [user1, user2].sort().join('__');
-        const chat = await chatsCollection.findOne({ _id: chatID });
-        res.json({ history: chat ? chat.messages : [] });
-    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+        let chat = await chatsCollection.findOne({ _id: chatID });
+        const history = chat ? chat.messages : [];
+        res.json({ history });
+    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/saveMessage', async (req, res) => {
+    try {
+        const { user1, user2, message } = req.body;
+        const chatID = [user1, user2].sort().join('__');
+        await chatsCollection.updateOne(
+            { _id: chatID },
+            { $push: { messages: message }, $setOnInsert: { users: [user1, user2] } },
+            { upsert: true }
+        );
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ error: 'Server error' }); }
 });
 
 io.on('connection', (socket) => {
@@ -189,4 +170,8 @@ io.on('connection', (socket) => {
     });
 });
 
-server.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+connectToDatabase().then(() => {
+    server.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+}).catch(err => {
+    console.error("Failed to start server:", err);
+});
