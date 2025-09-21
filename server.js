@@ -176,15 +176,37 @@ io.on('connection', (socket) => {
         }
     });
     
-    socket.on('private_message', async (payload) => {
-        const chatID = [payload.from, payload.to].sort().join('__');
-        await chatsCollection.updateOne({ _id: chatID }, { $push: { messages: payload } }, { upsert: true });
-        
-        const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) io.to(recipientSocketId).emit('private_message', payload);
-        
-        const senderSocketId = onlineUsers[payload.from];
-        if (senderSocketId) io.to(senderSocketId).emit('db_updated_notification');
+socket.on('private_message', async (payload) => {
+        const { from, to, encryptedBodyForSender, encryptedBodyForReceiver, timestamp } = payload;
+        const messageToStore = {
+            id: timestamp,
+            from,
+            to,
+            encryptedBodyForSender,
+            encryptedBodyForReceiver,
+            timestamp,
+            read: false
+        };
+
+        const chatID = [from, to].sort().join('__');
+        await chatsCollection.updateOne(
+            { _id: chatID },
+            { $push: { messages: messageToStore }, $setOnInsert: { users: [from, to] } },
+            { upsert: true }
+        );
+        const recipientSocketId = onlineUsers[to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('private_message', {
+                id: messageToStore.id,
+                from: from,
+                encryptedBodyForReceiver: encryptedBodyForReceiver,
+                timestamp: messageToStore.timestamp
+            });
+        }
+        const senderSocketId = onlineUsers[from];
+        if (senderSocketId) {
+            io.to(senderSocketId).emit('db_updated_notification');
+        }
     });
 
     socket.on('read_receipt', async (payload) => {
