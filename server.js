@@ -147,13 +147,47 @@ app.get('/search', async (req, res) => {
             params: {
                 q: query,
                 format: 'json',
-                no_html: 1, // HTMLタグを除外
-                skip_disambig: 1 // 曖昧さ回避ページをスキップ
+                no_html: 1,
+                skip_disambig: 1
+            },
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
         });
-        res.json(response.data);
+
+        const results = {
+            AbstractText: response.data.AbstractText || '',
+            AbstractURL: response.data.AbstractURL || '',
+            Image: response.data.Image || '',
+            RelatedTopics: []
+        };
+
+        if (response.data.RelatedTopics && Array.isArray(response.data.RelatedTopics)) {
+            response.data.RelatedTopics.forEach(topic => {
+                if (topic.Result) { // 通常の検索結果
+                    results.RelatedTopics.push({
+                        Result: topic.Result,
+                        FirstURL: topic.FirstURL,
+                        Text: topic.Text
+                    });
+                } else if (topic.Topics && Array.isArray(topic.Topics)) { // カテゴリ分けされた結果
+                    topic.Topics.forEach(subTopic => {
+                        if (subTopic.Result) {
+                            results.RelatedTopics.push({
+                                Result: subTopic.Result,
+                                FirstURL: subTopic.FirstURL,
+                                Text: subTopic.Text
+                            });
+                        }
+                    });
+                }
+            });
+        }
+        
+        res.json(results);
+
     } catch (error) {
-        console.error('DuckDuckGo API Error:', error);
+        console.error('DuckDuckGo API Error:', error.message);
         res.status(500).json({ error: 'Failed to fetch search results.' });
     }
 });
