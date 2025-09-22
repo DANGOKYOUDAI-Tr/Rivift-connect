@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
 const { MongoClient } = require('mongodb');
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -134,6 +135,27 @@ app.post('/saveMessage', async (req, res) => {
         );
         res.json({ success: true });
     } catch (error) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.get('/search', async (req, res) => {
+    const query = req.query.q;
+    if (!query) {
+        return res.status(400).json({ error: 'Query parameter "q" is required.' });
+    }
+    try {
+        const response = await axios.get('https://api.duckduckgo.com/', {
+            params: {
+                q: query,
+                format: 'json',
+                no_html: 1, // HTMLタグを除外
+                skip_disambig: 1 // 曖昧さ回避ページをスキップ
+            }
+        });
+        res.json(response.data);
+    } catch (error) {
+        console.error('DuckDuckGo API Error:', error);
+        res.status(500).json({ error: 'Failed to fetch search results.' });
+    }
 });
 
 io.on('connection', (socket) => {
