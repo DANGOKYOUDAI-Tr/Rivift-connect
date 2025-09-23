@@ -121,16 +121,11 @@ app.post('/getMessageHistory', async (req, res) => {
     try {
         const { user1, user2 } = req.body;
         const chatID = [user1, user2].sort().join('__');
-        
-        // chatsコレクションから、chatIDが一致するメッセージを、
-        // timestampの降順（新しい順）で、最大50件まで取得する
         const history = await chatsCollection
             .find({ chatID: chatID })
             .sort({ timestamp: -1 })
             .limit(50)
             .toArray();
-            
-        // クライアント側は古い順に表示したいので、逆順にして返す
         res.json({ history: history.reverse() });
 
     } catch (error) {
