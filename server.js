@@ -367,6 +367,14 @@ socket.on('private_message', async (payload) => {
         }
     });
 
+    // 「通話拒否」を中継する
+    socket.on('webrtc-reject-call', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('webrtc-reject-call', { from: socket.email });
+        }
+    });
+
 });
 
 connectToDatabase().then(() => {
