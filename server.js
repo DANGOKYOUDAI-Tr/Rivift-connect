@@ -272,7 +272,7 @@ socket.on('private_message', async (payload) => {
 
     const chatID = [from, to].sort().join('__');
     await chatsCollection.updateOne(
-        { __id: chatID },
+        { _id: chatID },
         { $push: { messages: messageToStore }, $setOnInsert: { users: [from, to] } },
         { upsert: true }
     );
