@@ -279,15 +279,18 @@ socket.on('private_message', async (payload) => {
     }
 });
 
-    socket.on('read_receipt', async (payload) => {
+socket.on('read_receipt', async (payload) => {
+    try { 
         const chatID = [payload.from, payload.to].sort().join('__');
         await chatsCollection.updateMany(
-            { _id: chatID },
-            { $set: { "messages.$[elem].read": true } },
-            { arrayFilters: [ { "elem.to": payload.from, "elem.from": payload.to } ] }
+            { chatID: chatID, to: payload.from },
+            { $set: { read: true } }
         );
         notifyUsers([payload.from, payload.to]);
-    });
+    } catch (e) {
+        console.error("read_receipt error:", e);
+    }
+});
 
     socket.on('delete_message', async ({ from, to, messageId }) => {
         const chatID = [from, to].sort().join('__');
