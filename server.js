@@ -236,30 +236,54 @@ io.on('connection', (socket) => {
     });
     
 socket.on('private_message', async (payload) => {
-    const { from, to, timestamp } = payload;
-    const messageToStore = {
-        id: timestamp,
-        read: false,
-        ...payload // from, to, type, encryptedFile, encryptedKey... など、受け取ったもの全て
-    };
+    const { from, to, timestamp, type } = payload;
+    let messageToStore;
+
+    if (type === 'file') {
+        // ファイルメッセージの場合
+        messageToStore = {
+            id: timestamp,
+            read: false,
+            from: from,
+            to: to,
+            timestamp: timestamp,
+            type: 'file',
+            encryptedFile: payload.encryptedFile,
+            encryptedKeyForSender: payload.encryptedKeyForSender,
+            encryptedKeyForReceiver: payload.encryptedKeyForReceiver
+        };
+    } else if (type === 'encrypted_text') {
+        // テキストメッセージの場合
+        messageToStore = {
+            id: timestamp,
+            read: false,
+            from: from,
+            to: to,
+            timestamp: timestamp,
+            type: 'encrypted_text',
+            encryptedBodyForSender: payload.encryptedBodyForSender,
+            encryptedBodyForReceiver: payload.encryptedBodyForReceiver
+        };
+    } else {
+        // その他の予期せぬタイプは無視
+        console.warn("Unknown message type received:", type);
+        return;
+    }
 
     const chatID = [from, to].sort().join('__');
     await chatsCollection.updateOne(
-        { _id: chatID },
+        { __id: chatID },
         { $push: { messages: messageToStore }, $setOnInsert: { users: [from, to] } },
         { upsert: true }
     );
-
+    
     const recipientSocketId = onlineUsers[to];
     if (recipientSocketId) {
-        const payloadForReceiver = { ...payload };
-        delete payloadForReceiver.encryptedBodyForSender; // テキストメッセージ用
-        delete payloadForReceiver.encryptedKeyForSender;  // ファイルメッセージ用
-
-        io.to(recipientSocketId).emit('private_message', payloadForReceiver);
+        // 相手に送る時は、payloadをそのまま送ってOK
+        io.to(recipientSocketId).emit('private_message', payload);
     }
     
-    // 送信者には、DBが更新されたことだけを通知する
+    // 送信者には、DBが更新されたことだけを通知
     const senderSocketId = onlineUsers[from];
     if (senderSocketId) {
         io.to(senderSocketId).emit('db_updated_notification');
