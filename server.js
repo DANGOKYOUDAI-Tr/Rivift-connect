@@ -121,10 +121,22 @@ app.post('/getMessageHistory', async (req, res) => {
     try {
         const { user1, user2 } = req.body;
         const chatID = [user1, user2].sort().join('__');
-        let chat = await chatsCollection.findOne({ _id: chatID });
-        const history = chat ? chat.messages : [];
-        res.json({ history });
-    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+        
+        // chatsコレクションから、chatIDが一致するメッセージを、
+        // timestampの降順（新しい順）で、最大50件まで取得する
+        const history = await chatsCollection
+            .find({ chatID: chatID })
+            .sort({ timestamp: -1 })
+            .limit(50)
+            .toArray();
+            
+        // クライアント側は古い順に表示したいので、逆順にして返す
+        res.json({ history: history.reverse() });
+
+    } catch (error) {
+        console.error("getMessageHistory error:", error);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 app.post('/saveMessage', async (req, res) => {
@@ -244,57 +256,31 @@ socket.on('delete_friend', async ({ from, to }) => {
 });
     
 socket.on('private_message', async (payload) => {
-    const { from, to, timestamp, type } = payload;
-    let messageToStore;
+    try {
+        const { from, to, timestamp } = payload;
+        const chatID = [from, to].sort().join('__');
 
-    if (type === 'file') {
-        // ファイルメッセージの場合
-        messageToStore = {
-            id: timestamp,
-            read: false,
-            from: from,
-            to: to,
-            timestamp: timestamp,
-            type: 'file',
-            encryptedFile: payload.encryptedFile,
-            encryptedKeyForSender: payload.encryptedKeyForSender,
-            encryptedKeyForReceiver: payload.encryptedKeyForReceiver
+        // payloadにchatIDを追加して、そのまま新しいドキュメントとして保存する
+        const messageToStore = {
+            chatID: chatID,
+            ...payload
         };
-    } else if (type === 'encrypted_text') {
-        // テキストメッセージの場合
-        messageToStore = {
-            id: timestamp,
-            read: false,
-            from: from,
-            to: to,
-            timestamp: timestamp,
-            type: 'encrypted_text',
-            encryptedBodyForSender: payload.encryptedBodyForSender,
-            encryptedBodyForReceiver: payload.encryptedBodyForReceiver
-        };
-    } else {
-        // その他の予期せぬタイプは無視
-        console.warn("Unknown message type received:", type);
-        return;
-    }
-
-    const chatID = [from, to].sort().join('__');
-    await chatsCollection.updateOne(
-        { _id: chatID },
-        { $push: { messages: messageToStore }, $setOnInsert: { users: [from, to] } },
-        { upsert: true }
-    );
-    
-    const recipientSocketId = onlineUsers[to];
-    if (recipientSocketId) {
-        // 相手に送る時は、payloadをそのまま送ってOK
-        io.to(recipientSocketId).emit('private_message', payload);
-    }
-    
-    // 送信者には、DBが更新されたことだけを通知
-    const senderSocketId = onlineUsers[from];
-    if (senderSocketId) {
-        io.to(senderSocketId).emit('db_updated_notification');
+        
+        // updateOneをやめて、insertOneで新しいドキュメントを一件追加する
+        await chatsCollection.insertOne(messageToStore);
+        
+        // (以降の、相手にメッセージを転送するロジックは変更なし)
+        const recipientSocketId = onlineUsers[to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('private_message', payload);
+        }
+        
+        const senderSocketId = onlineUsers[from];
+        if (senderSocketId) {
+            io.to(senderSocketId).emit('db_updated_notification');
+        }
+    } catch(e) {
+        console.error("private_message error:", e);
     }
 });
 
