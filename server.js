@@ -307,6 +307,48 @@ socket.on('private_message', async (payload) => {
     socket.on('disconnect', () => {
         if (socket.email) delete onlineUsers[socket.email];
     });
+//通話
+    // 「オファー」を中継する
+    socket.on('webrtc-offer', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('webrtc-offer', {
+                from: socket.email,
+                offer: payload.offer
+            });
+        }
+    });
+
+    // 「アンサー」を中継する
+    socket.on('webrtc-answer', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('webrtc-answer', {
+                from: socket.email,
+                answer: payload.answer
+            });
+        }
+    });
+
+    // 「経路情報(ICE Candidate)」を中継する
+    socket.on('webrtc-ice-candidate', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('webrtc-ice-candidate', {
+                from: socket.email,
+                candidate: payload.candidate
+            });
+        }
+    });
+
+    // 「通話終了」を中継する
+    socket.on('webrtc-end-call', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('webrtc-end-call', { from: socket.email });
+        }
+    });
+
 });
 
 connectToDatabase().then(() => {
