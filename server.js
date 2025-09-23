@@ -220,8 +220,13 @@ io.on('connection', (socket) => {
         notifyUsers([from, to]);
     });
 
-        socket.on('delete_friend', async ({ from, to }) => {
-        if (db.users[from] && db.users[to]) {
+socket.on('delete_friend', async ({ from, to }) => {
+    try { // エラーが起きてもサーバーが落ちないように try...catch で囲む
+        // ユーザーが存在するかどうかをちゃんと確認する
+        const fromUser = await usersCollection.findOne({ _id: from });
+        const toUser = await usersCollection.findOne({ _id: to });
+
+        if (fromUser && toUser) {
             // お互いの友達リストから、お互いを削除する
             await usersCollection.updateOne({ _id: from }, { $pull: { friends: to } });
             await usersCollection.updateOne({ _id: to }, { $pull: { friends: from } });
@@ -233,7 +238,10 @@ io.on('connection', (socket) => {
             // 関係者全員に、DBが更新されたことを通知する
             notifyUsers([from, to]);
         }
-    });
+    } catch (e) {
+        console.error("delete_friend error:", e);
+    }
+});
     
 socket.on('private_message', async (payload) => {
     const { from, to, timestamp, type } = payload;
