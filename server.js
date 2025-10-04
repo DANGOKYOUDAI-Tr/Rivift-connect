@@ -41,28 +41,37 @@ let onlineUsers = {};
 app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</h1>'));
 
 app.get('/get-ice-servers', async (req, res) => {
-  const turnUrl = process.env.TURN_URL;
-  const turnUsername = process.env.TURN_USERNAME;
-  const turnPassword = process.env.TURN_PASSWORD;
+  // Renderが自動で設定してくれるTURN_CONFIGという環境変数を読み込む
+  const turnConfig = process.env.TURN_CONFIG;
 
-  if (!turnUrl || !turnUsername || !turnPassword) {
-    console.error("TURN server environment variables not found!");
+  if (!turnConfig) {
+    console.error("TURN_CONFIG environment variable not found!");
+    // バックアップとしてGoogleのSTUNサーバーを返す
     return res.status(500).json([
       { urls: "stun:stun.l.google.com:19302" }
     ]);
   }
 
-  const iceServers = [
-    { urls: "stun:stun.l.google.com:19302" },
-    {
-      urls: turnUrl,
-      username: turnUsername,
-      credential: turnPassword,
-    }
-  ];
+  try {
+    const config = JSON.parse(turnConfig);
 
-  console.log("Returning self-hosted TURN server config:", iceServers);
-  res.json(iceServers);
+    const iceServers = [
+      { urls: "stun:stun.l.google.com:19302" },
+      {
+        urls: config.uris, 
+        username: config.username,
+        credential: config.password,
+      }
+    ];
+
+    console.log("Returning self-hosted TURN server config:", iceServers);
+    res.json(iceServers);
+  } catch (error) {
+    console.error("Failed to parse TURN_CONFIG:", error);
+    return res.status(500).json([
+      { urls: "stun:stun.l.google.com:19302" }
+    ]);
+  }
 });
 
 app.post('/createUser', async (req, res) => {

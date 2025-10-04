@@ -10,21 +10,11 @@ services:
         fromDatabase:
           name: rivift-connect-db
           property: connectionString
-      - key: TURN_URL
+      - key: TURN_CONFIG
         fromService:
           type: turn
           name: rivift-turn-server
-          property: url
-      - key: TURN_USERNAME
-        fromService:
-          type: turn
-          name: rivift-turn-server
-          property: username
-      - key: TURN_PASSWORD
-        fromService:
-          type: turn
-          name: rivift-turn-server
-          property: credential
+          property: all
 
   - type: turn
     name: rivift-turn-server
