@@ -41,21 +41,28 @@ let onlineUsers = {};
 app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</h1>'));
 
 app.get('/get-ice-servers', async (req, res) => {
-  try {
-    const response = await axios.get("https://openrelay.metered.ca/api/v1/turn/credentials?apiKey=1543912a7e4e13e008639223b79119253438");
-    const iceServers = response.data;
-    
-    console.log("Successfully fetched ICE servers from Open Relay Project:", iceServers);
-    res.json(iceServers);
+  const turnUrl = process.env.TURN_URL;
+  const turnUsername = process.env.TURN_USERNAME;
+  const turnPassword = process.env.TURN_PASSWORD;
 
-  } catch (error) {
-    const errorDetails = error.response ? JSON.stringify(error.response.data) : error.message;
-    console.error("Failed to get ICE servers from Open Relay:", errorDetails);
-    res.status(500).json([
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" },
+  if (!turnUrl || !turnUsername || !turnPassword) {
+    console.error("TURN server environment variables not found!");
+    return res.status(500).json([
+      { urls: "stun:stun.l.google.com:19302" }
     ]);
   }
+
+  const iceServers = [
+    { urls: "stun:stun.l.google.com:19302" },
+    {
+      urls: turnUrl,
+      username: turnUsername,
+      credential: turnPassword,
+    }
+  ];
+
+  console.log("Returning self-hosted TURN server config:", iceServers);
+  res.json(iceServers);
 });
 
 app.post('/createUser', async (req, res) => {

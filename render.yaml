@@ -1,0 +1,38 @@
+services:
+  # 1. 君のシグナリングサーバー（Node.js）の設定
+  - type: web
+    name: rivift-connect-signaling
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node server.js"
+    envVars:
+      - key: MONGO_URI
+        fromDatabase:
+          name: rivift-connect-db
+          property: connectionString
+      - key: TURN_URL
+        fromService:
+          type: turn
+          name: rivift-turn-server
+          property: url
+      - key: TURN_USERNAME
+        fromService:
+          type: turn
+          name: rivift-turn-server
+          property: username
+      - key: TURN_PASSWORD
+        fromService:
+          type: turn
+          name: rivift-turn-server
+          property: credential
+
+  # 2. Renderが提供するTURNサーバー（coturn）の設定
+  - type: turn
+    name: rivift-turn-server
+    ipAllowList: [] # 誰でもアクセスできるように空にする
+
+databases:
+  - name: rivift-connect-db
+    databaseName: riviftconnectdb
+    ipAllowList: []
