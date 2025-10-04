@@ -42,7 +42,8 @@ app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</
 
 app.get('/get-ice-servers', async (req, res) => {
   try {
-    const response = await fetch("https://rivift-os-turn-server.onrender.com/api/v1/turn/credentials?apiKey=1543912a7e4e13e008639223b79119253438");
+    const response = await fetch("https://global.relay.metered.ca/api/v1/turn/credentials?apiKey=1543912a7e4e13e008639223b79119253438");
+
     if (!response.ok) {
         throw new Error(`API responded with status: ${response.status}`);
     }
