@@ -41,16 +41,32 @@ let onlineUsers = {};
 app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</h1>'));
 
 app.get('/get-ice-servers', async (req, res) => {
-  const iceServers = [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" },
-  ];
+  try {
+    const accountSid = 'ACa1a7983360347e3612d37c3746618c7e';
+    const authToken = '406f54316886e24699564177d08658a5';
 
-  console.log("Returning hardcoded STUN servers:", iceServers);
-  res.json(iceServers);
+    const authHeader = 'Basic ' + Buffer.from(accountSid + ':' + authToken).toString('base64');
+
+    const response = await axios.post(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Tokens.json`,
+      null,
+      {
+        headers: {
+          'Authorization': authHeader
+        }
+      }
+    );
+
+    const iceServers = response.data.ice_servers;
+    
+    console.log("Successfully fetched ICE servers from Twilio:", iceServers);
+    res.json(iceServers);
+
+  } catch (error) {
+    const errorDetails = error.response ? JSON.stringify(error.response.data) : error.message;
+    console.error("Failed to get ICE servers from Twilio:", errorDetails);
+    res.status(500).json({ error: "Failed to get ICE servers", details: errorDetails });
+  }
 });
 
 app.post('/createUser', async (req, res) => {
