@@ -4,7 +4,6 @@ const { Server } = require("socket.io");
 const cors = require('cors');
 const { MongoClient } = require('mongodb');
 const axios = require('axios');
-const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
@@ -39,40 +38,6 @@ async function connectToDatabase() {
 let onlineUsers = {};
 
 app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</h1>'));
-
-app.get('/get-ice-servers', async (req, res) => {
-  // Renderが自動で設定してくれるTURN_CONFIGという環境変数を読み込む
-  const turnConfig = process.env.TURN_CONFIG;
-
-  if (!turnConfig) {
-    console.error("TURN_CONFIG environment variable not found!");
-    // バックアップとしてGoogleのSTUNサーバーを返す
-    return res.status(500).json([
-      { urls: "stun:stun.l.google.com:19302" }
-    ]);
-  }
-
-  try {
-    const config = JSON.parse(turnConfig);
-
-    const iceServers = [
-      { urls: "stun:stun.l.google.com:19302" },
-      {
-        urls: config.uris, 
-        username: config.username,
-        credential: config.password,
-      }
-    ];
-
-    console.log("Returning self-hosted TURN server config:", iceServers);
-    res.json(iceServers);
-  } catch (error) {
-    console.error("Failed to parse TURN_CONFIG:", error);
-    return res.status(500).json([
-      { urls: "stun:stun.l.google.com:19302" }
-    ]);
-  }
-});
 
 app.post('/createUser', async (req, res) => {
     try {
