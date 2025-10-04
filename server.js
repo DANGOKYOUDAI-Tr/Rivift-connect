@@ -42,15 +42,25 @@ app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</
 
 app.get('/get-ice-servers', async (req, res) => {
   try {
-    const response = await fetch("https://global.relay.metered.ca/api/v1/turn/credentials?apiKey=1543912a7e4e13e008639223b79119253438");
+    const accountSid = 'ACa1a7983360347e3612d37c3746618c7e';
+    const authToken = '406f54316886e24699564177d08658a5';
 
-    if (!response.ok) {
-        throw new Error(`API responded with status: ${response.status}`);
-    }
-    const iceServers = await response.json();
+    const response = await axios({
+      method: 'post',
+      url: `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Tokens.json`,
+      auth: {
+        username: accountSid,
+        password: authToken
+      }
+    });
+
+    const iceServers = response.data.ice_servers;
+    
+    console.log("Successfully fetched ICE servers from Twilio:", iceServers);
     res.json(iceServers);
+
   } catch (error) {
-    console.error("Failed to get ICE servers:", error);
+    console.error("Failed to get ICE servers from Twilio:", error.response ? error.response.data : error.message);
     res.status(500).json({ error: "Failed to get ICE servers" });
   }
 });
