@@ -4,6 +4,7 @@ const { Server } = require("socket.io");
 const cors = require('cors');
 const { MongoClient } = require('mongodb');
 const axios = require('axios');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
@@ -12,7 +13,7 @@ app.use(express.json({limit: '50mb'}));
 const server = http.createServer(app);
 const io = new Server(server, { 
     cors: { origin: "*", methods: ["GET", "POST"] },
-    maxHttpBufferSize: 50e6 // 最大50MBのデータまで受け取れるようにする
+    maxHttpBufferSize: 50e6
 });
 const PORT = process.env.PORT || 3001;
 
@@ -38,6 +39,20 @@ async function connectToDatabase() {
 let onlineUsers = {};
 
 app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</h1>'));
+
+app.get('/get-ice-servers', async (req, res) => {
+  try {
+    const response = await fetch("https://rivift-os-turn-server.onrender.com/api/v1/turn/credentials?apiKey=1543912a7e4e13e008639223b79119253438");
+    if (!response.ok) {
+        throw new Error(`API responded with status: ${response.status}`);
+    }
+    const iceServers = await response.json();
+    res.json(iceServers);
+  } catch (error) {
+    console.error("Failed to get ICE servers:", error);
+    res.status(500).json({ error: "Failed to get ICE servers" });
+  }
+});
 
 app.post('/createUser', async (req, res) => {
     try {
@@ -174,13 +189,13 @@ app.get('/search', async (req, res) => {
 
         if (response.data.RelatedTopics && Array.isArray(response.data.RelatedTopics)) {
             response.data.RelatedTopics.forEach(topic => {
-                if (topic.Result) { // 通常の検索結果
+                if (topic.Result) {
                     results.RelatedTopics.push({
                         Result: topic.Result,
                         FirstURL: topic.FirstURL,
                         Text: topic.Text
                     });
-                } else if (topic.Topics && Array.isArray(topic.Topics)) { // カテゴリ分けされた結果
+                } else if (topic.Topics && Array.isArray(topic.Topics)) {
                     topic.Topics.forEach(subTopic => {
                         if (subTopic.Result) {
                             results.RelatedTopics.push({
@@ -227,70 +242,56 @@ io.on('connection', (socket) => {
         notifyUsers([from, to]);
     });
 
-socket.on('delete_friend', async ({ from, to }) => {
-    try { // エラーが起きてもサーバーが落ちないように try...catch で囲む
-        // ユーザーが存在するかどうかをちゃんと確認する
-        const fromUser = await usersCollection.findOne({ _id: from });
-        const toUser = await usersCollection.findOne({ _id: to });
-
-        if (fromUser && toUser) {
-            // お互いの友達リストから、お互いを削除する
-            await usersCollection.updateOne({ _id: from }, { $pull: { friends: to } });
-            await usersCollection.updateOne({ _id: to }, { $pull: { friends: from } });
-
-            // チャット履歴も完全に削除する
-            const chatID = [from, to].sort().join('__');
-            await chatsCollection.deleteOne({ _id: chatID });
-
-            // 関係者全員に、DBが更新されたことを通知する
-            notifyUsers([from, to]);
+    socket.on('delete_friend', async ({ from, to }) => {
+        try {
+            const fromUser = await usersCollection.findOne({ _id: from });
+            const toUser = await usersCollection.findOne({ _id: to });
+            if (fromUser && toUser) {
+                await usersCollection.updateOne({ _id: from }, { $pull: { friends: to } });
+                await usersCollection.updateOne({ _id: to }, { $pull: { friends: from } });
+                const chatID = [from, to].sort().join('__');
+                await chatsCollection.deleteOne({ _id: chatID });
+                notifyUsers([from, to]);
+            }
+        } catch (e) {
+            console.error("delete_friend error:", e);
         }
-    } catch (e) {
-        console.error("delete_friend error:", e);
-    }
-});
+    });
     
-socket.on('private_message', async (payload) => {
-    try {
-        const { from, to, timestamp } = payload;
-        const chatID = [from, to].sort().join('__');
-
-        // payloadにchatIDを追加して、そのまま新しいドキュメントとして保存する
-        const messageToStore = {
-            chatID: chatID,
-            ...payload
-        };
-        
-        // updateOneをやめて、insertOneで新しいドキュメントを一件追加する
-        await chatsCollection.insertOne(messageToStore);
-        
-        // (以降の、相手にメッセージを転送するロジックは変更なし)
-        const recipientSocketId = onlineUsers[to];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('private_message', payload);
+    socket.on('private_message', async (payload) => {
+        try {
+            const { from, to, timestamp } = payload;
+            const chatID = [from, to].sort().join('__');
+            const messageToStore = {
+                chatID: chatID,
+                ...payload
+            };
+            await chatsCollection.insertOne(messageToStore);
+            const recipientSocketId = onlineUsers[to];
+            if (recipientSocketId) {
+                io.to(recipientSocketId).emit('private_message', payload);
+            }
+            const senderSocketId = onlineUsers[from];
+            if (senderSocketId) {
+                io.to(senderSocketId).emit('db_updated_notification');
+            }
+        } catch(e) {
+            console.error("private_message error:", e);
         }
-        
-        const senderSocketId = onlineUsers[from];
-        if (senderSocketId) {
-            io.to(senderSocketId).emit('db_updated_notification');
-        }
-    } catch(e) {
-        console.error("private_message error:", e);
-    }
-});
+    });
 
-socket.on('read_receipt', async (payload) => {
-    try { 
-        const chatID = [payload.from, payload.to].sort().join('__');
-        await chatsCollection.updateMany(
-            { chatID: chatID, to: payload.from },
-            { $set: { read: true } }
-        );
-        notifyUsers([payload.from, payload.to]);
-    } catch (e) {
-        console.error("read_receipt error:", e);
-    }
-});
+    socket.on('read_receipt', async (payload) => {
+        try { 
+            const chatID = [payload.from, payload.to].sort().join('__');
+            await chatsCollection.updateMany(
+                { chatID: chatID, to: payload.from },
+                { $set: { read: true } }
+            );
+            notifyUsers([payload.from, payload.to]);
+        } catch (e) {
+            console.error("read_receipt error:", e);
+        }
+    });
 
     socket.on('delete_message', async ({ from, to, messageId }) => {
         const chatID = [from, to].sort().join('__');
@@ -323,8 +324,7 @@ socket.on('read_receipt', async (payload) => {
     socket.on('disconnect', () => {
         if (socket.email) delete onlineUsers[socket.email];
     });
-//通話
-    // 「オファー」を中継する
+
     socket.on('webrtc-offer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) {
@@ -335,7 +335,6 @@ socket.on('read_receipt', async (payload) => {
         }
     });
 
-    // 「アンサー」を中継する
     socket.on('webrtc-answer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) {
@@ -346,7 +345,6 @@ socket.on('read_receipt', async (payload) => {
         }
     });
 
-    // 「経路情報(ICE Candidate)」を中継する
     socket.on('webrtc-ice-candidate', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) {
@@ -357,7 +355,6 @@ socket.on('read_receipt', async (payload) => {
         }
     });
 
-    // 「通話終了」を中継する
     socket.on('webrtc-end-call', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) {
@@ -365,7 +362,6 @@ socket.on('read_receipt', async (payload) => {
         }
     });
 
-    // 「通話拒否」を中継する
     socket.on('webrtc-reject-call', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) {
