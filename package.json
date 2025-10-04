@@ -1,9 +1,17 @@
 {
+  "name": "rivift-connect-server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "axios": "^1.12.2",
+    "axios": "^1.7.2",
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "mongodb": "^6.18.0",
-    "socket.io": "^4.8.1"
+    "mongodb": "^6.7.0",
+    "node-fetch": "^2.7.0",
+    "socket.io": "^4.7.5"
   }
 }
