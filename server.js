@@ -44,15 +44,17 @@ app.get('/get-ice-servers', async (req, res) => {
   try {
     const accountSid = 'ACa1a7983360347e3612d37c3746618c7e';
     const authToken = '406f54316886e24699564177d08658a5';
+    const authHeader = 'Basic ' + Buffer.from(accountSid + ':' + authToken).toString('base64');
 
-    const response = await axios({
-      method: 'post',
-      url: `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Tokens.json`,
-      auth: {
-        username: accountSid,
-        password: authToken
+    const response = await axios.post(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Tokens.json`,
+      null,
+      {
+        headers: {
+          'Authorization': authHeader
+        }
       }
-    });
+    );
 
     const iceServers = response.data.ice_servers;
     
@@ -60,8 +62,9 @@ app.get('/get-ice-servers', async (req, res) => {
     res.json(iceServers);
 
   } catch (error) {
-    console.error("Failed to get ICE servers from Twilio:", error.response ? error.response.data : error.message);
-    res.status(500).json({ error: "Failed to get ICE servers" });
+    const errorDetails = error.response ? JSON.stringify(error.response.data) : error.message;
+    console.error("Failed to get ICE servers from Twilio:", errorDetails);
+    res.status(500).json({ error: "Failed to get ICE servers", details: errorDetails });
   }
 });
 
