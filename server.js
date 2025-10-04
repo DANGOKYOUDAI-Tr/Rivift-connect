@@ -42,30 +42,19 @@ app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</
 
 app.get('/get-ice-servers', async (req, res) => {
   try {
-    const accountSid = 'ACa1a7983360347e3612d37c3746618c7e';
-    const authToken = '406f54316886e24699564177d08658a5';
-    const authHeader = 'Basic ' + Buffer.from(accountSid + ':' + authToken).toString('base64');
-    const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Tokens.json`, {
-      method: 'POST',
-      headers: {
-        'Authorization': authHeader
-      }
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Twilio API responded with status: ${response.status}. Body: ${errorText}`);
-    }
-
-    const data = await response.json();
-    const iceServers = data.ice_servers;
+    const response = await axios.get("https://openrelay.metered.ca/api/v1/turn/credentials?apiKey=1543912a7e4e13e008639223b79119253438");
+    const iceServers = response.data;
     
-    console.log("Successfully fetched ICE servers from Twilio:", iceServers);
+    console.log("Successfully fetched ICE servers from Open Relay Project:", iceServers);
     res.json(iceServers);
 
   } catch (error) {
-    console.error("Failed to get ICE servers from Twilio:", error.message);
-    res.status(500).json({ error: "Failed to get ICE servers" });
+    const errorDetails = error.response ? JSON.stringify(error.response.data) : error.message;
+    console.error("Failed to get ICE servers from Open Relay:", errorDetails);
+    res.status(500).json([
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+    ]);
   }
 });
 
