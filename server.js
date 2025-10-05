@@ -308,18 +308,30 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('read_receipt', async (payload) => {
-        try { 
-            const chatID = [payload.from, payload.to].sort().join('__');
-            await chatsCollection.updateMany(
-                { chatID: chatID, to: payload.from },
-                { $set: { read: true } }
-            );
-            notifyUsers([payload.from, payload.to]);
-        } catch (e) {
-            console.error("read_receipt error:", e);
+socket.on('read_receipt', async (payload) => {
+    try { 
+        const readerEmail = payload.from; 
+        const writerEmail = payload.to;
+        const chatID = [readerEmail, writerEmail].sort().join('__');
+        await chatsCollection.updateMany(
+            { chatID: chatID, "messages.to": readerEmail, "messages.read": { $ne: true } },
+            { $set: { "messages.$[elem].read": true } },
+            { arrayFilters: [ { "elem.to": readerEmail } ] }
+        );
+        const readerSocketId = onlineUsers[readerEmail];
+        const writerSocketId = onlineUsers[writerEmail];
+
+        if (readerSocketId) {
+            io.to(readerSocketId).emit('messages_marked_as_read', { chatPartner: writerEmail });
         }
-    });
+        if (writerSocketId) {
+            io.to(writerSocketId).emit('messages_marked_as_read', { chatPartner: readerEmail });
+        }
+
+    } catch (e) {
+        console.error("read_receipt error:", e);
+    }
+});
 
     socket.on('delete_message', async ({ from, to, messageId }) => {
         const chatID = [from, to].sort().join('__');
