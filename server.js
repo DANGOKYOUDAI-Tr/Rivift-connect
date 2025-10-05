@@ -409,10 +409,10 @@ socket.on('read_receipt', async (payload) => {
         }
     });
 
-    socket.on('start_live_canvas_request', (payload) => {
+socket.on('live_canvas_invite', (payload) => {
     const recipientSocketId = onlineUsers[payload.to];
     if (recipientSocketId) {
-        io.to(recipientSocketId).emit('start_live_canvas_request', {
+        io.to(recipientSocketId).emit('live_canvas_invite', {
             from: socket.email
         });
     }
