@@ -203,9 +203,51 @@ app.get('/search', async (req, res) => {
 });
 
 io.on('connection', (socket) => {
+    let currentUserEmail = null;
+
+    const notifyFriendsOfStatusChange = async (email, isOnline) => {
+        try {
+            const user = await usersCollection.findOne({ _id: email });
+            if (user && user.friends) {
+                user.friends.forEach(friendEmail => {
+                    const friendSocketId = onlineUsers[friendEmail];
+                    if (friendSocketId) {
+                        io.to(friendSocketId).emit('friend_status_changed', {
+                            email: email,
+                            isOnline: isOnline
+                        });
+                    }
+                });
+            }
+        } catch (error) {
+            console.error('Error notifying friends of status change:', error);
+        }
+    };
+
     socket.on('login', ({ email }) => {
         onlineUsers[email] = socket.id;
+        currentUserEmail = email;
         socket.email = email;
+        notifyFriendsOfStatusChange(email, true);
+    });
+
+    socket.on('get_initial_statuses', async (payload, callback) => {
+        const userEmail = payload.email;
+        const user = await usersCollection.findOne({ _id: userEmail });
+        if (user && user.friends) {
+            const statuses = {};
+            user.friends.forEach(friendEmail => {
+                statuses[friendEmail] = !!onlineUsers[friendEmail];
+            });
+            callback(statuses);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        if (currentUserEmail) {
+            delete onlineUsers[currentUserEmail];
+            notifyFriendsOfStatusChange(currentUserEmail, false);
+        }
     });
 
     const notifyUsers = (userEmails) => {
