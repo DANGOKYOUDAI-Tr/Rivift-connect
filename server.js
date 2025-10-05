@@ -94,7 +94,7 @@ app.post('/getSidebarData', async (req, res) => {
             friends: user.friends,
             requests: user.requests,
             sentRequests: user.sentRequests,
-            contactsData,
+            usersData: contactsData,
             unreadCounts
         });
     } catch (e) { 
