@@ -119,12 +119,13 @@ app.post('/getUsersData', async (req, res) => {
 
 app.post('/getMessageHistory', async (req, res) => {
     try {
-        const { user1, user2 } = req.body;
+        const { user1, user2, limit = 50, skip = 0 } = req.body; 
         const chatID = [user1, user2].sort().join('__');
         const history = await chatsCollection
             .find({ chatID: chatID })
-            .sort({ timestamp: -1 })
-            .limit(50)
+            .sort({ timestamp: -1 }) 
+            .skip(skip)               
+            .limit(limit)           
             .toArray();
         res.json({ history: history.reverse() });
 
