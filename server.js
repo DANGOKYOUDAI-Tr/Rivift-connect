@@ -418,6 +418,27 @@ socket.on('live_canvas_invite', (payload) => {
     }
 });
 
+socket.on('live_canvas_draw', (payload) => {
+    const recipientSocketId = onlineUsers[payload.to];
+    if (recipientSocketId) {
+        io.to(recipientSocketId).emit('live_canvas_draw', {
+            from: socket.email,
+            x: payload.x, y: payload.y,
+            lastX: payload.lastX, lastY: payload.lastY,
+            color: payload.color, size: payload.size
+        });
+    }
+});
+
+socket.on('live_canvas_clear', (payload) => {
+    const recipientSocketId = onlineUsers[payload.to];
+    if (recipientSocketId) {
+        io.to(recipientSocketId).emit('live_canvas_clear', {
+            from: socket.email
+        });
+    }
+});
+
 });
 
 connectToDatabase().then(() => {
