@@ -183,6 +183,50 @@ app.get('/search', async (req, res) => {
     }
 });
 
+let totalDataProxied = 0; 
+
+function rewriteHtmlPaths(html, baseUrl) {
+    const base = new URL(baseUrl);
+    return html.replace(/(src|href|action|data-src)=(["'])(\/(?!\/)[^"']+)(["'])/g,
+        (match, attr, q1, path, q2) => {
+            return `${attr}=${q1}${base.origin}${path}${q2}`;
+        }
+    );
+}
+
+app.get('/proxy', async (req, res) => {
+    const url = req.query.url;
+    if (!url) {
+        return res.status(400).send('URL parameter is required.');
+    }
+
+    try {
+        const response = await axios.get(url, {
+            responseType: 'text', 
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        });
+
+        const contentLength = response.headers['content-length'] || response.data.length;
+        totalDataProxied += parseInt(contentLength, 10);
+
+        const rewrittenHtml = rewriteHtmlPaths(response.data, url);
+        res.send(rewrittenHtml);
+
+    } catch (error) {
+        console.error('Proxy error:', error.message);
+        res.status(500).send(`Failed to proxy request for ${url}. Error: ${error.message}`);
+    }
+});
+
+app.get('/getProxyStats', (req, res) => {
+    res.json({
+        totalDataProxied,
+        totalDataProxiedMB: (totalDataProxied / (1024 * 1024)).toFixed(2)
+    });
+});
+
 const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
 
