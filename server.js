@@ -183,6 +183,44 @@ app.get('/search', async (req, res) => {
     }
 });
 
+const { JSDOM } = require('jsdom');
+const { Readability } = require('@mozilla/readability');
+
+app.get('/extract', async (req, res) => {
+    const url = req.query.url;
+    if (!url) {
+        return res.status(400).json({ error: 'URL parameter is required.' });
+    }
+
+    try {
+        const response = await axios.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        });
+
+        const dom = new JSDOM(response.data, { url: url });
+        const reader = new Readability(dom.window.document);
+        const article = reader.parse();
+
+        if (article) {
+            res.json({
+                title: article.title,
+                content: article.content, 
+                textContent: article.textContent, 
+                author: article.byline,
+                length: article.length
+            });
+        } else {
+            res.status(404).json({ error: '記事のコンテンツを抽出できませんでした。' });
+        }
+
+    } catch (error) {
+        console.error('Extraction error:', error.message);
+        res.status(500).json({ error: 'ページの読み込みまたは解析に失敗しました。' });
+    }
+});
+
 io.on('connection', (socket) => {
     let currentUserEmail = null;
 
