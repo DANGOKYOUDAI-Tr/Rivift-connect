@@ -4,8 +4,8 @@ function postNavigationMessage(url) {
     if (url && typeof url === 'string' && (url.startsWith('http') || url.startsWith('/'))) {
         window.parent.postMessage({
             type: 'rivift-browser-nav',
-            url: url
-        }, trustedOrigin);
+            url: url 
+        }, '*'); 
     }
 }
 window.addEventListener('load', () => {
