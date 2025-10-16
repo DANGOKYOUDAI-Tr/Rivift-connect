@@ -240,6 +240,36 @@ app.get('/proxy', async (req, res) => {
     }
 });
 
+const google = require('google-it');
+
+app.get('/youtube-search', async (req, res) => {
+    const query = req.query.q;
+    if (!query) {
+        return res.status(400).json({ error: 'Query is required' });
+    }
+    try {
+        const options = {
+            query: `${query} site:youtube.com`, 
+            'no-display': true
+        };
+        const results = await google(options);
+        const videoResults = results.map(r => {
+            const videoIdMatch = r.link.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
+            return {
+                title: r.title,
+                link: r.link,
+                videoId: videoIdMatch ? videoIdMatch[1] : null
+            };
+        }).filter(r => r.videoId); 
+
+        res.json({ results: videoResults });
+
+    } catch (error) {
+        console.error('YouTube search error:', error);
+        res.status(500).json({ error: 'Failed to search YouTube' });
+    }
+});
+
 app.get('/getProxyStats', (req, res) => {
     res.json({
         totalDataProxied,
