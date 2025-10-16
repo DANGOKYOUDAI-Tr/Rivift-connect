@@ -223,10 +223,20 @@ app.get('/iframe-helper.js', (req, res) => {
 
 app.get('/proxy', async (req, res) => {
     const url = req.query.url;
-    if (!url) { return res.status(400).send('URL is required.'); }
+    if (!url) {
+        return res.status(400).send('URL parameter is required.');
+    }
+
     try {
-        const response = await axios.get(url, { responseType: 'text', headers: { 'User-Agent': '...' } });
+        const response = await axios.get(url, {
+            responseType: 'text',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        });
+
         let html = response.data;
+
         const helperScript = `<script src="${process.env.SERVER_BASE_URL || `http://localhost:${PORT}`}/iframe-helper.js"></script>`;
         const baseTag = `<base href="${url}">`;
 
@@ -236,10 +246,14 @@ app.get('/proxy', async (req, res) => {
             html = `${baseTag}${helperScript}${html}`;
         }
         
-        totalDataProxied += html.length;
+        const contentLength = response.headers['content-length'] || response.data.length;
+        totalDataProxied += parseInt(contentLength, 10);
+        
         res.send(html);
+
     } catch (error) {
-        res.status(500).send(`Proxy error: ${error.message}`);
+        console.error('Proxy error:', error.message);
+        res.status(500).send(`Failed to proxy request for ${url}. Error: ${error.message}`);
     }
 });
 
