@@ -166,36 +166,16 @@ app.get('/search', async (req, res) => {
             }
         });
 
-        const results = {
-            AbstractText: response.data.AbstractText || '',
-            AbstractURL: response.data.AbstractURL || '',
-            Image: response.data.Image || '',
-            RelatedTopics: []
-        };
+        const searchResults = (response.data.RelatedTopics || [])
+            .filter(topic => topic.Result) 
+            .map(topic => ({
+                title: topic.Text,
+                description: topic.Result.replace(/<[^>]*>?/gm, ''), 
+                url: topic.FirstURL
+            }));
 
-        if (response.data.RelatedTopics && Array.isArray(response.data.RelatedTopics)) {
-            response.data.RelatedTopics.forEach(topic => {
-                if (topic.Result) {
-                    results.RelatedTopics.push({
-                        Result: topic.Result,
-                        FirstURL: topic.FirstURL,
-                        Text: topic.Text
-                    });
-                } else if (topic.Topics && Array.isArray(topic.Topics)) {
-                    topic.Topics.forEach(subTopic => {
-                        if (subTopic.Result) {
-                            results.RelatedTopics.push({
-                                Result: subTopic.Result,
-                                FirstURL: subTopic.FirstURL,
-                                Text: subTopic.Text
-                            });
-                        }
-                    });
-                }
-            });
-        }
-        
-        res.json(results);
+        res.json({ results: searchResults });
+
 
     } catch (error) {
         console.error('DuckDuckGo API Error:', error.message);
