@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
+const path = require('path');
 const { MongoClient } = require('mongodb');
 const axios = require('axios');
 
@@ -183,6 +184,8 @@ app.get('/search', async (req, res) => {
     }
 });
 
+
+
 let totalDataProxied = 0; 
 
 function rewriteHtmlPaths(html, baseUrl) {
@@ -214,6 +217,10 @@ function rewriteHtmlPaths(html, baseUrl) {
     return rewrittenHtml;
 }
 
+app.get('/iframe-helper.js', (req, res) => {
+    res.sendFile(path.join(__dirname, 'iframe-helper.js'));
+});
+
 app.get('/proxy', async (req, res) => {
     const url = req.query.url;
     if (!url) {
@@ -222,21 +229,28 @@ app.get('/proxy', async (req, res) => {
 
     try {
         const response = await axios.get(url, {
-            responseType: 'text', 
+            responseType: 'text',
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
         });
 
+        let html = response.data;
+        const helperScript = `<script src="${process.env.SERVER_BASE_URL || `http://localhost:${PORT}`}/iframe-helper.js"></script>`;
+        const baseTag = `<base href="${url}">`;
+        if (html.includes('<head>')) {
+            html = html.replace('<head>', `<head>${baseTag}${helperScript}`);
+        } else {
+            html = `${baseTag}${helperScript}${html}`;
+        }
         const contentLength = response.headers['content-length'] || response.data.length;
         totalDataProxied += parseInt(contentLength, 10);
-
-        const rewrittenHtml = rewriteHtmlPaths(response.data, url);
-        res.send(rewrittenHtml);
+        
+        res.send(html);
 
     } catch (error) {
         console.error('Proxy error:', error.message);
-        res.status(500).send(`Failed to proxy request for ${url}. Error: ${error.message}`);
+        res.status(500).send(`Failed to proxy request. Error: ${error.message}`);
     }
 });
 
