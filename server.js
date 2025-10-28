@@ -5,6 +5,7 @@ const cors = require('cors');
 const path = require('path');
 const { MongoClient } = require('mongodb');
 const axios = require('axios');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
@@ -129,7 +130,6 @@ app.post('/getMessageHistory', async (req, res) => {
             .limit(limit)           
             .toArray();
         res.json({ history: history.reverse() });
-
     } catch (error) {
         console.error("getMessageHistory error:", error);
         res.status(500).json({ error: 'Server error' });
@@ -176,84 +176,34 @@ app.get('/search', async (req, res) => {
             }));
 
         res.json({ results: searchResults });
-
-
     } catch (error) {
         console.error('DuckDuckGo API Error:', error.message);
         res.status(500).json({ error: 'Failed to fetch search results.' });
     }
 });
 
-
-
-let totalDataProxied = 0; 
-
-function rewriteHtmlPaths(html, baseUrl) {
-    const base = new URL(baseUrl);
-    const domain = base.origin;
-    const rewrite = (content) => {
-        content = content.replace(/(src|href|action|data-src)=(["'])(\/(?!\/)[^"']+)(["'])/g,
-            (match, attr, q1, path, q2) => `${attr}=${q1}${domain}${path}${q2}`
-        );
-        content = content.replace(/(src|href|action|data-src)=(["'])(?!\/|https?:|data:)([^"']+)(["'])/g,
-            (match, attr, q1, path, q2) => {
-                const newUrl = new URL(path, baseUrl).href;
-                return `${attr}=${q1}${newUrl}${q2}`;
-            }
-        );
-        
-        return content;
-    };
-
-    let rewrittenHtml = rewrite(html);
-    rewrittenHtml = rewrittenHtml.replace(/<style([^>]*)>([\s\S]*?)<\/style>/gi, (match, attrs, css) => {
-        const rewrittenCss = css.replace(/url\((["']?)(?!\/|https?:|data:)([^"'\)]+)(["']?)\)/g, (match, q1, path, q2) => {
-            const newUrl = new URL(path, baseUrl).href;
-            return `url(${q1}${newUrl}${q2})`;
-        });
-        return `<style${attrs}>${rewrittenCss}</style>`;
-    });
-
-    return rewrittenHtml;
-}
-
-app.get('/iframe-helper.js', (req, res) => {
-    res.sendFile(path.join(__dirname, 'iframe-helper.js'));
-});
-
-app.get('/proxy', async (req, res) => {
-    const url = req.query.url;
-    if (!url) {
-        return res.status(400).send('URL parameter is required.');
-    }
-
+app.post('/proxy', async (req, res) => {
     try {
-        const response = await axios.get(url, {
-            responseType: 'text',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-        });
-
-        let html = response.data;
-
-        const helperScript = `<script src="${process.env.SERVER_BASE_URL || `http://localhost:${PORT}`}/iframe-helper.js"></script>`;
-        const baseTag = `<base href="${url}">`;
-
-        if (html.includes('<head>')) {
-            html = html.replace('<head>', `<head>${baseTag}${helperScript}`);
-        } else {
-            html = `${baseTag}${helperScript}${html}`;
+        const { url, method, headers, body } = req.body;
+        if (!url) {
+            return res.status(400).send('URL is required.');
         }
-        
-        const contentLength = response.headers['content-length'] || response.data.length;
-        totalDataProxied += parseInt(contentLength, 10);
-        
-        res.send(html);
-
+        const fetchOptions = {
+            method: method,
+            headers: { ...headers },
+            body: body ? Buffer.from(body, 'base64') : null,
+            redirect: 'follow'
+        };
+        delete fetchOptions.headers['host'];
+        delete fetchOptions.headers['origin'];
+        delete fetchOptions.headers['referer'];
+        delete fetchOptions.headers['content-length'];
+        fetchOptions.headers['user-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36';
+        const response = await fetch(url, fetchOptions);
+        res.setHeader('x-proxy-headers', JSON.stringify(Object.fromEntries(response.headers)));
+        response.body.pipe(res);
     } catch (error) {
-        console.error('Proxy error:', error.message);
-        res.status(500).send(`Failed to proxy request for ${url}. Error: ${error.message}`);
+        res.status(500).send(error.message);
     }
 });
 
@@ -280,13 +230,13 @@ app.get('/youtube-search', async (req, res) => {
         }).filter(r => r.videoId); 
 
         res.json({ results: videoResults });
-
     } catch (error) {
         console.error('YouTube search error:', error);
         res.status(500).json({ error: 'Failed to search YouTube' });
     }
 });
 
+let totalDataProxied = 0; 
 app.get('/getProxyStats', (req, res) => {
     res.json({
         totalDataProxied,
@@ -325,7 +275,6 @@ app.get('/extract', async (req, res) => {
         } else {
             res.status(404).json({ error: '記事のコンテンツを抽出できませんでした。' });
         }
-
     } catch (error) {
         console.error('Extraction error:', error.message);
         res.status(500).json({ error: 'ページの読み込みまたは解析に失敗しました。' });
