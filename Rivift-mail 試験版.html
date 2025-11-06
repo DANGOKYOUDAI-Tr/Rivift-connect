@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rivift Connect v3.0</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        /* 基本スタイルとレイアウト */
+:root { --bg-dark: #1e1e1e; --bg-medium: #2d2d2d; --bg-light: #3c3c3c; --text-primary: #e0e0e0; --text-secondary: #a0a0a0; --accent-blue: #007bff; --accent-green: #28a745; --accent-red: #dc3545; }
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: var(--bg-dark); color: var(--text-primary); overflow: hidden; }
+#app-container { width: 100vw; height: 100vh; }
+.view { width: 100%; height: 100%; display: none; }
+.view.active { display: flex; }
+.hidden { display: none !important; }
+
+/* 認証画面 */
+#auth-view { justify-content: center; align-items: center; }
+.auth-box { width: 340px; padding: 40px; background-color: var(--bg-medium); border-radius: 8px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+.auth-box h1 { margin-top: 0; margin-bottom: 10px; color: white; }
+.auth-description { color: var(--text-secondary); margin-bottom: 30px; font-size: 14px; }
+.auth-box input, .auth-box button { width: 100%; padding: 12px; margin-bottom: 15px; border-radius: 4px; border: 1px solid var(--bg-light); background-color: var(--bg-dark); color: var(--text-primary); font-size: 16px; }
+.auth-box button { background-color: var(--accent-blue); border: none; cursor: pointer; transition: background-color 0.2s; }
+.auth-box button:hover { background-color: #0056b3; }
+.auth-toggle { font-size: 13px; color: var(--text-secondary); }
+.auth-toggle a { color: var(--accent-blue); text-decoration: none; }
+
+/* メイン画面 */
+#main-view { flex-direction: row; }
+.sidebar { width: 300px; background-color: var(--bg-medium); display: flex; flex-direction: column; border-right: 1px solid #111; }
+.sidebar-header { padding: 15px; border-bottom: 1px solid #111; display: flex; justify-content: space-between; align-items: center; }
+.current-user-profile { display: flex; align-items: center; gap: 10px; cursor: pointer; overflow: hidden; flex-grow: 1; padding: 5px; border-radius: 5px; transition: background-color 0.2s; }
+.current-user-profile:hover { background-color: var(--bg-light); }
+.profile-icon { width: 40px; height: 40px; border-radius: 50%; background-color: var(--bg-light); background-size: cover; background-position: center; flex-shrink: 0; }
+#current-user-display-name { font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#logout-btn { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 18px; padding: 8px; border-radius: 50%; }
+#logout-btn:hover { color: var(--text-primary); background-color: var(--bg-light); }
+.sidebar-actions { display: flex; padding: 10px; gap: 10px; border-bottom: 1px solid #111; }
+.sidebar-actions button { flex-grow: 1; padding: 10px; font-size: 18px; border-radius: 4px; border: 1px solid var(--bg-light); background-color: var(--bg-light); color: var(--text-primary); cursor: pointer; transition: background-color 0.2s; }
+.sidebar-actions button:hover { background-color: #4a4a4a; }
+
+.contact-list { list-style: none; padding: 0; margin: 0; flex-grow: 1; overflow-y: auto; }
+.contact-list li { padding: 12px 15px; cursor: pointer; border-bottom: 1px solid var(--bg-dark); transition: background-color 0.2s; display: flex; align-items: center; gap: 12px; position: relative; }
+.contact-list li:hover { background-color: var(--bg-light); }
+.contact-list li.active { background-color: var(--accent-blue); }
+.contact-info { display: flex; flex-direction: column; flex-grow: 1; overflow: hidden; }
+.contact-info .display-name { font-weight: bold; }
+.contact-info .last-message { font-size: 13px; color: var(--text-secondary); text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+.unread-badge { background-color: var(--accent-blue); color: white; font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 10px; margin-left: auto; }
+
+.sidebar-section { padding: 15px; border-top: 1px solid #111; }
+.sidebar-section h4 { margin: 0 0 10px 0; font-size: 14px; color: var(--text-secondary); display: flex; align-items: center; gap: 8px; }
+.notification-badge:not(.visible) { display: none; }
+#request-list, #sent-request-list { list-style: none; padding: 0; margin: 0; }
+#request-list li, #sent-request-list li { display: flex; justify-content: space-between; align-items: center; font-size: 14px; margin-bottom: 8px; }
+.request-actions button { background: none; border: none; color: var(--text-secondary); cursor: pointer; margin-left: 5px; font-size: 20px; padding: 5px; }
+.accept-btn { color: var(--accent-green); }
+.reject-btn, .cancel-btn { color: var(--accent-red); }
+
+/* メインコンテンツ */
+.main-content { flex-grow: 1; display: flex; }
+.content-area { width: 100%; height: 100%; display: none; }
+.content-area.active { display: flex; flex-direction: column; }
+.welcome-message { margin: auto; text-align: center; color: var(--text-secondary); }
+.welcome-message i { font-size: 60px; margin-bottom: 20px; }
+
+.chat-header { padding: 15px 20px; border-bottom: 1px solid #333; background-color: var(--bg-medium); display: flex; align-items: center; gap: 15px; }
+.chat-header h3 { margin: 0; }
+.messages-container { flex-grow: 1; overflow-y: auto; padding: 20px; }
+.message { display: flex; margin-bottom: 15px; gap: 10px; }
+.message.sent { flex-direction: row-reverse; }
+.message-content { display: flex; flex-direction: column; }
+.message.sent .message-content { align-items: flex-end; }
+.message.received .message-content { align-items: flex-start; }
+.bubble { padding: 10px 15px; border-radius: 20px; max-width: 450px; line-height: 1.5; word-wrap: break-word; }
+.bubble img.message-image { max-width: 100%; max-height: 250px; border-radius: 15px; cursor: pointer; }
+.bubble img.message-stamp { width: 100px; height: 100px; }
+.bubble a.message-file { display: flex; align-items: center; gap: 10px; background-color: rgba(0,0,0,0.2); padding: 10px; border-radius: 10px; text-decoration: none; color: var(--text-primary); }
+.bubble a.message-file i { font-size: 24px; }
+.sent .bubble { background-color: var(--accent-blue); color: white; border-bottom-right-radius: 5px; }
+.received .bubble { background-color: var(--bg-light); border-bottom-left-radius: 5px; }
+.message-meta { font-size: 11px; color: var(--text-secondary); margin-top: 4px; padding: 0 8px; }
+
+.message-input-area { display: flex; padding: 15px 20px; border-top: 1px solid #333; background-color: var(--bg-medium); align-items: center; position: relative; }
+.message-input-area button { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 20px; padding: 10px; }
+#message-input { flex-grow: 1; border-radius: 20px; padding: 10px 20px; border: none; background-color: var(--bg-light); color: var(--text-primary); font-size: 16px; margin: 0 10px; }
+#send-message-btn { color: var(--accent-blue); }
+#stamp-panel { position: absolute; bottom: 80px; right: 20px; background-color: var(--bg-light); border-radius: 8px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); padding: 10px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+#stamp-panel img { width: 60px; height: 60px; cursor: pointer; transition: transform 0.1s; }
+#stamp-panel img:hover { transform: scale(1.1); }
+
+/* モーダル */
+#modal-overlay { position: fixed; inset: 0; background-color: rgba(0,0,0,0.7); display: flex; justify-content: center; align-items: center; z-index: 1000; }
+#modal-content { background-color: var(--bg-medium); padding: 30px; border-radius: 8px; width: 100%; max-width: 450px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+#modal-content h3 { margin-top: 0; }
+#modal-content input, #modal-content textarea { width: 100%; padding: 10px; margin-bottom: 10px; border-radius: 4px; border: 1px solid var(--bg-light); background-color: var(--bg-dark); color: var(--text-primary); }
+#modal-content textarea { height: 120px; resize: vertical; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+.modal-actions button { padding: 8px 16px; border-radius: 4px; border: none; cursor: pointer; }
+.primary-btn { background-color: var(--accent-blue); color: white; }
+.secondary-btn { background-color: var(--bg-light); color: var(--text-primary); }
+#icon-select-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(60px, 1fr)); gap: 10px; margin: 20px 0; }
+.default-icon { width: 60px; height: 60px; border-radius: 50%; background-color: var(--bg-dark); cursor: pointer; border: 3px solid transparent; transition: border-color 0.2s; }
+.default-icon.selected { border-color: var(--accent-blue); }
+#icon-preview { width: 80px; height: 80px; border-radius: 50%; background-color: var(--bg-dark); margin: 0 auto 10px; background-size: cover; background-position: center; border: 2px solid var(--bg-light); }
+#icon-upload-area label { cursor: pointer; color: var(--accent-blue); }
+#icon-upload-area input[type="file"] { display: none; }
+
+/* トースト通知 */
+#toast-container { position: fixed; top: 20px; right: 20px; z-index: 2000; display: flex; flex-direction: column; gap: 10px; }
+.toast { background-color: var(--bg-light); color: var(--text-primary); padding: 15px 20px; border-radius: 6px; box-shadow: 0 3px 10px rgba(0,0,0,0.3); display: flex; align-items: center; gap: 10px; animation: slideIn 0.3s ease-out forwards; }
+.toast.success { border-left: 4px solid var(--accent-green); } .toast.error { border-left: 4px solid var(--accent-red); } .toast.info { border-left: 4px solid var(--accent-blue); }
+.toast i { font-size: 20px; }
+@keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    </style>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+</head>
+<body>
+    <!-- アプリ全体のコンテナ -->
+    <div id="app-container">
+        <!-- ログイン/新規作成ビュー -->
+        <div id="auth-view" class="view active">
+            <form id="auth-form" class="auth-box">
+                <h1>Rivift Connect</h1>
+                <p class="auth-description">安全で新しいコミュニケーションを始めよう</p>
+                <input type="email" id="auth-email" placeholder="メールアドレス">
+                <input type="text" id="auth-display-name" placeholder="表示名" class="hidden">
+                <input type="password" id="auth-password" placeholder="パスワード" required>
+                <input type="password" id="auth-password-confirm" placeholder="パスワードの確認" class="hidden">
+                <button type="submit" id="auth-btn">ログイン</button>
+                <p class="auth-toggle">アカウントをお持ちでないですか？ <a href="#" id="auth-toggle-link">新規作成</a></p>
+            </form>
+        </div>
+
+        <!-- メインアプリビュー -->
+        <div id="main-view" class="view">
+            <!-- サイドバー -->
+            <div class="sidebar">
+                <div class="sidebar-header">
+                    <div class="current-user-profile" title="プロフィールを編集">
+                        <div class="profile-icon" id="current-user-icon"></div>
+                        <span id="current-user-display-name"></span>
+                    </div>
+                    <button id="logout-btn" title="ログアウト"><i class="fa-solid fa-right-from-bracket"></i></button>
+                </div>
+                <div class="sidebar-actions">
+                    <button id="add-friend-btn" title="友達を追加"><i class="fa-solid fa-user-plus"></i></button>
+                    <button id="new-mail-btn" title="メールを作成"><i class="fa-solid fa-paper-plane"></i></button>
+                </div>
+                <ul id="contact-list" class="contact-list"></ul>
+                <div id="friend-requests-section" class="sidebar-section">
+                    <h4>友達申請 <span class="notification-badge" id="requests-badge"></span></h4>
+                    <ul id="request-list"></ul>
+                </div>
+                <div id="sent-requests-section" class="sidebar-section">
+                    <h4>送信済み申請</h4>
+                    <ul id="sent-request-list"></ul>
+                </div>
+            </div>
+
+            <!-- メインコンテンツ -->
+            <div class="main-content">
+                <div id="welcome-view" class="content-area active">
+                    <div class="welcome-message">
+                        <i class="fa-solid fa-comments"></i>
+                        <h2>Rivift Connectへようこそ</h2>
+                        <p>連絡先を選択して会話を開始しましょう</p>
+                    </div>
+                </div>
+                <div id="conversation-view" class="content-area">
+                    <div class="chat-header">
+                        <div class="profile-icon" id="chat-partner-icon"></div>
+                        <h3 id="chat-partner-display-name"></h3>
+                    </div>
+                    <div id="messages" class="messages-container"></div>
+                    <form id="message-form" class="message-input-area">
+                        <button type="button" id="attachment-btn" title="ファイルを添付"><i class="fa-solid fa-paperclip"></i></button>
+                        <input type="file" id="file-upload-input" class="hidden">
+                        <input type="text" id="message-input" placeholder="メッセージを入力..." autocomplete="off">
+                        <button type="button" id="stamp-btn" title="スタンプ"><i class="fa-solid fa-face-smile"></i></button>
+                        <button type="submit" id="send-message-btn" title="送信"><i class="fa-solid fa-paper-plane"></i></button>
+                    </form>
+                    <div id="stamp-panel" class="hidden"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 汎用モーダル -->
+    <div id="modal-overlay" class="hidden">
+        <div id="modal-content"></div>
+    </div>
+    
+    <!-- トースト通知コンテナ -->
+    <div id="toast-container"></div>
+
+<script>
+let currentUser = null;
+let activeConversation = null;
+const STAMPS = [ 'https://api.iconify.design/fluent-emoji/thumbs-up.svg', 'https://api.iconify.design/fluent-emoji/ok-hand.svg', 'https://api.iconify.design/fluent-emoji/smiling-face-with-heart-eyes.svg', 'https://api.iconify.design/fluent-emoji/rolling-on-the-floor-laughing.svg', 'https://api.iconify.design/fluent-emoji/face-with-tears-of-joy.svg', 'https://api.iconify.design/fluent-emoji/thinking-face.svg', 'https://api.iconify.design/fluent-emoji/partying-face.svg', 'https://api.iconify.design/fluent-emoji/rocket.svg' ];
+const NOTIFICATION_SOUND = new Audio('https://cdn.jsdelivr.net/gh/k-logic/sounds@main/misc/notification_high-intensity.wav');
+let hasUserInteracted = false;
+
+const DOM = {
+    authView: document.getElementById('auth-view'), authForm: document.getElementById('auth-form'), authEmail: document.getElementById('auth-email'), authDisplayName: document.getElementById('auth-display-name'), authPassword: document.getElementById('auth-password'), authPasswordConfirm: document.getElementById('auth-password-confirm'), authBtn: document.getElementById('auth-btn'), authToggleLink: document.getElementById('auth-toggle-link'),
+    mainView: document.getElementById('main-view'),
+    currentUserDisplayName: document.getElementById('current-user-display-name'), currentUserIcon: document.getElementById('current-user-icon'), logoutBtn: document.getElementById('logout-btn'),
+    addFriendBtn: document.getElementById('add-friend-btn'), newMailBtn: document.getElementById('new-mail-btn'),
+    contactList: document.getElementById('contact-list'),
+    requestsBadge: document.getElementById('requests-badge'), requestList: document.getElementById('request-list'),
+    sentRequestList: document.getElementById('sent-request-list'),
+    welcomeView: document.getElementById('welcome-view'), conversationView: document.getElementById('conversation-view'),
+    chatPartnerIcon: document.getElementById('chat-partner-icon'), chatPartnerDisplayName: document.getElementById('chat-partner-display-name'),
+    messages: document.getElementById('messages'), messageForm: document.getElementById('message-form'),
+    attachmentBtn: document.getElementById('attachment-btn'), fileUploadInput: document.getElementById('file-upload-input'), messageInput: document.getElementById('message-input'),
+    stampBtn: document.getElementById('stamp-btn'), stampPanel: document.getElementById('stamp-panel'), sendMessageBtn: document.getElementById('send-message-btn'),
+    modalOverlay: document.getElementById('modal-overlay'), modalContent: document.getElementById('modal-content'),
+    toastContainer: document.getElementById('toast-container'),
+};
+
+const SERVER_URL = "https://rivift-connect-server.onrender.com";
+let socket;
+
+function showButtonSpinner(button) { button.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`; button.disabled = true; }
+function hideButtonSpinner(button, originalText) { button.innerHTML = originalText; button.disabled = false; }
+
+function connectToServer() {
+    if (socket && socket.connected) {
+        socket.emit('login', { email: currentUser.email });
+        return;
+    }
+    socket = io(SERVER_URL);
+    socket.on("connect", () => {
+        console.log("サーバーに接続しました！ ID:", socket.id);
+        if (currentUser) socket.emit('login', { email: currentUser.email });
+    });
+    socket.on('private_message', async (payload) => {
+        if (currentUser && payload.from !== currentUser.email) await handleIncomingMessage(payload);
+    });
+    socket.on('read_receipt', (payload) => {
+        if (currentUser && payload.from !== currentUser.email) handleReadReceipt(payload);
+    });
+    socket.on('db_updated_notification', async () => {
+        if (currentUser) {
+            await refreshCurrentUserState();
+            await renderAllSidebars();
+            if (activeConversation) await startConversation(activeConversation.partnerEmail, 'chat', true);
+        }
+    });
+}
+
+async function getKeyFromPassword(password, salt) { const encoder = new TextEncoder(); const keyMaterial = await window.crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']); return window.crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, keyMaterial, { "name": "AES-GCM", "length": 256 }, true, ["encrypt", "decrypt"]); }
+async function encryptWithPassword(password, dataToEncrypt) { const salt = window.crypto.getRandomValues(new Uint8Array(16)); const iv = window.crypto.getRandomValues(new Uint8Array(12)); const key = await getKeyFromPassword(password, salt); const encoder = new TextEncoder(); const encryptedData = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoder.encode(JSON.stringify(dataToEncrypt))); return { salt: arrayBufferToBase64(salt), iv: arrayBufferToBase64(iv), encryptedData: arrayBufferToBase64(encryptedData) }; }
+async function decryptWithPassword(password, encryptedPayload) { try { const salt = base64ToArrayBuffer(encryptedPayload.salt); const iv = base64ToArrayBuffer(encryptedPayload.iv); const encryptedData = base64ToArrayBuffer(encryptedPayload.encryptedData); const key = await getKeyFromPassword(password, salt); const decryptedData = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, encryptedData); const decoder = new TextDecoder(); return JSON.parse(decoder.decode(decryptedData)); } catch (e) { return null; } }
+async function generateUserKeys() { return await window.crypto.subtle.generateKey({ name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["encrypt", "decrypt"]); }
+async function encryptMessage(publicKey, messagePayload) { const encoder = new TextEncoder(); return await window.crypto.subtle.encrypt({ name: "RSA-OAEP" }, publicKey, encoder.encode(JSON.stringify(messagePayload))); }
+async function decryptMessagePayload(privateKey, encryptedMessage) { try { const decryptedData = await window.crypto.subtle.decrypt({ name: "RSA-OAEP" }, privateKey, encryptedMessage); const decoder = new TextDecoder(); return JSON.parse(decoder.decode(decryptedData)); } catch (e) { console.error("Payload復号失敗:", e); return null; } }
+function arrayBufferToBase64(buffer) { let binary = ''; const bytes = new Uint8Array(buffer); for (let i = 0; i < bytes.byteLength; i++) { binary += String.fromCharCode(bytes[i]); } return window.btoa(binary); }
+function base64ToArrayBuffer(base64) { const binary_string = window.atob(base64); const len = binary_string.length; const bytes = new Uint8Array(len); for (let i = 0; i < len; i++) { bytes[i] = binary_string.charCodeAt(i); } return bytes.buffer; }
+
+async function api(endpoint, payload) {
+    try {
+        const res = await fetch(`${SERVER_URL}/${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!res.ok) {
+            const errorData = await res.json().catch(() => ({ error: res.statusText }));
+            throw new Error(errorData.error || `API Error: ${res.status}`);
+        }
+        return res.json();
+    } catch (error) {
+        console.error(`API call to ${endpoint} failed:`, error);
+        showToast("サーバーとの通信に失敗しました。", "error");
+        return null;
+    }
+}
+
+async function refreshCurrentUserState() {
+    if (!currentUser) return;
+    const result = await api('getUserData', { email: currentUser.email });
+    if (result && result.userData) {
+        currentUser.friends = result.userData.friends;
+        currentUser.requests = result.userData.requests;
+        currentUser.sentRequests = result.userData.sentRequests;
+        currentUser.displayName = result.userData.displayName;
+        currentUser.icon = result.userData.icon;
+    }
+}
+
+function switchView(viewId) { DOM.authView.classList.toggle('active', viewId === 'auth-view'); DOM.mainView.classList.toggle('active', viewId === 'main-view'); }
+function switchContentView(viewId) { DOM.welcomeView.classList.toggle('active', viewId === 'welcome-view'); DOM.conversationView.classList.toggle('active', viewId === 'conversation-view'); }
+
+let isRegisterMode = false;
+DOM.authToggleLink.onclick = (e) => { e.preventDefault(); isRegisterMode = !isRegisterMode; DOM.authDisplayName.classList.toggle('hidden', !isRegisterMode); DOM.authPasswordConfirm.classList.toggle('hidden', !isRegisterMode); DOM.authBtn.innerText = isRegisterMode ? '新規作成' : 'ログイン'; DOM.authToggleLink.innerText = isRegisterMode ? 'ログイン画面へ' : 'アカウントを新規作成'; };
+DOM.authForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const email = DOM.authEmail.value;
+    const password = DOM.authPassword.value;
+    const originalBtnText = DOM.authBtn.innerText;
+    showButtonSpinner(DOM.authBtn);
+
+    try {
+        if (!email || !password) throw new Error("入力してください");
+        if (isRegisterMode) {
+            const result = await api('getUserData', { email });
+            if (result && result.userData) throw new Error("このメールアドレスは既に使用されています。");
+            const displayName = DOM.authDisplayName.value;
+            const confirmPass = DOM.authPasswordConfirm.value;
+            if (!displayName) throw new Error('表示名を入力してください。');
+            if (password !== confirmPass) throw new Error('パスワードが一致しません。');
+            showIconSelectionModal(email, displayName, password);
+        } else {
+            const result = await api('getUserData', { email });
+            if (!result || !result.userData) throw new Error('メールアドレスまたはパスワードが違います。');
+            const userData = result.userData;
+            const privateKeyJwk = await decryptWithPassword(password, userData.encryptedPrivateKeyPayload);
+            if (!privateKeyJwk) throw new Error('メールアドレスまたはパスワードが違います。');
+            const publicKey = await window.crypto.subtle.importKey("jwk", userData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
+            const privateKey = await window.crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"]);
+            currentUser = { email, displayName: userData.displayName, keys: { publicKey, privateKey }, icon: userData.icon, friends: userData.friends, requests: userData.requests, sentRequests: userData.sentRequests };
+            connectToServer();
+            initializeAppUI();
+        }
+    } catch (error) {
+        showToast(error.message, "error");
+    } finally {
+        if (!isRegisterMode) hideButtonSpinner(DOM.authBtn, originalBtnText);
+    }
+};
+
+function showIconSelectionModal(email, displayName, password) {
+    hideButtonSpinner(DOM.authBtn, '新規作成');
+    const defaultIcons = [ 'https://api.iconify.design/ph:user-circle-thin.svg?color=white', 'https://api.iconify.design/ph:cat-thin.svg?color=white', 'https://api.iconify.design/ph:dog-thin.svg?color=white', 'https://api.iconify.design/ph:bird-thin.svg?color=white', 'https://api.iconify.design/ph:ghost-thin.svg?color=white', 'https://api.iconify.design/ph:rocket-launch-thin.svg?color=white', 'https://api.iconify.design/ph:planet-thin.svg?color=white', 'https://api.iconify.design/ph:game-controller-thin.svg?color=white' ];
+    let selectedIcon = defaultIcons[0];
+    const iconGridHtml = defaultIcons.map((icon, index) => `<img src="${icon}" class="default-icon ${index === 0 ? 'selected' : ''}" data-icon="${icon}">`).join('');
+    showModal({
+        title: 'アイコンを選択', content: `<div id="icon-select-grid">${iconGridHtml}</div>`,
+        actions: [{ text: '作成完了', class: 'primary-btn', action: async (btn) => {
+            showButtonSpinner(btn);
+            const keys = await generateUserKeys();
+            const privateKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.privateKey);
+            const encryptedPrivateKeyPayload = await encryptWithPassword(password, privateKeyJwk);
+            const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keys.publicKey);
+            const result = await api('createUser', { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon: selectedIcon });
+            hideButtonSpinner(btn, '作成完了');
+            if (result && result.success) {
+                closeModal();
+                showToast(`ようこそ、${displayName}さん！ログインしてください。`, 'success');
+                DOM.authEmail.value = email;
+                DOM.authPassword.value = '';
+                if (isRegisterMode) DOM.authToggleLink.click();
+            } else {
+                showToast("アカウント作成に失敗しました。", "error");
+            }
+        }}]
+    });
+    document.querySelectorAll('.default-icon').forEach(el => el.onclick = () => { document.querySelector('.default-icon.selected')?.classList.remove('selected'); el.classList.add('selected'); selectedIcon = el.dataset.icon; });
+}
+
+function initializeAppUI() { DOM.currentUserDisplayName.innerText = currentUser.displayName; DOM.currentUserIcon.style.backgroundImage = `url(${currentUser.icon || ''})`; renderAllSidebars(); switchView('main-view'); switchContentView('welcome-view'); }
+async function renderAllSidebars() {
+    const { friends, requests, sentRequests, contactsData, unreadCounts } = await api('getSidebarData', { email: currentUser.email });
+    currentUser.friends = friends;
+    currentUser.requests = requests;
+    currentUser.sentRequests = sentRequests;
+    renderContactList(friends, contactsData, unreadCounts);
+    renderFriendRequests(requests, contactsData);
+    renderSentRequests(sentRequests, contactsData);
+}
+DOM.logoutBtn.onclick = () => { if (socket) socket.disconnect(); currentUser = null; activeConversation = null; switchView('auth-view'); DOM.authEmail.value = ''; DOM.authPassword.value = ''; };
+
+function renderContactList(friends, contactsData, unreadCounts) {
+    DOM.contactList.innerHTML = '';
+    friends.forEach(email => {
+        const friendData = contactsData[email];
+        if (!friendData) return;
+        const unreadCount = unreadCounts[email] || 0;
+        const li = document.createElement('li');
+        li.dataset.email = email;
+        li.innerHTML = `<div class="profile-icon" style="background-image: url(${friendData.icon || ''})"></div>
+            <div class="contact-info"><span class="display-name">${friendData.displayName}</span><span class="last-message"></span></div>
+            ${unreadCount > 0 ? `<span class="unread-badge">${unreadCount}</span>` : ''}`;
+        if (activeConversation?.partnerEmail === email) li.classList.add('active');
+        li.onclick = () => startConversation(email, 'chat');
+        DOM.contactList.appendChild(li);
+    });
+}
+function renderFriendRequests(requests, contactsData) {
+    DOM.requestsBadge.classList.toggle('visible', requests.length > 0);
+    DOM.requestsBadge.innerText = requests.length || '';
+    DOM.requestList.innerHTML = '';
+    requests.forEach(fromEmail => {
+        const userData = contactsData[fromEmail];
+        if(!userData) return;
+        const li = document.createElement('li');
+        li.innerHTML = `<span>${userData.displayName}</span><div class="request-actions"><button class="accept-btn" title="承認"><i class="fa-solid fa-circle-check"></i></button><button class="reject-btn" title="拒否"><i class="fa-solid fa-circle-xmark"></i></button></div>`;
+        li.querySelector('.accept-btn').onclick = () => socket.emit('accept_friend_request', { from: currentUser.email, to: fromEmail });
+        li.querySelector('.reject-btn').onclick = () => socket.emit('reject_friend_request', { from: currentUser.email, to: fromEmail });
+        DOM.requestList.appendChild(li);
+    });
+}
+function renderSentRequests(sentRequests, contactsData) {
+    DOM.sentRequestList.innerHTML = '';
+    sentRequests.forEach(toEmail => {
+        const userData = contactsData[toEmail];
+        if(!userData) return;
+        const li = document.createElement('li');
+        li.innerHTML = `<span>${userData.displayName}</span><div class="request-actions"><button class="cancel-btn" title="キャンセル"><i class="fa-solid fa-trash-can"></i></button></div>`;
+        li.querySelector('.cancel-btn').onclick = () => socket.emit('cancel_friend_request', { from: currentUser.email, to: toEmail });
+        DOM.sentRequestList.appendChild(li);
+    });
+}
+
+DOM.addFriendBtn.onclick = () => showModal({ title: '友達を追加', content: `<input type="email" id="add-friend-email" placeholder="相手のメールアドレス">`, actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '送信', class: 'primary-btn', action: () => sendFriendRequest(document.getElementById('add-friend-email').value) }] });
+async function sendFriendRequest(friendEmail) {
+    if (!friendEmail || friendEmail === currentUser.email) return;
+    const { userData } = await api('getUserData', { email: friendEmail });
+    if (!userData) return showToast("そのユーザーは存在しません。", "error");
+    if (currentUser.friends.includes(friendEmail)) return showToast("既に友達です。", "info");
+    if (currentUser.sentRequests?.includes(friendEmail)) return showToast("既に申請を送信済みです。", "info");
+    socket.emit('send_friend_request', { from: currentUser.email, to: friendEmail });
+    showToast(`「${friendEmail}」に友達申請を送りました。`, "success");
+    closeModal();
+}
+
+DOM.newMailBtn.onclick = () => showModal({ title: 'メールを作成', content: `<input type="email" id="mail-to" placeholder="宛先"><input type="text" id="mail-subject" placeholder="件名"><textarea id="mail-body" placeholder="本文"></textarea>`, actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '送信', class: 'primary-btn', action: sendMail } ] });
+async function sendMail() {
+    const to = document.getElementById('mail-to').value;
+    const subject = document.getElementById('mail-subject').value;
+    const body = document.getElementById('mail-body').value;
+    if (!to || !subject || !body) return showToast("全ての項目を入力してください。", "error");
+    const { userData: recipientData } = await api('getUserData', { email: to });
+    if (!recipientData) return showToast("宛先が見つかりません。", "error");
+    const publicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
+    const mailContent = { type: 'mail', subject, body };
+    const encryptedBody = await encryptMessage(publicKey, mailContent);
+    socket.emit('private_message', { from: currentUser.email, to, encryptedBody: arrayBufferToBase64(encryptedBody), isMail: true });
+    showToast(`「${to}」にメールを送信しました。`, "success");
+    closeModal();
+}
+
+async function startConversation(partnerEmail, type, isRefresh = false) {
+    if (!isRefresh) activeConversation = { partnerEmail, type };
+    await renderAllSidebars();
+    const { userData: partnerData } = await api('getUserData', { email: partnerEmail });
+    if (!partnerData) return switchContentView('welcome-view');
+    DOM.chatPartnerDisplayName.innerText = partnerData.displayName;
+    DOM.chatPartnerIcon.style.backgroundImage = `url(${partnerData.icon || ''})`;
+    switchContentView('conversation-view');
+    DOM.messages.innerHTML = '';
+    const { history } = await api('getMessageHistory', { user1: currentUser.email, user2: partnerEmail });
+    if(history){
+        for (const msg of history) {
+            let body = null;
+            const msgType = msg.from === currentUser.email ? 'sent' : 'received';
+            body = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(msg.encryptedBody));
+            if (body) await displayMessage(msg.from, body, msgType, msg.read, msg.timestamp, msg.id);
+            else await displayMessage(msg.from, { type: 'text', content: '[このメッセージは表示できません]' }, msgType, msg.read, msg.timestamp, msg.id);
+        }
+    }
+    socket.emit('read_receipt', { from: currentUser.email, to: partnerEmail });
+}
+
+DOM.messageForm.onsubmit = (e) => { e.preventDefault(); sendMessage('text', DOM.messageInput.value); };
+DOM.attachmentBtn.onclick = () => DOM.fileUploadInput.click();
+DOM.fileUploadInput.onchange = (e) => { if (e.target.files && e.target.files[0]) { const file = e.target.files[0]; const reader = new FileReader(); reader.onload = (event) => sendMessage('file', { name: file.name, type: file.type, dataUrl: event.target.result }); reader.readAsDataURL(file); e.target.value = null; } };
+DOM.stampBtn.onclick = () => DOM.stampPanel.classList.toggle('hidden');
+DOM.stampPanel.innerHTML = STAMPS.map(src => `<img src="${src}" data-stamp-id="${src}">`).join('');
+document.querySelectorAll('#stamp-panel img').forEach(el => el.onclick = (e) => { sendMessage('stamp', e.target.dataset.stampId); DOM.stampPanel.classList.add('hidden'); });
+
+async function sendMessage(type, content) {
+    if (!activeConversation || !content) return;
+    if (type === 'text' && content.trim() === '') return;
+    const partnerEmail = activeConversation.partnerEmail;
+    const { userData: recipientData } = await api('getUserData', {email: partnerEmail});
+    if (!recipientData) return showToast("送信先が見つかりません", "error");
+    const messagePayload = { type, content };
+    const recipientPublicKey = await window.crypto.subtle.importKey("jwk", recipientData.publicKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]);
+    const encryptedBody = await encryptMessage(recipientPublicKey, messagePayload);
+    const msg = { id: Date.now(), from: currentUser.email, to: partnerEmail, encryptedBody: arrayBufferToBase64(encryptedBody), timestamp: Date.now(), read: false };
+    socket.emit('private_message', msg);
+    await displayMessage(currentUser.email, messagePayload, 'sent', false, msg.timestamp, msg.id);
+    if (type === 'text') DOM.messageInput.value = '';
+}
+
+async function handleIncomingMessage(payload) {
+    const fromEmail = payload.from;
+    const decryptedPayload = await decryptMessagePayload(currentUser.keys.privateKey, base64ToArrayBuffer(payload.encryptedBody));
+    if (!decryptedPayload) return;
+    if (decryptedPayload.type === 'mail') {
+        const { usersData } = await api('getUsersData', { emails: [fromEmail] });
+        showToast(`新着メール from ${usersData[fromEmail]?.displayName || fromEmail}: ${decryptedPayload.content.subject}`, 'info');
+        if (hasUserInteracted) NOTIFICATION_SOUND.play();
+        return;
+    }
+    const isChatOpen = fromEmail === activeConversation?.partnerEmail;
+    if (isChatOpen) {
+        await displayMessage(fromEmail, decryptedPayload, 'received', false, payload.timestamp, payload.id);
+        socket.emit('read_receipt', { from: currentUser.email, to: fromEmail });
+    } else {
+        const { usersData } = await api('getUsersData', { emails: [fromEmail] });
+        showToast(`新着メッセージ from ${usersData[fromEmail]?.displayName || fromEmail}`, 'info');
+        if (hasUserInteracted) NOTIFICATION_SOUND.play();
+    }
+    await refreshCurrentUserState();
+    await renderContactList();
+}
+
+async function handleReadReceipt(payload) {
+    if (payload.from === activeConversation?.partnerEmail) {
+        document.querySelectorAll('.message.sent .read-status').forEach(el => { el.innerText = '既読'; });
+    }
+}
+
+async function displayMessage(from, body, type, read = false, timestamp, id = null) {
+    const msgDiv = document.createElement('div');
+    msgDiv.className = `message ${type}`;
+    if (id) msgDiv.dataset.messageId = id;
+    const { usersData } = await api('getUsersData', {emails: [from]});
+    const senderData = usersData[from];
+    const senderIcon = (type === 'sent' ? currentUser.icon : senderData?.icon) || '';
+    let bubbleContent = '';
+    if (typeof body !== 'object' || body === null) body = { type: 'text', content: '[メッセージ形式エラー]' };
+    switch(body.type) {
+        case 'image': bubbleContent = `<img src="${body.content}" class="message-image" alt="添付画像">`; break;
+        case 'stamp': bubbleContent = `<img src="${body.content}" class="message-stamp" alt="スタンプ">`; break;
+        case 'file': bubbleContent = `<a href="${body.content.dataUrl}" download="${body.content.name}" class="message-file"><i class="fa-solid fa-file-arrow-down"></i> <div><strong>${body.content.name}</strong><br><small>${body.content.type}</small></div></a>`; break;
+        default: bubbleContent = (body.content || '').replace(/</g, "<").replace(/>/g, ">");
+    }
+    msgDiv.innerHTML = `<div class="profile-icon" style="background-image: url(${senderIcon})"></div>
+        <div class="message-content">
+            <div class="bubble">${bubbleContent}</div>
+            <div class="message-meta">
+                <span>${new Date(timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                ${type === 'sent' ? `<span class="read-status">${read ? '既読' : ''}</span>` : ''}
+            </div>
+        </div>`;
+    DOM.messages.appendChild(msgDiv);
+    DOM.messages.scrollTop = DOM.messages.scrollHeight;
+    
+    if (type === 'sent') {
+        msgDiv.oncontextmenu = (e) => {
+            e.preventDefault();
+            showContextMenu(e, [{
+                label: "メッセージを削除",
+                action: () => socket.emit('delete_message', { from: currentUser.email, to: activeConversation.partnerEmail, messageId: id })
+            }]);
+        };
+    }
+}
+
+function showModal({ title, content, actions }) { DOM.modalContent.innerHTML = `<h3>${title}</h3><div class="modal-body">${content}</div>`; const actionsEl = document.createElement('div'); actionsEl.className = 'modal-actions'; actions.forEach(a => { const btn = document.createElement('button'); btn.innerText = a.text; btn.className = a.class; btn.onclick = () => a.action(btn); actionsEl.appendChild(btn); }); DOM.modalContent.appendChild(actionsEl); DOM.modalOverlay.classList.remove('hidden'); }
+function closeModal() { DOM.modalOverlay.classList.add('hidden'); }
+document.body.addEventListener('click', () => { hasUserInteracted = true; }, { once: true });
+DOM.modalOverlay.addEventListener('click', (e) => { if (e.target === DOM.modalOverlay) closeModal(); });
+
+DOM.currentUserIcon.parentElement.addEventListener('click', () => {
+    showModal({
+        title: 'プロフィールを編集',
+        content: `<input type="text" id="profile-display-name" value="${currentUser.displayName}"><div id="icon-upload-area"><div id="icon-preview" style="background-image: url(${currentUser.icon || ''})"></div><label for="icon-file-input">アイコンを変更</label><input type="file" id="icon-file-input" accept="image/*"></div>`,
+        actions: [ { text: 'キャンセル', class: 'secondary-btn', action: closeModal }, { text: '保存', class: 'primary-btn', action: saveProfile } ]
+    });
+    const fileInput = document.getElementById('icon-file-input');
+    const preview = document.getElementById('icon-preview');
+    fileInput.onchange = () => { if (fileInput.files && fileInput.files[0]) { const reader = new FileReader(); reader.onload = (e) => { preview.style.backgroundImage = `url(${e.target.result})`; preview.dataset.newIcon = e.target.result; }; reader.readAsDataURL(fileInput.files[0]); } };
+});
+
+async function saveProfile() {
+    const newDisplayName = document.getElementById('profile-display-name').value;
+    const preview = document.getElementById('icon-preview');
+    const newIcon = preview.dataset.newIcon;
+    let updated = false;
+    if (newDisplayName && newDisplayName !== currentUser.displayName) updated = true;
+    if (newIcon) updated = true;
+    if (updated) socket.emit('update_profile', {email: currentUser.email, newDisplayName, newIcon});
+    closeModal();
+}
+
+function showToast(message, type = 'info') {
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    const iconClass = type === 'success' ? 'fa-circle-check' : (type === 'error' ? 'fa-circle-xmark' : 'fa-circle-info');
+    toast.innerHTML = `<i class="fa-solid ${iconClass}"></i><p>${message}</p>`;
+    DOM.toastContainer.appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
+}
+
+function showContextMenu(e, items) {
+    const menu = document.createElement('div');
+    menu.className = 'context-menu'; // You'll need to style this
+    items.forEach(item => {
+        const el = document.createElement('div');
+        el.innerText = item.label;
+        el.onclick = () => {
+            item.action();
+            document.body.removeChild(menu);
+        };
+        menu.appendChild(el);
+    });
+    menu.style.position = 'fixed';
+    menu.style.left = `${e.clientX}px`;
+    menu.style.top = `${e.clientY}px`;
+    document.body.appendChild(menu);
+    const remover = () => {
+        if(document.body.contains(menu)) document.body.removeChild(menu);
+        window.removeEventListener('click', remover);
+    };
+    setTimeout(() => window.addEventListener('click', remover), 100);
+}
+</script>
+</body>
+</html>

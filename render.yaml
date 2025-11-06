@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: rivift-connect-signaling
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node server.js"
+    envVars:
+      - key: MONGO_URI
+        fromDatabase:
+          name: rivift-connect-db
+          property: connectionString
+      - key: TURN_CONFIG
+        fromService:
+          type: turn
+          name: rivift-turn-server
+          property: all
+
+  - type: turn
+    name: rivift-turn-server
+    ipAllowList: []
+
+databases:
+  - name: rivift-connect-db
+    databaseName: riviftconnectdb
+    ipAllowList: []
