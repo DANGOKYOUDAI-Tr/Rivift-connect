@@ -331,26 +331,38 @@ app.get('/extract', async (req, res) => {
 io.on('connection', (socket) => {
     let currentUserEmail = null;
 
-        socket.on('get-ice-servers', async (payload, callback) => {
-        // もしSIDかTokenが設定されてなかったら、エラーを返す
-        if (!accountSid || !authToken) {
-            console.error("Twilioの認証情報が.envファイルに設定されていません。");
-            // エラーがあったことを、コールバックでクライアントに教える
-            return callback({ error: "Twilio credentials not configured" });
-        }
+socket.on('get-ice-servers', async (payload, callback) => {
+    console.log("--- [1/4] 'get-ice-servers' イベントを受信しました。 ---");
+    
+    if (!accountSid || !authToken) {
+        const errorMsg = "Twilioの認証情報が.envファイルに設定されていません。";
+        console.error("--- [ERROR] " + errorMsg + " ---");
+        return callback({ error: errorMsg });
+    }
+    
+    try {
+        console.log("--- [2/4] Twilio Clientを初期化します... ---");
+        const client = twilio(accountSid, authToken);
         
-        try {
-            const client = twilio(accountSid, authToken);
-            console.log("Socket経由でTwilioにICEサーバーの情報を問い合わせています...");
-            const token = await client.tokens.create({ ttl: 3600 });
-            console.log("Twilioから情報を取得しました！");
-            // 取得した情報を、コールバックでクライアントに返す！
-            callback({ iceServers: token.iceServers });
-        } catch (error) {
-            console.error('TwilioからICEサーバーの取得に失敗しました:', error);
-            callback({ error: "Failed to get ICE servers from Twilio" });
-        }
-    });
+        console.log("--- [3/4] Twilio APIにトークン作成をリクエストします... ---");
+        const token = await client.tokens.create({ ttl: 3600 });
+        
+        console.log("--- [4/4] Twilioからトークンを取得しました！クライアントに返信します。 ---");
+        callback({ iceServers: token.iceServers });
+
+    } catch (error) {
+        // ★★★ ここが一番大事！ ★★★
+        // どんなエラーが起きても、絶対にコンソールに出力させる！
+        console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        console.error("--- [FATAL ERROR] Twilioとの通信中にエラーが発生 ---");
+        console.error("エラー名:", error.name);
+        console.error("エラーメッセージ:", error.message);
+        console.error("エラースタック:", error.stack);
+        console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        
+        callback({ error: `Twilioとの通信に失敗しました: ${error.message}` });
+    }
+});
 
     const notifyFriendsOfStatusChange = async (email, isOnline) => {
         try {
