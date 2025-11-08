@@ -10,7 +10,9 @@ const fetch = require('node-fetch');
 const twilio = require('twilio');
 
 const app = express();
-app.use(cors());
+app.use(cors({
+    origin: "*" 
+}));
 app.use(express.json({limit: '50mb'}));
 
 const server = http.createServer(app);
