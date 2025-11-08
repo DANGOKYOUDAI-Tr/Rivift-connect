@@ -341,14 +341,11 @@ socket.on('get-ice-servers', async (payload, callback) => {
     }
     
     try {
-        console.log("--- [2/4] Twilio Clientを初期化します... ---");
         const client = twilio(accountSid, authToken);
+        const token = await client.tokens.create({ ttl: 3600 });
         
-        console.log("--- [3/4] Twilio APIにICEサーバー情報作成をリクエストします... ---");
-        const ice = await client.api.v2010.accounts(accountSid).ice.create({ ttl: 3600 });
-        
-        console.log("--- [4/4] TwilioからICEサーバー情報を取得しました！クライアントに返信します。 ---");
-        callback({ iceServers: ice.iceServers });
+        console.log("--- [4/4] Twilioからトークンを取得しました！クライアントに返信します。 ---");
+        callback({ iceServers: token.iceServers });
 
     } catch (error) {
         console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
