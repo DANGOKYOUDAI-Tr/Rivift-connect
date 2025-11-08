@@ -344,15 +344,13 @@ socket.on('get-ice-servers', async (payload, callback) => {
         console.log("--- [2/4] Twilio Clientを初期化します... ---");
         const client = twilio(accountSid, authToken);
         
-        console.log("--- [3/4] Twilio APIにトークン作成をリクエストします... ---");
-        const token = await client.tokens.create({ ttl: 3600 });
+        console.log("--- [3/4] Twilio APIにICEサーバー情報作成をリクエストします... ---");
+        const ice = await client.api.v2010.accounts(accountSid).ice.create({ ttl: 3600 });
         
-        console.log("--- [4/4] Twilioからトークンを取得しました！クライアントに返信します。 ---");
-        callback({ iceServers: token.iceServers });
+        console.log("--- [4/4] TwilioからICEサーバー情報を取得しました！クライアントに返信します。 ---");
+        callback({ iceServers: ice.iceServers });
 
     } catch (error) {
-        // ★★★ ここが一番大事！ ★★★
-        // どんなエラーが起きても、絶対にコンソールに出力させる！
         console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
         console.error("--- [FATAL ERROR] Twilioとの通信中にエラーが発生 ---");
         console.error("エラー名:", error.name);
