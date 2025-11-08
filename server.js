@@ -290,24 +290,6 @@ app.get('/getProxyStats', (req, res) => {
     });
 });
 
-app.get('/get-ice-servers', async (req, res) => {
-    if (!accountSid || !authToken) {
-        console.error("TwilioのAccount SIDまたはAuth Tokenが.envファイルに設定されていません。");
-        return res.json([{ urls: 'stun:stun.l.google.com:19302' }]);
-    }
-    
-    try {
-        const client = twilio(accountSid, authToken);
-        console.log("TwilioにICEサーバーの情報を問い合わせています...");
-        const token = await client.tokens.create({ ttl: 3600 });
-        console.log("Twilioから情報を取得しました！");
-        res.json(token.iceServers);
-    } catch (error) {
-        console.error('TwilioからICEサーバーの取得に失敗しました:', error);
-        res.status(500).send('Could not get ICE servers from Twilio');
-    }
-});
-
 const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
 
@@ -348,6 +330,27 @@ app.get('/extract', async (req, res) => {
 
 io.on('connection', (socket) => {
     let currentUserEmail = null;
+
+        socket.on('get-ice-servers', async (payload, callback) => {
+        // もしSIDかTokenが設定されてなかったら、エラーを返す
+        if (!accountSid || !authToken) {
+            console.error("Twilioの認証情報が.envファイルに設定されていません。");
+            // エラーがあったことを、コールバックでクライアントに教える
+            return callback({ error: "Twilio credentials not configured" });
+        }
+        
+        try {
+            const client = twilio(accountSid, authToken);
+            console.log("Socket経由でTwilioにICEサーバーの情報を問い合わせています...");
+            const token = await client.tokens.create({ ttl: 3600 });
+            console.log("Twilioから情報を取得しました！");
+            // 取得した情報を、コールバックでクライアントに返す！
+            callback({ iceServers: token.iceServers });
+        } catch (error) {
+            console.error('TwilioからICEサーバーの取得に失敗しました:', error);
+            callback({ error: "Failed to get ICE servers from Twilio" });
+        }
+    });
 
     const notifyFriendsOfStatusChange = async (email, isOnline) => {
         try {
