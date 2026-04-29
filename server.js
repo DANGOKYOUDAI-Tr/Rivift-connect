@@ -8,6 +8,9 @@ const axios = require('axios');
 const fetch = require('node-fetch');
 const twilio = require('twilio');
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Firebase Admin SDK（MongoDBの代わり）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const admin = require('firebase-admin');
 
 admin.initializeApp({
@@ -22,16 +25,25 @@ const db = admin.firestore();
 const usersCol = () => db.collection('users');
 const chatsCol = () => db.collection('chats');
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Firestore ヘルパー（MongoDBと同じ感覚で使えるように）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ユーザー取得（MongoDB: usersCollection.findOne({ _id: email })）
 async function getUser(email) {
     const snap = await usersCol().doc(email).get();
     return snap.exists ? snap.data() : null;
 }
 
+// チャット取得（MongoDB: chatsCollection.findOne({ _id: chatID })）
 async function getChat(chatID) {
     const snap = await chatsCol().doc(chatID).get();
     return snap.exists ? snap.data() : null;
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Express / Socket.io セットアップ
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: '50mb' }));
@@ -48,8 +60,13 @@ const authToken = process.env.TWILIO_AUTH_TOKEN;
 
 let onlineUsers = {};
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// REST API
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v5.0 (Firebase) is Active!</h1>'));
 
+// ユーザー作成
 app.post('/createUser', async (req, res) => {
     try {
         const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon } = req.body;
@@ -63,19 +80,16 @@ app.post('/createUser', async (req, res) => {
     } catch (e) { console.error('createUser error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
+// ユーザーデータ取得
 app.post('/getUserData', async (req, res) => {
     try {
         const { email } = req.body;
-        console.log('getUserData called:', email);
         const userData = await getUser(email);
-        console.log('userData:', userData);
         res.json({ userData });
-    } catch (e) { 
-        console.error('getUserData error:', e); 
-        res.status(500).json({ error: 'Server error' }); 
-    }
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// サイドバーデータ取得
 app.post('/getSidebarData', async (req, res) => {
     try {
         const { email } = req.body;
@@ -85,6 +99,7 @@ app.post('/getSidebarData', async (req, res) => {
         const { friends = [], requests = [], sentRequests = [] } = user;
         const contactEmails = [...new Set([...friends, ...requests, ...sentRequests])];
 
+        // 連絡先のユーザーデータを取得（Firestoreはin queryが30件まで）
         const usersData = {};
         const chunks = [];
         for (let i = 0; i < contactEmails.length; i += 30) chunks.push(contactEmails.slice(i, i + 30));
@@ -97,6 +112,7 @@ app.post('/getSidebarData', async (req, res) => {
             });
         }
 
+        // 未読数カウント
         const unreadCounts = {};
         for (const friendEmail of friends) {
             const chatID = [email, friendEmail].sort().join('__');
@@ -112,6 +128,7 @@ app.post('/getSidebarData', async (req, res) => {
     } catch (e) { console.error('getSidebarData error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
+// 複数ユーザーデータ取得（公開鍵含む）
 app.post('/getUsersData', async (req, res) => {
     try {
         const { emails = [] } = req.body;
@@ -131,17 +148,20 @@ app.post('/getUsersData', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// メッセージ履歴取得
 app.post('/getMessageHistory', async (req, res) => {
     try {
         const { user1, user2, limit = 50, skip = 0 } = req.body;
         const chatID = [user1, user2].sort().join('__');
         const chat = await getChat(chatID);
         if (!chat || !chat.messages) return res.json({ history: [] });
+        // skipとlimitを再現
         const history = chat.messages.slice(Math.max(0, chat.messages.length - skip - limit), chat.messages.length - skip);
         res.json({ history });
     } catch (e) { console.error('getMessageHistory error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
+// メッセージ保存
 app.post('/saveMessage', async (req, res) => {
     try {
         const { user1, user2, message } = req.body;
@@ -155,6 +175,7 @@ app.post('/saveMessage', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// DuckDuckGo検索
 app.get('/search', async (req, res) => {
     const query = req.query.q;
     if (!query) return res.status(400).json({ error: 'Query parameter "q" is required.' });
@@ -169,11 +190,14 @@ app.get('/search', async (req, res) => {
         res.json({ results });
     } catch (e) { res.status(500).json({ error: 'Failed to fetch search results.' }); }
 });
+
+// プロキシ統計
 let totalDataProxied = 0;
 app.get('/getProxyStats', (req, res) => {
     res.json({ totalDataProxied, totalDataProxiedMB: (totalDataProxied / (1024 * 1024)).toFixed(2) });
 });
 
+// HTMLパス書き換え
 function rewriteHtmlPaths(html, baseUrl) {
     const base = new URL(baseUrl);
     const domain = base.origin;
@@ -198,10 +222,12 @@ function rewriteHtmlPaths(html, baseUrl) {
     return rewrittenHtml;
 }
 
+// iframe-helper.js
 app.get('/iframe-helper.js', (req, res) => {
     res.sendFile(path.join(__dirname, 'iframe-helper.js'));
 });
 
+// Webプロキシ
 app.post('/proxy', async (req, res) => {
     try {
         const { url, method, headers, body } = req.body;
@@ -220,6 +246,7 @@ app.post('/proxy', async (req, res) => {
     } catch (e) { console.error('Proxy error:', e.message); res.status(500).send(e.message); }
 });
 
+// YouTube検索
 const google = require('google-it');
 app.get('/youtube-search', async (req, res) => {
     const query = req.query.q;
@@ -234,6 +261,7 @@ app.get('/youtube-search', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Failed to search YouTube' }); }
 });
 
+// 記事抽出
 const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
 app.get('/extract', async (req, res) => {
@@ -251,6 +279,9 @@ app.get('/extract', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'ページの読み込みまたは解析に失敗しました。' }); }
 });
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Socket.io（リアルタイム通信 - 変更なし）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 io.on('connection', (socket) => {
     let currentUserEmail = null;
 
@@ -336,10 +367,12 @@ io.on('connection', (socket) => {
             const { from, to } = payload;
             const chatID = [from, to].sort().join('__');
             const messageToStore = { chatID, ...payload };
+            // Firestoreに保存
             await chatsCol().doc(chatID).set({
                 users: [from, to],
                 messages: admin.firestore.FieldValue.arrayUnion(messageToStore)
             }, { merge: true });
+            // リアルタイム配信
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('private_message', payload);
             const senderSocketId = onlineUsers[from];
@@ -354,6 +387,7 @@ io.on('connection', (socket) => {
             const chatID = [readerEmail, writerEmail].sort().join('__');
             const chat = await getChat(chatID);
             if (chat && chat.messages) {
+                // 未読メッセージを既読に更新
                 const updatedMessages = chat.messages.map(msg => {
                     if (msg.to === readerEmail && !msg.read) return { ...msg, read: true };
                     return msg;
@@ -390,6 +424,52 @@ io.on('connection', (socket) => {
         notifyUsers([user1, user2]);
     });
 
+    // メッセージ編集
+    socket.on('edit_message', async ({ from, to, messageId, newText }) => {
+        try {
+            const chatID = [from, to].sort().join('__');
+            const chat = await getChat(chatID);
+            if (chat && chat.messages) {
+                const updatedMessages = chat.messages.map(msg => {
+                    if (msg.id === messageId && msg.from === from) {
+                        return { ...msg, editedText: newText, edited: true };
+                    }
+                    return msg;
+                });
+                await chatsCol().doc(chatID).update({ messages: updatedMessages });
+            }
+            const recipientSocketId = onlineUsers[to];
+            if (recipientSocketId) io.to(recipientSocketId).emit('message_edited', { messageId, newText });
+        } catch (e) { console.error('edit_message error:', e); }
+    });
+
+    // リアクション追加・トグル
+    socket.on('add_reaction', async ({ from, to, messageId, emoji }) => {
+        try {
+            const chatID = [from, to].sort().join('__');
+            const chat = await getChat(chatID);
+            if (chat && chat.messages) {
+                const updatedMessages = chat.messages.map(msg => {
+                    if (msg.id === messageId) {
+                        const reactions = msg.reactions || [];
+                        const existingIndex = reactions.findIndex(r => r.from === from && r.emoji === emoji);
+                        const newReactions = existingIndex >= 0
+                            ? reactions.filter((_, i) => i !== existingIndex)
+                            : [...reactions, { from, emoji }];
+                        return { ...msg, reactions: newReactions };
+                    }
+                    return msg;
+                });
+                await chatsCol().doc(chatID).update({ messages: updatedMessages });
+                const updatedMsg = updatedMessages.find(m => m.id === messageId);
+                const reactions = updatedMsg?.reactions || [];
+                [onlineUsers[from], onlineUsers[to]].forEach(socketId => {
+                    if (socketId) io.to(socketId).emit('reaction_updated', { messageId, reactions });
+                });
+            }
+        } catch (e) { console.error('add_reaction error:', e); }
+    });
+
     socket.on('update_profile', async ({ email, newDisplayName, newIcon }) => {
         try {
             const updateData = {};
@@ -401,7 +481,7 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('update_profile error:', e); }
     });
 
-    // WebRTC
+    // WebRTC（変更なし）
     socket.on('webrtc-offer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-offer', { from: socket.email, offer: payload.offer });
@@ -423,7 +503,7 @@ io.on('connection', (socket) => {
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-reject-call', { from: socket.email });
     });
 
-    // LiveCanvas
+    // LiveCanvas（変更なし）
     socket.on('live_canvas_invite', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('live_canvas_invite', { from: socket.email });
@@ -441,4 +521,7 @@ io.on('connection', (socket) => {
     });
 });
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// サーバー起動（MongoDBへの接続不要になったので直接起動）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 server.listen(PORT, () => console.log(`Rivift Connect Server v5.0 (Firebase) is running on port ${PORT}`));
