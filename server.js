@@ -151,12 +151,16 @@ app.post('/getUsersData', async (req, res) => {
 // メッセージ履歴取得
 app.post('/getMessageHistory', async (req, res) => {
     try {
-        const { user1, user2, limit = 50, skip = 0 } = req.body;
+        const { user1, user2, limit = 50, lastTimestamp = null } = req.body;
         const chatID = [user1, user2].sort().join('__');
-        const chat = await getChat(chatID);
-        if (!chat || !chat.messages) return res.json({ history: [] });
-        // skipとlimitを再現
-        const history = chat.messages.slice(Math.max(0, chat.messages.length - skip - limit), chat.messages.length - skip);
+        let q = chatsCol().doc(chatID).collection('messages')
+            .orderBy('timestamp', 'desc')
+            .limit(limit);
+        if (lastTimestamp) {
+            q = q.startAfter(lastTimestamp);
+        }
+        const snap = await q.get();
+        const history = snap.docs.map(d => d.data()).reverse();
         res.json({ history });
     } catch (e) { console.error('getMessageHistory error:', e); res.status(500).json({ error: 'Server error' }); }
 });
@@ -366,15 +370,13 @@ io.on('connection', (socket) => {
         try {
             const { from, to } = payload;
             const chatID = [from, to].sort().join('__');
-            const messageToStore = { chatID, ...payload };
-            // Firestoreに保存
-            await chatsCol().doc(chatID).set({
-                users: [from, to],
-                messages: admin.firestore.FieldValue.arrayUnion(messageToStore)
-            }, { merge: true });
+            const msgId = payload.id || `${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+            // サブコレクションに保存（1ドキュメントに全メッセージを詰めない→速度改善）
+            await chatsCol().doc(chatID).set({ users: [from, to], lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+            await chatsCol().doc(chatID).collection('messages').doc(msgId).set({ ...payload, id: msgId });
             // リアルタイム配信
             const recipientSocketId = onlineUsers[to];
-            if (recipientSocketId) io.to(recipientSocketId).emit('private_message', payload);
+            if (recipientSocketId) io.to(recipientSocketId).emit('private_message', { ...payload, id: msgId });
             const senderSocketId = onlineUsers[from];
             if (senderSocketId) io.to(senderSocketId).emit('db_updated_notification');
         } catch (e) { console.error('private_message error:', e); }
@@ -414,6 +416,9 @@ io.on('connection', (socket) => {
                 });
                 await chatsCol().doc(chatID).update({ messages: updatedMessages });
             }
+            // 相手にも通知
+            const recipientSocketId = onlineUsers[to];
+            if (recipientSocketId) io.to(recipientSocketId).emit('message_deleted', { messageId });
             notifyUsers([from, to]);
         } catch (e) { console.error('delete_message error:', e); }
     });
