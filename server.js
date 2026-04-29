@@ -66,9 +66,14 @@ app.post('/createUser', async (req, res) => {
 app.post('/getUserData', async (req, res) => {
     try {
         const { email } = req.body;
+        console.log('getUserData called:', email);
         const userData = await getUser(email);
+        console.log('userData:', userData);
         res.json({ userData });
-    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+    } catch (e) { 
+        console.error('getUserData error:', e); 
+        res.status(500).json({ error: 'Server error' }); 
+    }
 });
 
 app.post('/getSidebarData', async (req, res) => {
