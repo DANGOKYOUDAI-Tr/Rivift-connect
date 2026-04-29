@@ -387,15 +387,12 @@ io.on('connection', (socket) => {
             const readerEmail = payload.from;
             const writerEmail = payload.to;
             const chatID = [readerEmail, writerEmail].sort().join('__');
-            const chat = await getChat(chatID);
-            if (chat && chat.messages) {
-                // 未読メッセージを既読に更新
-                const updatedMessages = chat.messages.map(msg => {
-                    if (msg.to === readerEmail && !msg.read) return { ...msg, read: true };
-                    return msg;
-                });
-                await chatsCol().doc(chatID).update({ messages: updatedMessages });
-            }
+            // サブコレクションの未読メッセージを一括既読
+            const unreadSnap = await chatsCol().doc(chatID).collection('messages')
+                .where('to', '==', readerEmail).where('read', '==', false).get();
+            const batch = db.batch();
+            unreadSnap.docs.forEach(d => batch.update(d.ref, { read: true }));
+            await batch.commit();
             const readerSocketId = onlineUsers[readerEmail];
             const writerSocketId = onlineUsers[writerEmail];
             if (readerSocketId) io.to(readerSocketId).emit('messages_marked_as_read', { chatPartner: writerEmail });
@@ -406,17 +403,11 @@ io.on('connection', (socket) => {
     socket.on('delete_message', async ({ from, to, messageId }) => {
         try {
             const chatID = [from, to].sort().join('__');
-            const chat = await getChat(chatID);
-            if (chat && chat.messages) {
-                const updatedMessages = chat.messages.map(msg => {
-                    if (msg.id === messageId && msg.from === from) {
-                        return { ...msg, type: 'deleted', content: 'メッセージが削除されました' };
-                    }
-                    return msg;
-                });
-                await chatsCol().doc(chatID).update({ messages: updatedMessages });
+            const msgRef = chatsCol().doc(chatID).collection('messages').doc(messageId);
+            const msgSnap = await msgRef.get();
+            if (msgSnap.exists && msgSnap.data().from === from) {
+                await msgRef.update({ type: 'deleted', content: 'メッセージが削除されました' });
             }
-            // 相手にも通知
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('message_deleted', { messageId });
             notifyUsers([from, to]);
@@ -424,24 +415,26 @@ io.on('connection', (socket) => {
     });
 
     socket.on('delete_chat', async ({ user1, user2 }) => {
-        const chatID = [user1, user2].sort().join('__');
-        await chatsCol().doc(chatID).delete();
-        notifyUsers([user1, user2]);
+        try {
+            const chatID = [user1, user2].sort().join('__');
+            // サブコレクションを全削除
+            const msgsSnap = await chatsCol().doc(chatID).collection('messages').get();
+            const batch = db.batch();
+            msgsSnap.docs.forEach(d => batch.delete(d.ref));
+            batch.delete(chatsCol().doc(chatID));
+            await batch.commit();
+            notifyUsers([user1, user2]);
+        } catch (e) { console.error('delete_chat error:', e); }
     });
 
     // メッセージ編集
     socket.on('edit_message', async ({ from, to, messageId, newText }) => {
         try {
             const chatID = [from, to].sort().join('__');
-            const chat = await getChat(chatID);
-            if (chat && chat.messages) {
-                const updatedMessages = chat.messages.map(msg => {
-                    if (msg.id === messageId && msg.from === from) {
-                        return { ...msg, editedText: newText, edited: true };
-                    }
-                    return msg;
-                });
-                await chatsCol().doc(chatID).update({ messages: updatedMessages });
+            const msgRef = chatsCol().doc(chatID).collection('messages').doc(messageId);
+            const msgSnap = await msgRef.get();
+            if (msgSnap.exists && msgSnap.data().from === from) {
+                await msgRef.update({ editedText: newText, edited: true });
             }
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('message_edited', { messageId, newText });
@@ -452,26 +445,18 @@ io.on('connection', (socket) => {
     socket.on('add_reaction', async ({ from, to, messageId, emoji }) => {
         try {
             const chatID = [from, to].sort().join('__');
-            const chat = await getChat(chatID);
-            if (chat && chat.messages) {
-                const updatedMessages = chat.messages.map(msg => {
-                    if (msg.id === messageId) {
-                        const reactions = msg.reactions || [];
-                        const existingIndex = reactions.findIndex(r => r.from === from && r.emoji === emoji);
-                        const newReactions = existingIndex >= 0
-                            ? reactions.filter((_, i) => i !== existingIndex)
-                            : [...reactions, { from, emoji }];
-                        return { ...msg, reactions: newReactions };
-                    }
-                    return msg;
-                });
-                await chatsCol().doc(chatID).update({ messages: updatedMessages });
-                const updatedMsg = updatedMessages.find(m => m.id === messageId);
-                const reactions = updatedMsg?.reactions || [];
-                [onlineUsers[from], onlineUsers[to]].forEach(socketId => {
-                    if (socketId) io.to(socketId).emit('reaction_updated', { messageId, reactions });
-                });
-            }
+            const msgRef = chatsCol().doc(chatID).collection('messages').doc(messageId);
+            const msgSnap = await msgRef.get();
+            if (!msgSnap.exists) return;
+            const reactions = msgSnap.data().reactions || [];
+            const existingIndex = reactions.findIndex(r => r.from === from && r.emoji === emoji);
+            const newReactions = existingIndex >= 0
+                ? reactions.filter((_, i) => i !== existingIndex)
+                : [...reactions, { from, emoji }];
+            await msgRef.update({ reactions: newReactions });
+            [onlineUsers[from], onlineUsers[to]].forEach(socketId => {
+                if (socketId) io.to(socketId).emit('reaction_updated', { messageId, reactions: newReactions });
+            });
         } catch (e) { console.error('add_reaction error:', e); }
     });
 
