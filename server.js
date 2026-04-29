@@ -1,211 +1,187 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
 const path = require('path');
-const { MongoClient } = require('mongodb');
 const axios = require('axios');
 const fetch = require('node-fetch');
+const twilio = require('twilio');
+
+const admin = require('firebase-admin');
+
+admin.initializeApp({
+    credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    })
+});
+
+const db = admin.firestore();
+const usersCol = () => db.collection('users');
+const chatsCol = () => db.collection('chats');
+
+async function getUser(email) {
+    const snap = await usersCol().doc(email).get();
+    return snap.exists ? snap.data() : null;
+}
+
+async function getChat(chatID) {
+    const snap = await chatsCol().doc(chatID).get();
+    return snap.exists ? snap.data() : null;
+}
 
 const app = express();
-app.use(cors());
-app.use(express.json({limit: '50mb'}));
+app.use(cors({ origin: "*" }));
+app.use(express.json({ limit: '50mb' }));
 
 const server = http.createServer(app);
-const io = new Server(server, { 
+const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
     maxHttpBufferSize: 50e6
 });
 const PORT = process.env.PORT || 3001;
 
-const MONGO_URI = process.env.MONGO_URI;
-let usersCollection;
-let chatsCollection;
-
-async function connectToDatabase() {
-    if (!MONGO_URI) { console.error("MONGO_URI not found."); process.exit(1); }
-    try {
-        const client = new MongoClient(MONGO_URI);
-        await client.connect();
-        const db = client.db("rivift-connect-db");
-        usersCollection = db.collection("users");
-        chatsCollection = db.collection("chats");
-        console.log('Successfully connected to MongoDB Atlas');
-    } catch (e) {
-        console.error("Failed to connect to MongoDB Atlas", e);
-        process.exit(1);
-    }
-}
+const accountSid = process.env.TWILIO_ACCOUNT_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
 
 let onlineUsers = {};
 
-app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v4.1 is Active!</h1>'));
+app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v5.0 (Firebase) is Active!</h1>'));
 
 app.post('/createUser', async (req, res) => {
     try {
         const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon } = req.body;
-        const existingUser = await usersCollection.findOne({ _id: email });
-        if (existingUser) {
-            return res.status(400).json({ error: 'User already exists' });
-        }
-        await usersCollection.insertOne({ _id: email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon, friends: [], requests: [], sentRequests: [] });
+        const existing = await getUser(email);
+        if (existing) return res.status(400).json({ error: 'User already exists' });
+        await usersCol().doc(email).set({
+            email, displayName, publicKeyJwk, encryptedPrivateKeyPayload,
+            icon: icon || null, friends: [], requests: [], sentRequests: []
+        });
         res.json({ success: true });
-    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+    } catch (e) { console.error('createUser error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/getUserData', async (req, res) => {
     try {
         const { email } = req.body;
-        const userData = await usersCollection.findOne({ _id: email });
+        const userData = await getUser(email);
         res.json({ userData });
-    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/getSidebarData', async (req, res) => {
     try {
         const { email } = req.body;
-        const user = await usersCollection.findOne({ _id: email });
+        const user = await getUser(email);
         if (!user) return res.status(404).json({ error: 'User not found' });
-        
-        const contactEmails = [...user.friends, ...user.requests, ...user.sentRequests];
-        const uniqueEmails = [...new Set(contactEmails)];
-        
-        const contactsData = {};
-        if (uniqueEmails.length > 0) {
-            const users = await usersCollection.find({ _id: { $in: uniqueEmails } }).toArray();
-            users.forEach(u => {
-                contactsData[u._id] = { displayName: u.displayName, icon: u.icon };
+
+        const { friends = [], requests = [], sentRequests = [] } = user;
+        const contactEmails = [...new Set([...friends, ...requests, ...sentRequests])];
+
+        const usersData = {};
+        const chunks = [];
+        for (let i = 0; i < contactEmails.length; i += 30) chunks.push(contactEmails.slice(i, i + 30));
+        for (const chunk of chunks) {
+            if (chunk.length === 0) continue;
+            const snaps = await usersCol().where(admin.firestore.FieldPath.documentId(), 'in', chunk).get();
+            snaps.forEach(doc => {
+                const d = doc.data();
+                usersData[doc.id] = { displayName: d.displayName, icon: d.icon };
             });
         }
-        
+
         const unreadCounts = {};
-        if (user.friends.length > 0) {
-            for (const friendEmail of user.friends) {
-                const chatID = [email, friendEmail].sort().join('__');
-                const chat = await chatsCollection.findOne({ _id: chatID });
-                if (chat) {
-                    const count = chat.messages.filter(msg => msg.to === email && !msg.read).length;
-                    unreadCounts[friendEmail] = count;
-                } else {
-                    unreadCounts[friendEmail] = 0;
-                }
+        for (const friendEmail of friends) {
+            const chatID = [email, friendEmail].sort().join('__');
+            const chat = await getChat(chatID);
+            if (chat && chat.messages) {
+                unreadCounts[friendEmail] = chat.messages.filter(m => m.to === email && !m.read).length;
+            } else {
+                unreadCounts[friendEmail] = 0;
             }
         }
-        
-        res.json({
-            friends: user.friends,
-            requests: user.requests,
-            sentRequests: user.sentRequests,
-            usersData: contactsData,
-            unreadCounts
-        });
-    } catch (e) { 
-        console.error("getSidebarData error:", e);
-        res.status(500).json({ error: 'Server error' }); 
-    }
+
+        res.json({ friends, requests, sentRequests, usersData, unreadCounts });
+    } catch (e) { console.error('getSidebarData error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/getUsersData', async (req, res) => {
     try {
-        const { emails } = req.body;
+        const { emails = [] } = req.body;
         const usersData = {};
-        if (emails && emails.length > 0) {
-            const users = await usersCollection.find({ _id: { $in: emails } }).toArray();
-            users.forEach(user => {
-                usersData[user._id] = { displayName: user.displayName, icon: user.icon, publicKeyJwk: user.publicKeyJwk };
+        if (emails.length === 0) return res.json({ usersData });
+        const chunks = [];
+        for (let i = 0; i < emails.length; i += 30) chunks.push(emails.slice(i, i + 30));
+        for (const chunk of chunks) {
+            if (chunk.length === 0) continue;
+            const snaps = await usersCol().where(admin.firestore.FieldPath.documentId(), 'in', chunk).get();
+            snaps.forEach(doc => {
+                const d = doc.data();
+                usersData[doc.id] = { displayName: d.displayName, icon: d.icon, publicKeyJwk: d.publicKeyJwk };
             });
         }
         res.json({ usersData });
-    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/getMessageHistory', async (req, res) => {
     try {
-        const { user1, user2, limit = 50, skip = 0 } = req.body; 
+        const { user1, user2, limit = 50, skip = 0 } = req.body;
         const chatID = [user1, user2].sort().join('__');
-        const history = await chatsCollection
-            .find({ chatID: chatID })
-            .sort({ timestamp: -1 }) 
-            .skip(skip)               
-            .limit(limit)           
-            .toArray();
-        res.json({ history: history.reverse() });
-
-    } catch (error) {
-        console.error("getMessageHistory error:", error);
-        res.status(500).json({ error: 'Server error' });
-    }
+        const chat = await getChat(chatID);
+        if (!chat || !chat.messages) return res.json({ history: [] });
+        const history = chat.messages.slice(Math.max(0, chat.messages.length - skip - limit), chat.messages.length - skip);
+        res.json({ history });
+    } catch (e) { console.error('getMessageHistory error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/saveMessage', async (req, res) => {
     try {
         const { user1, user2, message } = req.body;
         const chatID = [user1, user2].sort().join('__');
-        await chatsCollection.updateOne(
-            { _id: chatID },
-            { $push: { messages: message }, $setOnInsert: { users: [user1, user2] } },
-            { upsert: true }
-        );
+        const chatRef = chatsCol().doc(chatID);
+        await chatRef.set({
+            users: [user1, user2],
+            messages: admin.firestore.FieldValue.arrayUnion({ chatID, ...message })
+        }, { merge: true });
         res.json({ success: true });
-    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/search', async (req, res) => {
     const query = req.query.q;
-    if (!query) {
-        return res.status(400).json({ error: 'Query parameter "q" is required.' });
-    }
+    if (!query) return res.status(400).json({ error: 'Query parameter "q" is required.' });
     try {
         const response = await axios.get('https://api.duckduckgo.com/', {
-            params: {
-                q: query,
-                format: 'json',
-                no_html: 1,
-                skip_disambig: 1
-            },
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
+            params: { q: query, format: 'json', no_html: 1, skip_disambig: 1 },
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
-
-        const searchResults = (response.data.RelatedTopics || [])
-            .filter(topic => topic.Result) 
-            .map(topic => ({
-                title: topic.Text,
-                description: topic.Result.replace(/<[^>]*>?/gm, ''), 
-                url: topic.FirstURL
-            }));
-
-        res.json({ results: searchResults });
-
-
-    } catch (error) {
-        console.error('DuckDuckGo API Error:', error.message);
-        res.status(500).json({ error: 'Failed to fetch search results.' });
-    }
+        const results = (response.data.RelatedTopics || [])
+            .filter(t => t.Result)
+            .map(t => ({ title: t.Text, description: t.Result.replace(/<[^>]*>?/gm, ''), url: t.FirstURL }));
+        res.json({ results });
+    } catch (e) { res.status(500).json({ error: 'Failed to fetch search results.' }); }
 });
-
-
-
-let totalDataProxied = 0; 
+let totalDataProxied = 0;
+app.get('/getProxyStats', (req, res) => {
+    res.json({ totalDataProxied, totalDataProxiedMB: (totalDataProxied / (1024 * 1024)).toFixed(2) });
+});
 
 function rewriteHtmlPaths(html, baseUrl) {
     const base = new URL(baseUrl);
     const domain = base.origin;
     const rewrite = (content) => {
         content = content.replace(/(src|href|action|data-src)=(["'])(\/(?!\/)[^"']+)(["'])/g,
-            (match, attr, q1, path, q2) => `${attr}=${q1}${domain}${path}${q2}`
-        );
+            (match, attr, q1, path, q2) => `${attr}=${q1}${domain}${path}${q2}`);
         content = content.replace(/(src|href|action|data-src)=(["'])(?!\/|https?:|data:)([^"']+)(["'])/g,
             (match, attr, q1, path, q2) => {
                 const newUrl = new URL(path, baseUrl).href;
                 return `${attr}=${q1}${newUrl}${q2}`;
-            }
-        );
-        
+            });
         return content;
     };
-
     let rewrittenHtml = rewrite(html);
     rewrittenHtml = rewrittenHtml.replace(/<style([^>]*)>([\s\S]*?)<\/style>/gi, (match, attrs, css) => {
         const rewrittenCss = css.replace(/url\((["']?)(?!\/|https?:|data:)([^"'\)]+)(["']?)\)/g, (match, q1, path, q2) => {
@@ -214,7 +190,6 @@ function rewriteHtmlPaths(html, baseUrl) {
         });
         return `<style${attrs}>${rewrittenCss}</style>`;
     });
-
     return rewrittenHtml;
 }
 
@@ -225,14 +200,9 @@ app.get('/iframe-helper.js', (req, res) => {
 app.post('/proxy', async (req, res) => {
     try {
         const { url, method, headers, body } = req.body;
-        if (!url) {
-            return res.status(400).send('URL is required.');
-        }
+        if (!url) return res.status(400).send('URL is required.');
         const fetchOptions = {
-            method: method,
-            headers: { ...headers },
-            body: body ? Buffer.from(body, 'base64') : null,
-            redirect: 'follow'
+            method, headers: { ...headers }, body: body ? Buffer.from(body, 'base64') : null, redirect: 'follow'
         };
         delete fetchOptions.headers['host'];
         delete fetchOptions.headers['origin'];
@@ -242,107 +212,62 @@ app.post('/proxy', async (req, res) => {
         const response = await fetch(url, fetchOptions);
         res.setHeader('x-proxy-headers', JSON.stringify(Object.fromEntries(response.headers)));
         response.body.pipe(res);
-    } catch (error) {
-        console.error('Proxy error:', error.message);
-        res.status(500).send(error.message);
-    }
+    } catch (e) { console.error('Proxy error:', e.message); res.status(500).send(e.message); }
 });
 
 const google = require('google-it');
-
 app.get('/youtube-search', async (req, res) => {
     const query = req.query.q;
-    if (!query) {
-        return res.status(400).json({ error: 'Query is required' });
-    }
+    if (!query) return res.status(400).json({ error: 'Query is required' });
     try {
-        const options = {
-            query: `${query} site:youtube.com`, 
-            'no-display': true
-        };
-        const results = await google(options);
+        const results = await google({ query: `${query} site:youtube.com`, 'no-display': true });
         const videoResults = results.map(r => {
-            const videoIdMatch = r.link.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
-            return {
-                title: r.title,
-                link: r.link,
-                videoId: videoIdMatch ? videoIdMatch[1] : null
-            };
-        }).filter(r => r.videoId); 
-
+            const m = r.link.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
+            return { title: r.title, link: r.link, videoId: m ? m[1] : null };
+        }).filter(r => r.videoId);
         res.json({ results: videoResults });
-
-    } catch (error) {
-        console.error('YouTube search error:', error);
-        res.status(500).json({ error: 'Failed to search YouTube' });
-    }
-});
-
-app.get('/getProxyStats', (req, res) => {
-    res.json({
-        totalDataProxied,
-        totalDataProxiedMB: (totalDataProxied / (1024 * 1024)).toFixed(2)
-    });
+    } catch (e) { res.status(500).json({ error: 'Failed to search YouTube' }); }
 });
 
 const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
-
 app.get('/extract', async (req, res) => {
     const url = req.query.url;
-    if (!url) {
-        return res.status(400).json({ error: 'URL parameter is required.' });
-    }
-
+    if (!url) return res.status(400).json({ error: 'URL parameter is required.' });
     try {
-        const response = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-        });
-
-        const dom = new JSDOM(response.data, { url: url });
-        const reader = new Readability(dom.window.document);
-        const article = reader.parse();
-
+        const response = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } });
+        const dom = new JSDOM(response.data, { url });
+        const article = new Readability(dom.window.document).parse();
         if (article) {
-            res.json({
-                title: article.title,
-                content: article.content, 
-                textContent: article.textContent, 
-                author: article.byline,
-                length: article.length
-            });
+            res.json({ title: article.title, content: article.content, textContent: article.textContent, author: article.byline, length: article.length });
         } else {
             res.status(404).json({ error: '記事のコンテンツを抽出できませんでした。' });
         }
-
-    } catch (error) {
-        console.error('Extraction error:', error.message);
-        res.status(500).json({ error: 'ページの読み込みまたは解析に失敗しました。' });
-    }
+    } catch (e) { res.status(500).json({ error: 'ページの読み込みまたは解析に失敗しました。' }); }
 });
 
 io.on('connection', (socket) => {
     let currentUserEmail = null;
 
+    socket.on('get-ice-servers', async (payload, callback) => {
+        if (!accountSid || !authToken) return callback({ error: 'Twilioの認証情報が設定されていません。' });
+        try {
+            const client = twilio(accountSid, authToken);
+            const token = await client.tokens.create({ ttl: 3600 });
+            callback({ iceServers: token.iceServers });
+        } catch (e) { callback({ error: `Twilioとの通信に失敗しました: ${e.message}` }); }
+    });
+
     const notifyFriendsOfStatusChange = async (email, isOnline) => {
         try {
-            const user = await usersCollection.findOne({ _id: email });
+            const user = await getUser(email);
             if (user && user.friends) {
                 user.friends.forEach(friendEmail => {
                     const friendSocketId = onlineUsers[friendEmail];
-                    if (friendSocketId) {
-                        io.to(friendSocketId).emit('friend_status_changed', {
-                            email: email,
-                            isOnline: isOnline
-                        });
-                    }
+                    if (friendSocketId) io.to(friendSocketId).emit('friend_status_changed', { email, isOnline });
                 });
             }
-        } catch (error) {
-            console.error('Error notifying friends of status change:', error);
-        }
+        } catch (e) { console.error('notifyFriendsOfStatusChange error:', e); }
     };
 
     socket.on('login', ({ email }) => {
@@ -353,22 +278,17 @@ io.on('connection', (socket) => {
     });
 
     socket.on('get_initial_statuses', async (payload, callback) => {
-        const userEmail = payload.email;
-        const user = await usersCollection.findOne({ _id: userEmail });
+        const user = await getUser(payload.email);
         if (user && user.friends) {
             const statuses = {};
-            user.friends.forEach(friendEmail => {
-                statuses[friendEmail] = !!onlineUsers[friendEmail];
-            });
+            user.friends.forEach(friendEmail => { statuses[friendEmail] = !!onlineUsers[friendEmail]; });
             callback(statuses);
         }
     });
 
     socket.on('disconnect', () => {
-        if (currentUserEmail) {
-            delete onlineUsers[currentUserEmail];
-            notifyFriendsOfStatusChange(currentUserEmail, false);
-        }
+        if (currentUserEmail) { delete onlineUsers[currentUserEmail]; notifyFriendsOfStatusChange(currentUserEmail, false); }
+        if (socket.email) delete onlineUsers[socket.email];
     });
 
     const notifyUsers = (userEmails) => {
@@ -379,190 +299,141 @@ io.on('connection', (socket) => {
     };
 
     socket.on('send_friend_request', async ({ from, to }) => {
-        await usersCollection.updateOne({ _id: to }, { $addToSet: { requests: from } });
-        await usersCollection.updateOne({ _id: from }, { $addToSet: { sentRequests: to } });
+        await usersCol().doc(to).update({ requests: admin.firestore.FieldValue.arrayUnion(from) });
+        await usersCol().doc(from).update({ sentRequests: admin.firestore.FieldValue.arrayUnion(to) });
         notifyUsers([from, to]);
     });
 
     socket.on('accept_friend_request', async ({ from, to }) => {
-        await usersCollection.updateOne({ _id: from }, { $pull: { requests: to }, $addToSet: { friends: to } });
-        await usersCollection.updateOne({ _id: to }, { $pull: { sentRequests: from }, $addToSet: { friends: from } });
+        await usersCol().doc(from).update({
+            requests: admin.firestore.FieldValue.arrayRemove(to),
+            friends: admin.firestore.FieldValue.arrayUnion(to)
+        });
+        await usersCol().doc(to).update({
+            sentRequests: admin.firestore.FieldValue.arrayRemove(from),
+            friends: admin.firestore.FieldValue.arrayUnion(from)
+        });
         notifyUsers([from, to]);
     });
 
     socket.on('delete_friend', async ({ from, to }) => {
         try {
-            const fromUser = await usersCollection.findOne({ _id: from });
-            const toUser = await usersCollection.findOne({ _id: to });
-            if (fromUser && toUser) {
-                await usersCollection.updateOne({ _id: from }, { $pull: { friends: to } });
-                await usersCollection.updateOne({ _id: to }, { $pull: { friends: from } });
-                const chatID = [from, to].sort().join('__');
-                await chatsCollection.deleteOne({ _id: chatID });
-                notifyUsers([from, to]);
-            }
-        } catch (e) {
-            console.error("delete_friend error:", e);
-        }
+            await usersCol().doc(from).update({ friends: admin.firestore.FieldValue.arrayRemove(to) });
+            await usersCol().doc(to).update({ friends: admin.firestore.FieldValue.arrayRemove(from) });
+            const chatID = [from, to].sort().join('__');
+            await chatsCol().doc(chatID).delete();
+            notifyUsers([from, to]);
+        } catch (e) { console.error('delete_friend error:', e); }
     });
-    
+
     socket.on('private_message', async (payload) => {
         try {
-            const { from, to, timestamp } = payload;
+            const { from, to } = payload;
             const chatID = [from, to].sort().join('__');
-            const messageToStore = {
-                chatID: chatID,
-                ...payload
-            };
-            await chatsCollection.insertOne(messageToStore);
+            const messageToStore = { chatID, ...payload };
+            await chatsCol().doc(chatID).set({
+                users: [from, to],
+                messages: admin.firestore.FieldValue.arrayUnion(messageToStore)
+            }, { merge: true });
             const recipientSocketId = onlineUsers[to];
-            if (recipientSocketId) {
-                io.to(recipientSocketId).emit('private_message', payload);
-            }
+            if (recipientSocketId) io.to(recipientSocketId).emit('private_message', payload);
             const senderSocketId = onlineUsers[from];
-            if (senderSocketId) {
-                io.to(senderSocketId).emit('db_updated_notification');
-            }
-        } catch(e) {
-            console.error("private_message error:", e);
-        }
+            if (senderSocketId) io.to(senderSocketId).emit('db_updated_notification');
+        } catch (e) { console.error('private_message error:', e); }
     });
 
-socket.on('read_receipt', async (payload) => {
-    try { 
-        const readerEmail = payload.from; 
-        const writerEmail = payload.to;
-        const chatID = [readerEmail, writerEmail].sort().join('__');
-        await chatsCollection.updateMany(
-            { chatID: chatID, "messages.to": readerEmail, "messages.read": { $ne: true } },
-            { $set: { "messages.$[elem].read": true } },
-            { arrayFilters: [ { "elem.to": readerEmail } ] }
-        );
-        const readerSocketId = onlineUsers[readerEmail];
-        const writerSocketId = onlineUsers[writerEmail];
-
-        if (readerSocketId) {
-            io.to(readerSocketId).emit('messages_marked_as_read', { chatPartner: writerEmail });
-        }
-        if (writerSocketId) {
-            io.to(writerSocketId).emit('messages_marked_as_read', { chatPartner: readerEmail });
-        }
-
-    } catch (e) {
-        console.error("read_receipt error:", e);
-    }
-});
+    socket.on('read_receipt', async (payload) => {
+        try {
+            const readerEmail = payload.from;
+            const writerEmail = payload.to;
+            const chatID = [readerEmail, writerEmail].sort().join('__');
+            const chat = await getChat(chatID);
+            if (chat && chat.messages) {
+                const updatedMessages = chat.messages.map(msg => {
+                    if (msg.to === readerEmail && !msg.read) return { ...msg, read: true };
+                    return msg;
+                });
+                await chatsCol().doc(chatID).update({ messages: updatedMessages });
+            }
+            const readerSocketId = onlineUsers[readerEmail];
+            const writerSocketId = onlineUsers[writerEmail];
+            if (readerSocketId) io.to(readerSocketId).emit('messages_marked_as_read', { chatPartner: writerEmail });
+            if (writerSocketId) io.to(writerSocketId).emit('messages_marked_as_read', { chatPartner: readerEmail });
+        } catch (e) { console.error('read_receipt error:', e); }
+    });
 
     socket.on('delete_message', async ({ from, to, messageId }) => {
-        const chatID = [from, to].sort().join('__');
-        await chatsCollection.updateOne(
-            { _id: chatID, "messages.id": messageId, "messages.from": from },
-            { $set: { 
-                "messages.$.type": "deleted",
-                "messages.$.content": "メッセージが削除されました",
-            }}
-        );
-        notifyUsers([from, to]);
+        try {
+            const chatID = [from, to].sort().join('__');
+            const chat = await getChat(chatID);
+            if (chat && chat.messages) {
+                const updatedMessages = chat.messages.map(msg => {
+                    if (msg.id === messageId && msg.from === from) {
+                        return { ...msg, type: 'deleted', content: 'メッセージが削除されました' };
+                    }
+                    return msg;
+                });
+                await chatsCol().doc(chatID).update({ messages: updatedMessages });
+            }
+            notifyUsers([from, to]);
+        } catch (e) { console.error('delete_message error:', e); }
     });
-    
+
     socket.on('delete_chat', async ({ user1, user2 }) => {
         const chatID = [user1, user2].sort().join('__');
-        await chatsCollection.deleteOne({ _id: chatID });
+        await chatsCol().doc(chatID).delete();
         notifyUsers([user1, user2]);
     });
-    
-    socket.on('update_profile', async ({email, newDisplayName, newIcon}) => {
-        const updateData = {};
-        if (newDisplayName) updateData.displayName = newDisplayName;
-        if (newIcon) updateData.icon = newIcon;
-        const result = await usersCollection.findOneAndUpdate({ _id: email }, { $set: updateData }, { returnDocument: 'after' });
-        if (result.value) {
-            notifyUsers([email, ...result.value.friends]);
-        }
+
+    socket.on('update_profile', async ({ email, newDisplayName, newIcon }) => {
+        try {
+            const updateData = {};
+            if (newDisplayName) updateData.displayName = newDisplayName;
+            if (newIcon) updateData.icon = newIcon;
+            await usersCol().doc(email).update(updateData);
+            const user = await getUser(email);
+            if (user) notifyUsers([email, ...(user.friends || [])]);
+        } catch (e) { console.error('update_profile error:', e); }
     });
 
-    socket.on('disconnect', () => {
-        if (socket.email) delete onlineUsers[socket.email];
-    });
-
+    // WebRTC
     socket.on('webrtc-offer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('webrtc-offer', {
-                from: socket.email,
-                offer: payload.offer
-            });
-        }
+        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-offer', { from: socket.email, offer: payload.offer });
     });
-
     socket.on('webrtc-answer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('webrtc-answer', {
-                from: socket.email,
-                answer: payload.answer
-            });
-        }
+        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-answer', { from: socket.email, answer: payload.answer });
     });
-
     socket.on('webrtc-ice-candidate', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('webrtc-ice-candidate', {
-                from: socket.email,
-                candidate: payload.candidate
-            });
-        }
+        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-ice-candidate', { from: socket.email, candidate: payload.candidate });
     });
-
     socket.on('webrtc-end-call', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('webrtc-end-call', { from: socket.email });
-        }
+        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-end-call', { from: socket.email });
     });
-
     socket.on('webrtc-reject-call', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('webrtc-reject-call', { from: socket.email });
-        }
+        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-reject-call', { from: socket.email });
     });
 
-socket.on('live_canvas_invite', (payload) => {
-    const recipientSocketId = onlineUsers[payload.to];
-    if (recipientSocketId) {
-        io.to(recipientSocketId).emit('live_canvas_invite', {
-            from: socket.email
+    // LiveCanvas
+    socket.on('live_canvas_invite', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('live_canvas_invite', { from: socket.email });
+    });
+    socket.on('live_canvas_draw', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('live_canvas_draw', {
+            from: socket.email, x: payload.x, y: payload.y,
+            lastX: payload.lastX, lastY: payload.lastY, color: payload.color, size: payload.size
         });
-    }
+    });
+    socket.on('live_canvas_clear', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('live_canvas_clear', { from: socket.email });
+    });
 });
 
-socket.on('live_canvas_draw', (payload) => {
-    const recipientSocketId = onlineUsers[payload.to];
-    if (recipientSocketId) {
-        io.to(recipientSocketId).emit('live_canvas_draw', {
-            from: socket.email,
-            x: payload.x, y: payload.y,
-            lastX: payload.lastX, lastY: payload.lastY,
-            color: payload.color, size: payload.size
-        });
-    }
-});
-
-socket.on('live_canvas_clear', (payload) => {
-    const recipientSocketId = onlineUsers[payload.to];
-    if (recipientSocketId) {
-        io.to(recipientSocketId).emit('live_canvas_clear', {
-            from: socket.email
-        });
-    }
-});
-
-});
-
-connectToDatabase().then(() => {
-    server.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
-}).catch(err => {
-    console.error("Failed to start server:", err);
-});
+server.listen(PORT, () => console.log(`Rivift Connect Server v5.0 (Firebase) is running on port ${PORT}`));
