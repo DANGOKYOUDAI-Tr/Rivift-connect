@@ -406,7 +406,7 @@ io.on('connection', (socket) => {
             const msgRef = chatsCol().doc(chatID).collection('messages').doc(messageId);
             const msgSnap = await msgRef.get();
             if (msgSnap.exists && msgSnap.data().from === from) {
-                await msgRef.update({ type: 'deleted', content: 'メッセージが削除されました' });
+                await msgRef.delete();
             }
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('message_deleted', { messageId });
@@ -508,6 +508,16 @@ io.on('connection', (socket) => {
     socket.on('live_canvas_clear', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('live_canvas_clear', { from: socket.email });
+    });
+
+    socket.on('typing_start', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('typing_start', { from: payload.from });
+    });
+
+    socket.on('typing_stop', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('typing_stop', { from: payload.from });
     });
 });
 
