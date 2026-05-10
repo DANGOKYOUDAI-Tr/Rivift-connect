@@ -537,12 +537,8 @@ io.on('connection', (socket) => {
     socket.on('proximity_share_response', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (!recipientSocketId) return;
-        if (payload.accepted) {
-            // 承認: Offerを改めて送信側→受信側へ中継するよう促す
-            io.to(recipientSocketId).emit('proximity_ready_ack', { from: socket.email });
-        } else {
-            io.to(recipientSocketId).emit('proximity_share_response', { from: socket.email, accepted: false });
-        }
+        // 承認・拒否どちらもそのまま送信側に転送する（proximity_ready_ack は廃止）
+        io.to(recipientSocketId).emit('proximity_share_response', { from: socket.email, accepted: payload.accepted });
     });
 
     // 受信側準備完了 → 送信側にOffer送信を促す
