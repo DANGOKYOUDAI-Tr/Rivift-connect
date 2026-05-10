@@ -406,7 +406,7 @@ io.on('connection', (socket) => {
             const msgRef = chatsCol().doc(chatID).collection('messages').doc(messageId);
             const msgSnap = await msgRef.get();
             if (msgSnap.exists && msgSnap.data().from === from) {
-                await msgRef.delete();
+                await msgRef.update({ type: 'deleted', content: 'メッセージが削除されました' });
             }
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('message_deleted', { messageId });
@@ -518,6 +518,64 @@ io.on('connection', (socket) => {
     socket.on('typing_stop', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('typing_stop', { from: payload.from });
+    });
+
+    // ── 近距離共有 シグナリング ──────────────────────────
+    // 送信側 → 受信側に招待通知
+    socket.on('proximity_offer', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_share_invite', {
+            from: socket.email,
+            fileName: payload.fileName,
+            fileSize: payload.fileSize,
+            fileType: payload.fileType,
+            destType: payload.destType,
+        });
+    });
+
+    // 受信側の承認/拒否を送信側に通知
+    socket.on('proximity_share_response', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (!recipientSocketId) return;
+        if (payload.accepted) {
+            // 承認: Offerを改めて送信側→受信側へ中継するよう促す
+            io.to(recipientSocketId).emit('proximity_ready_ack', { from: socket.email });
+        } else {
+            io.to(recipientSocketId).emit('proximity_share_response', { from: socket.email, accepted: false });
+        }
+    });
+
+    // 受信側準備完了 → 送信側にOffer送信を促す
+    socket.on('proximity_ready', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_offer', { from: socket.email });
+    });
+
+    // WebRTC Offer中継（送信側→受信側）
+    socket.on('proximity_do_answer', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_answer', {
+            from: socket.email,
+            offer: payload.offer,
+        });
+    });
+
+    // WebRTC Answer中継（受信側→送信側）
+    socket.on('proximity_answer', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_answer', {
+            from: socket.email,
+            answer: payload.answer,
+        });
+    });
+
+    // ICE候補中継（双方向）
+    socket.on('proximity_ice', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_ice', {
+            from: socket.email,
+            candidate: payload.candidate,
+        });
     });
 });
 
