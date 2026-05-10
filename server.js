@@ -573,6 +573,15 @@ io.on('connection', (socket) => {
             candidate: payload.candidate,
         });
     });
+    
+    // 受信完了通知中継（受信側→送信側）
+    socket.on('proximity_received', (payload) => {
+    const recipientSocketId = onlineUsers[payload.to];
+    if (recipientSocketId) io.to(recipientSocketId).emit('proximity_received', {
+        from: socket.email,
+        fileName: payload.fileName,
+    });
+});
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
