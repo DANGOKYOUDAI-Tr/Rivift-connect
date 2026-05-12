@@ -61,6 +61,45 @@ const authToken = process.env.TWILIO_AUTH_TOKEN;
 let onlineUsers = {};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// セキュリティ ユーティリティ
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// 二人が相互フォロワー（友達）かどうか確認する
+async function areFriends(emailA, emailB) {
+    try {
+        const userA = await getUser(emailA);
+        return Array.isArray(userA?.friends) && userA.friends.includes(emailB);
+    } catch { return false; }
+}
+
+// proximity シグナリングのレートリミット（送信側の過剰招待を防ぐ）
+// email → { count, windowStart }
+const proximityOfferCount = {};
+const PROXIMITY_OFFER_LIMIT  = 10;    // 1分間に最大10回
+const PROXIMITY_OFFER_WINDOW = 60000; // 60秒
+
+function proximityOfferAllowed(email) {
+    const now = Date.now();
+    const rec = proximityOfferCount[email];
+    if (!rec || now - rec.windowStart > PROXIMITY_OFFER_WINDOW) {
+        proximityOfferCount[email] = { count: 1, windowStart: now };
+        return true;
+    }
+    if (rec.count >= PROXIMITY_OFFER_LIMIT) return false;
+    rec.count++;
+    return true;
+}
+
+// 許可済みファイルタイプ（クライアント側と二重チェック）
+const ALLOWED_FILE_TYPES = new Set([
+    'image/jpeg','image/png','image/gif','image/webp','image/svg+xml',
+    'video/mp4','video/webm','video/ogg','video/quicktime',
+    'audio/mpeg','audio/ogg','audio/wav','audio/flac','audio/aac','audio/webm',
+    'application/pdf','text/plain','text/html','text/css','text/javascript','application/json',
+]);
+const MAX_FILE_BYTES = 500 * 1024 * 1024; // 500 MB
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // REST API
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -522,66 +561,130 @@ io.on('connection', (socket) => {
 
     // ── 近距離共有 シグナリング ──────────────────────────
     // 送信側 → 受信側に招待通知
-    socket.on('proximity_offer', (payload) => {
-        const recipientSocketId = onlineUsers[payload.to];
+    socket.on('proximity_offer', async (payload) => {
+        const senderEmail = socket.email;
+        const targetEmail = payload.to;
+
+        // ① 自分自身への送信を拒否
+        if (!senderEmail || senderEmail === targetEmail) return;
+
+        // ② 友達関係の確認（Firestoreで検証）
+        const friends = await areFriends(senderEmail, targetEmail);
+        if (!friends) {
+            socket.emit('proximity_error', { reason: '友達ではないユーザーへのファイル送信は許可されていません。' });
+            return;
+        }
+
+        // ③ レートリミット
+        if (!proximityOfferAllowed(senderEmail)) {
+            socket.emit('proximity_error', { reason: '送信リクエストが多すぎます。しばらく待ってから再試行してください。' });
+            return;
+        }
+
+        // ④ ファイルタイプ検証（サーバー側でも）
+        const fileType = (payload.fileType || '').toLowerCase().split(';')[0].trim();
+        if (!ALLOWED_FILE_TYPES.has(fileType)) {
+            socket.emit('proximity_error', { reason: `許可されていないファイルタイプです: ${fileType}` });
+            return;
+        }
+
+        // ⑤ ファイルサイズ検証（サーバー側でも）
+        const fileSize = Number(payload.fileSize);
+        if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > MAX_FILE_BYTES) {
+            socket.emit('proximity_error', { reason: 'ファイルサイズが不正または制限を超えています。' });
+            return;
+        }
+
+        const recipientSocketId = onlineUsers[targetEmail];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_share_invite', {
-            from: socket.email,
+            from: senderEmail,
             fileName: payload.fileName,
-            fileSize: payload.fileSize,
-            fileType: payload.fileType,
+            fileSize: fileSize,
+            fileType: fileType,
             destType: payload.destType,
         });
     });
 
     // 受信側の承認/拒否を送信側に通知
-    socket.on('proximity_share_response', (payload) => {
-        const recipientSocketId = onlineUsers[payload.to];
+    socket.on('proximity_share_response', async (payload) => {
+        const responderEmail = socket.email;
+        const targetEmail    = payload.to;
+
+        // 送信相手と自分が友達かチェック
+        if (!responderEmail || !targetEmail) return;
+        const friends = await areFriends(responderEmail, targetEmail);
+        if (!friends) return;
+
+        const recipientSocketId = onlineUsers[targetEmail];
         if (!recipientSocketId) return;
         // 承認・拒否どちらもそのまま送信側に転送する（proximity_ready_ack は廃止）
-        io.to(recipientSocketId).emit('proximity_share_response', { from: socket.email, accepted: payload.accepted });
+        io.to(recipientSocketId).emit('proximity_share_response', { from: responderEmail, accepted: !!payload.accepted });
     });
 
     // 受信側準備完了 → 送信側にOffer送信を促す
-    socket.on('proximity_ready', (payload) => {
-        const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_offer', { from: socket.email });
+    socket.on('proximity_ready', async (payload) => {
+        const senderEmail = socket.email;
+        const targetEmail = payload.to;
+        if (!senderEmail || !targetEmail || senderEmail === targetEmail) return;
+        if (!(await areFriends(senderEmail, targetEmail))) return;
+        const recipientSocketId = onlineUsers[targetEmail];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_offer', { from: senderEmail });
     });
 
     // WebRTC Offer中継（送信側→受信側）
-    socket.on('proximity_do_answer', (payload) => {
-        const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_answer', {
-            from: socket.email,
+    // ⚠️ BUG FIX: 送信側は proximity_do_answer でOfferを送ってくるが、
+    //   受信側は proximity_do_offer を待ち受けている。
+    //   誤って proximity_do_answer のまま転送するとシグナリングが壊れる。
+    socket.on('proximity_do_answer', async (payload) => {
+        const senderEmail = socket.email;
+        const targetEmail = payload.to;
+        if (!senderEmail || !targetEmail || senderEmail === targetEmail) return;
+        if (!(await areFriends(senderEmail, targetEmail))) return;
+        const recipientSocketId = onlineUsers[targetEmail];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_offer', {
+            from: senderEmail,
             offer: payload.offer,
         });
     });
 
     // WebRTC Answer中継（受信側→送信側）
-    socket.on('proximity_answer', (payload) => {
-        const recipientSocketId = onlineUsers[payload.to];
+    socket.on('proximity_answer', async (payload) => {
+        const senderEmail = socket.email;
+        const targetEmail = payload.to;
+        if (!senderEmail || !targetEmail || senderEmail === targetEmail) return;
+        if (!(await areFriends(senderEmail, targetEmail))) return;
+        const recipientSocketId = onlineUsers[targetEmail];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_answer', {
-            from: socket.email,
+            from: senderEmail,
             answer: payload.answer,
         });
     });
 
     // ICE候補中継（双方向）
-    socket.on('proximity_ice', (payload) => {
-        const recipientSocketId = onlineUsers[payload.to];
+    socket.on('proximity_ice', async (payload) => {
+        const senderEmail = socket.email;
+        const targetEmail = payload.to;
+        if (!senderEmail || !targetEmail || senderEmail === targetEmail) return;
+        if (!(await areFriends(senderEmail, targetEmail))) return;
+        const recipientSocketId = onlineUsers[targetEmail];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_ice', {
-            from: socket.email,
+            from: senderEmail,
             candidate: payload.candidate,
         });
     });
-    
+
     // 受信完了通知中継（受信側→送信側）
-    socket.on('proximity_received', (payload) => {
-    const recipientSocketId = onlineUsers[payload.to];
-    if (recipientSocketId) io.to(recipientSocketId).emit('proximity_received', {
-        from: socket.email,
-        fileName: payload.fileName,
+    socket.on('proximity_received', async (payload) => {
+        const senderEmail = socket.email;
+        const targetEmail = payload.to;
+        if (!senderEmail || !targetEmail || senderEmail === targetEmail) return;
+        if (!(await areFriends(senderEmail, targetEmail))) return;
+        const recipientSocketId = onlineUsers[targetEmail];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_received', {
+            from: senderEmail,
+            fileName: payload.fileName,
+        });
     });
-});
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
