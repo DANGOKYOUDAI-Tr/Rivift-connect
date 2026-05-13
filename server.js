@@ -544,14 +544,12 @@ io.on('connection', (socket) => {
     // 受信側準備完了 → 送信側にOffer送信を促す
     socket.on('proximity_ready', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
-        console.log(`[PS] proximity_ready: from=${socket.email} to=${payload.to} recipientSocketId=${recipientSocketId}`);
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_offer', { from: socket.email });
     });
 
     // WebRTC Offer中継（送信側→受信側）
     socket.on('proximity_do_answer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
-        console.log(`[PS] proximity_do_answer: from=${socket.email} to=${payload.to} recipientSocketId=${recipientSocketId} onlineUsers=${JSON.stringify(Object.keys(onlineUsers))}`);
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_answer', {
             from: socket.email,
             offer: payload.offer,
@@ -578,12 +576,20 @@ io.on('connection', (socket) => {
     
     // 受信完了通知中継（受信側→送信側）
     socket.on('proximity_received', (payload) => {
-    const recipientSocketId = onlineUsers[payload.to];
-    if (recipientSocketId) io.to(recipientSocketId).emit('proximity_received', {
-        from: socket.email,
-        fileName: payload.fileName,
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_received', {
+            from: socket.email,
+            fileName: payload.fileName,
+        });
     });
-});
+
+    // キャンセル通知中継（送信側→受信側 または 受信側→送信側）
+    socket.on('proximity_cancel', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_cancel', {
+            from: socket.email,
+        });
+    });
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
