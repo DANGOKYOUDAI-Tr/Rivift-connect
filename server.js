@@ -284,6 +284,150 @@ app.get('/extract', async (req, res) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Rivift App Store API — Server.js への追記分
+// REST API セクション（app.get('/') の下あたり）に追記してください
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const appsCol = () => db.collection('store_apps');
+
+// ── アプリ一覧取得 ──────────────────────────────────────
+// GET /store/apps?category=tool&sort=popular&limit=30&offset=0
+app.get('/store/apps', async (req, res) => {
+    try {
+        const { category = 'all', sort = 'newest', limit = 30, offset = 0 } = req.query;
+        let q = appsCol();
+        if (category && category !== 'all') q = q.where('category', '==', category);
+        if (sort === 'popular') q = q.orderBy('downloads', 'desc');
+        else q = q.orderBy('createdAt', 'desc');
+        q = q.limit(Number(limit)).offset(Number(offset));
+        const snap = await q.get();
+        const apps = snap.docs.map(d => {
+            const data = d.data();
+            return {
+                id: d.id,
+                title: data.title,
+                description: data.description,
+                category: data.category,
+                authorEmail: data.authorEmail,
+                authorName: data.authorName,
+                iconEmoji: data.iconEmoji || '📦',
+                downloads: data.downloads || 0,
+                version: data.version || '1.0.0',
+                createdAt: data.createdAt,
+                updatedAt: data.updatedAt,
+                // htmlContent は一覧では返さない（重いため）
+            };
+        });
+        res.json({ apps });
+    } catch (e) { console.error('store/apps error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── アプリ詳細取得（htmlContent含む）──────────────────
+// GET /store/apps/:id
+app.get('/store/apps/:id', async (req, res) => {
+    try {
+        const snap = await appsCol().doc(req.params.id).get();
+        if (!snap.exists) return res.status(404).json({ error: 'App not found' });
+        res.json({ app: { id: snap.id, ...snap.data() } });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── アプリ投稿 ──────────────────────────────────────────
+// POST /store/apps
+app.post('/store/apps', async (req, res) => {
+    try {
+        const { email, title, description, category, htmlContent, iconEmoji, version } = req.body;
+        if (!email || !title || !htmlContent) return res.status(400).json({ error: 'email, title, htmlContent は必須です' });
+        const user = await getUser(email);
+        if (!user) return res.status(401).json({ error: 'Connectアカウントが見つかりません' });
+        if (Buffer.byteLength(htmlContent, 'utf8') > 1_000_000) return res.status(400).json({ error: 'HTMLが大きすぎます（最大1MB）' });
+        const now = Date.now();
+        const docRef = appsCol().doc();
+        await docRef.set({
+            title: title.slice(0, 60),
+            description: (description || '').slice(0, 500),
+            category: ['tool', 'game', 'entertainment', 'other'].includes(category) ? category : 'other',
+            authorEmail: email,
+            authorName: user.displayName || email,
+            htmlContent,
+            iconEmoji: (iconEmoji || '📦').slice(0, 2),
+            version: (version || '1.0.0').slice(0, 20),
+            downloads: 0,
+            createdAt: now,
+            updatedAt: now,
+        });
+        res.json({ success: true, id: docRef.id });
+    } catch (e) { console.error('store publish error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── アプリ更新 ──────────────────────────────────────────
+// PUT /store/apps/:id
+app.put('/store/apps/:id', async (req, res) => {
+    try {
+        const { email, title, description, category, htmlContent, iconEmoji, version } = req.body;
+        const snap = await appsCol().doc(req.params.id).get();
+        if (!snap.exists) return res.status(404).json({ error: 'App not found' });
+        if (snap.data().authorEmail !== email) return res.status(403).json({ error: '権限がありません' });
+        const update = { updatedAt: Date.now() };
+        if (title) update.title = title.slice(0, 60);
+        if (description !== undefined) update.description = description.slice(0, 500);
+        if (category) update.category = ['tool', 'game', 'entertainment', 'other'].includes(category) ? category : 'other';
+        if (htmlContent) {
+            if (Buffer.byteLength(htmlContent, 'utf8') > 1_000_000) return res.status(400).json({ error: 'HTMLが大きすぎます' });
+            update.htmlContent = htmlContent;
+        }
+        if (iconEmoji) update.iconEmoji = iconEmoji.slice(0, 2);
+        if (version) update.version = version.slice(0, 20);
+        await appsCol().doc(req.params.id).update(update);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── アプリ削除 ──────────────────────────────────────────
+// DELETE /store/apps/:id
+app.delete('/store/apps/:id', async (req, res) => {
+    try {
+        const { email } = req.body;
+        const snap = await appsCol().doc(req.params.id).get();
+        if (!snap.exists) return res.status(404).json({ error: 'App not found' });
+        if (snap.data().authorEmail !== email) return res.status(403).json({ error: '権限がありません' });
+        await appsCol().doc(req.params.id).delete();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── ダウンロード数インクリメント ────────────────────────
+// POST /store/apps/:id/download
+app.post('/store/apps/:id/download', async (req, res) => {
+    try {
+        await appsCol().doc(req.params.id).update({
+            downloads: admin.firestore.FieldValue.increment(1)
+        });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── 自分の投稿アプリ一覧 ────────────────────────────────
+// GET /store/my-apps?email=xxx
+app.get('/store/my-apps', async (req, res) => {
+    try {
+        const { email } = req.query;
+        if (!email) return res.status(400).json({ error: 'email is required' });
+        const snap = await appsCol()
+            .where('authorEmail', '==', email)
+            .orderBy('createdAt', 'desc')
+            .get();
+        const apps = snap.docs.map(d => {
+            const data = d.data();
+            return { id: d.id, ...data, htmlContent: undefined }; // htmlContentは返さない
+        });
+        res.json({ apps });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Socket.io（リアルタイム通信 - 変更なし）
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 io.on('connection', (socket) => {
