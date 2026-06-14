@@ -399,12 +399,12 @@ app.get('/store/my-apps', async (req, res) => {
         if (!email) return res.status(400).json({ error: 'email is required' });
         const snap = await appsCol()
             .where('authorEmail', '==', email)
-            .orderBy('createdAt', 'desc')
             .get();
         const apps = snap.docs.map(d => {
             const { htmlContent, iconImage, ...rest } = d.data();
             return { id: d.id, ...rest };
         });
+        .sort((a, b) => b.createdAt - a.createdAt); 
         res.json({ apps });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
