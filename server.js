@@ -654,17 +654,19 @@ app.get('/store/apps/:id/comments', async (req, res) => {
         const cached = _commentCacheGet(cacheKey);
         if (cached) return res.json({ comments: cached, _cached: true });
 
-        // Firestore: where は orderBy より前に指定する必要がある
-        let q = commentsCol().where('appId', '==', appId);
-        if (before) q = q.where('createdAt', '<', before);
-        q = q.orderBy('createdAt', 'desc').limit(limit);
+        // 複合インデックス不要：appId のみで絞り込み、ソートはメモリで行う
+        // （コメント数が数百件規模なら十分実用的）
+        const snap = await commentsCol().where('appId', '==', appId).get();
 
-        const snap = await q.get();
-        // メールアドレスは返さない
-        const comments = snap.docs.map(d => {
+        let comments = snap.docs.map(d => {
             const { email, ...rest } = d.data();
             return { id: d.id, ...rest };
         });
+
+        // メモリでソート・カーソル適用
+        comments.sort((a, b) => b.createdAt - a.createdAt);
+        if (before) comments = comments.filter(c => c.createdAt < before);
+        comments = comments.slice(0, limit);
 
         _commentCacheSet(cacheKey, comments);
         res.json({ comments });
