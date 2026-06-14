@@ -9,7 +9,7 @@ const fetch = require('node-fetch');
 const twilio = require('twilio');
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Firebase Admin SDK（MongoDBの代わり）
+// Firebase Admin SDK
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const admin = require('firebase-admin');
 
@@ -24,18 +24,17 @@ admin.initializeApp({
 const db = admin.firestore();
 const usersCol = () => db.collection('users');
 const chatsCol = () => db.collection('chats');
+const appsCol = () => db.collection('store_apps');
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Firestore ヘルパー（MongoDBと同じ感覚で使えるように）
+// Firestore ヘルパー
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// ユーザー取得（MongoDB: usersCollection.findOne({ _id: email })）
 async function getUser(email) {
     const snap = await usersCol().doc(email).get();
     return snap.exists ? snap.data() : null;
 }
 
-// チャット取得（MongoDB: chatsCollection.findOne({ _id: chatID })）
 async function getChat(chatID) {
     const snap = await chatsCol().doc(chatID).get();
     return snap.exists ? snap.data() : null;
@@ -61,10 +60,60 @@ const authToken = process.env.TWILIO_AUTH_TOKEN;
 let onlineUsers = {};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// App Store: インメモリキャッシュ（Firestore読み取り節約）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const _listCache = new Map();
+const LIST_CACHE_TTL = 30_000; // 30秒
+const LIST_CACHE_MAX = 20;
+
+function _cacheGet(key) {
+    const entry = _listCache.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expireAt) { _listCache.delete(key); return null; }
+    return entry.data;
+}
+
+function _cacheSet(key, data) {
+    if (_listCache.size >= LIST_CACHE_MAX) {
+        const oldest = [..._listCache.entries()].sort((a, b) => a[1].expireAt - b[1].expireAt)[0];
+        if (oldest) _listCache.delete(oldest[0]);
+    }
+    _listCache.set(key, { data, expireAt: Date.now() + LIST_CACHE_TTL });
+}
+
+function _cacheInvalidate() {
+    _listCache.clear();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// App Store: レートリミット（IPベース・メモリ内）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const _rateLimitMap = new Map();
+const RATE_LIMIT_MAX = 10;
+const RATE_LIMIT_WINDOW = 60_000; // 1分
+
+function _rateLimit(req, endpoint) {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    const key = `${ip}:${endpoint}`;
+    const now = Date.now();
+    const timestamps = (_rateLimitMap.get(key) || []).filter(t => now - t < RATE_LIMIT_WINDOW);
+    if (timestamps.length >= RATE_LIMIT_MAX) return false;
+    timestamps.push(now);
+    _rateLimitMap.set(key, timestamps);
+    // メモリ肥大化防止
+    if (_rateLimitMap.size > 1000) {
+        for (const [k, ts] of _rateLimitMap.entries()) {
+            if (ts.every(t => now - t > RATE_LIMIT_WINDOW)) _rateLimitMap.delete(k);
+        }
+    }
+    return true;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // REST API
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v5.0 (Firebase) is Active!</h1>'));
+app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v5.1 (Firebase) is Active!</h1>'));
 
 // ユーザー作成
 app.post('/createUser', async (req, res) => {
@@ -99,7 +148,6 @@ app.post('/getSidebarData', async (req, res) => {
         const { friends = [], requests = [], sentRequests = [] } = user;
         const contactEmails = [...new Set([...friends, ...requests, ...sentRequests])];
 
-        // 連絡先のユーザーデータを取得（Firestoreはin queryが30件まで）
         const usersData = {};
         const chunks = [];
         for (let i = 0; i < contactEmails.length; i += 30) chunks.push(contactEmails.slice(i, i + 30));
@@ -112,7 +160,6 @@ app.post('/getSidebarData', async (req, res) => {
             });
         }
 
-        // 未読数カウント
         const unreadCounts = {};
         for (const friendEmail of friends) {
             const chatID = [email, friendEmail].sort().join('__');
@@ -283,28 +330,33 @@ app.get('/extract', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'ページの読み込みまたは解析に失敗しました。' }); }
 });
 
-// Rivift App Store API — Server.js への追記分 (修正版)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Rivift App Store API
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-const appsCol = () => db.collection('store_apps');
-
-// ── アプリ一覧取得（htmlContentは返さない）─────────────
+// ── アプリ一覧取得（キャッシュ付き・htmlContent/iconImageは返さない）
 app.get('/store/apps', async (req, res) => {
     try {
         const { category = 'all', sort = 'newest', limit = 30, offset = 0 } = req.query;
+        const cacheKey = `${category}|${sort}|${limit}|${offset}`;
+        const cached = _cacheGet(cacheKey);
+        if (cached) return res.json({ apps: cached, _cached: true });
+
         let q = appsCol();
         if (category && category !== 'all') q = q.where('category', '==', category);
-        q = q.orderBy(sort === 'popular' ? 'downloads' : 'createdAt', 'desc')
-             .limit(Number(limit)).offset(Number(offset));
+        const sortField = sort === 'popular' ? 'downloads' : sort === 'liked' ? 'likeCount' : 'createdAt';
+        q = q.orderBy(sortField, 'desc').limit(Number(limit)).offset(Number(offset));
         const snap = await q.get();
         const apps = snap.docs.map(d => {
-            const { htmlContent, ...rest } = d.data();
+            const { htmlContent, iconImage, ...rest } = d.data();
             return { id: d.id, ...rest };
         });
+        _cacheSet(cacheKey, apps);
         res.json({ apps });
     } catch (e) { console.error('store/apps error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── アプリ詳細（htmlContent含む）──────────────────────
+// ── アプリ詳細（htmlContent含む）
 app.get('/store/apps/:id', async (req, res) => {
     try {
         const snap = await appsCol().doc(req.params.id).get();
@@ -313,7 +365,7 @@ app.get('/store/apps/:id', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── アプリ投稿 ──────────────────────────────────────────
+// ── アプリ投稿
 app.post('/store/apps', async (req, res) => {
     try {
         const { email, title, description, category, htmlContent, iconEmoji, iconImage, version } = req.body;
@@ -335,14 +387,18 @@ app.post('/store/apps', async (req, res) => {
             iconImage: iconImage || null,
             version: (version || '1.0.0').slice(0, 20),
             downloads: 0,
+            likeCount: 0,
+            ratingSum: 0,
+            ratingCount: 0,
             createdAt: now,
             updatedAt: now,
         });
+        _cacheInvalidate();
         res.json({ success: true, id: docRef.id });
     } catch (e) { console.error('store publish error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── アプリ更新 ──────────────────────────────────────────
+// ── アプリ更新
 app.put('/store/apps/:id', async (req, res) => {
     try {
         const { email, title, description, category, htmlContent, iconEmoji, iconImage, version } = req.body;
@@ -366,11 +422,12 @@ app.put('/store/apps/:id', async (req, res) => {
         }
         if (version) update.version = version.slice(0, 20);
         await appsCol().doc(req.params.id).update(update);
+        _cacheInvalidate();
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── アプリ削除 ──────────────────────────────────────────
+// ── アプリ削除
 app.delete('/store/apps/:id', async (req, res) => {
     try {
         const { email } = req.body;
@@ -378,41 +435,181 @@ app.delete('/store/apps/:id', async (req, res) => {
         if (!snap.exists) return res.status(404).json({ error: 'App not found' });
         if (snap.data().authorEmail !== email) return res.status(403).json({ error: '権限がありません' });
         await appsCol().doc(req.params.id).delete();
+        _cacheInvalidate();
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── ダウンロード数インクリメント ────────────────────────
+// ── ダウンロード数インクリメント
 app.post('/store/apps/:id/download', async (req, res) => {
     try {
         await appsCol().doc(req.params.id).update({
             downloads: admin.firestore.FieldValue.increment(1)
         });
+        _cacheInvalidate();
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── 自分の投稿アプリ一覧（htmlContent・iconImageは除外）
+// ── 自分の投稿アプリ一覧
 app.get('/store/my-apps', async (req, res) => {
     try {
         const { email } = req.query;
         if (!email) return res.status(400).json({ error: 'email is required' });
-        const snap = await appsCol()
-            .where('authorEmail', '==', email)
-            .get();
+        const snap = await appsCol().where('authorEmail', '==', email).get();
         const apps = snap.docs.map(d => {
             const { htmlContent, iconImage, ...rest } = d.data();
             return { id: d.id, ...rest };
         });
-        apps.sort((a, b) => b.createdAt - a.createdAt); 
+        apps.sort((a, b) => b.createdAt - a.createdAt);
         res.json({ apps });
+    } catch (e) { console.error('my-apps error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── ハート（いいね）トグル
+// サブコレクション likes/{email} で管理。1ユーザー1いいねを確実に保証。
+app.post('/store/apps/:id/like', async (req, res) => {
+    try {
+        if (!_rateLimit(req, 'like')) return res.status(429).json({ error: 'Too many requests' });
+        const { email } = req.body;
+        if (!email) return res.status(400).json({ error: 'email is required' });
+
+        const appRef = appsCol().doc(req.params.id);
+        const likeRef = appRef.collection('likes').doc(email);
+        const likeSnap = await likeRef.get();
+
+        let liked;
+        if (likeSnap.exists) {
+            // いいね取り消し
+            await Promise.all([
+                likeRef.delete(),
+                appRef.update({ likeCount: admin.firestore.FieldValue.increment(-1) }),
+            ]);
+            liked = false;
+        } else {
+            // いいね追加
+            await Promise.all([
+                likeRef.set({ likedAt: Date.now() }),
+                appRef.update({ likeCount: admin.firestore.FieldValue.increment(1) }),
+            ]);
+            liked = true;
+        }
+        _cacheInvalidate();
+
+        const appSnap = await appRef.get();
+        res.json({ liked, likeCount: appSnap.data()?.likeCount || 0 });
+    } catch (e) { console.error('like error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── 自分がいいねしているか確認
+app.get('/store/apps/:id/like', async (req, res) => {
+    try {
+        const { email } = req.query;
+        if (!email) return res.status(400).json({ error: 'email is required' });
+        const likeSnap = await appsCol().doc(req.params.id).collection('likes').doc(email).get();
+        res.json({ liked: likeSnap.exists });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ── 星評価（1〜5）
+// サブコレクション ratings/{email} で1人1評価。変更可。
+// 集計は ratingSum/ratingCount に保持し毎回全件集計しない。
+app.post('/store/apps/:id/rating', async (req, res) => {
+    try {
+        if (!_rateLimit(req, 'rating')) return res.status(429).json({ error: 'Too many requests' });
+        const { email, score } = req.body;
+        if (!email) return res.status(400).json({ error: 'email is required' });
+        const s = Number(score);
+        if (!s || s < 1 || s > 5 || !Number.isInteger(s)) return res.status(400).json({ error: 'score must be 1-5 integer' });
 
+        const appRef = appsCol().doc(req.params.id);
+        const ratingRef = appRef.collection('ratings').doc(email);
+        const ratingSnap = await ratingRef.get();
+
+        if (ratingSnap.exists) {
+            // 既存評価を変更: 差分だけ加算
+            const oldScore = ratingSnap.data().score;
+            const diff = s - oldScore;
+            await Promise.all([
+                ratingRef.set({ score: s, updatedAt: Date.now() }),
+                diff !== 0 ? appRef.update({ ratingSum: admin.firestore.FieldValue.increment(diff) }) : Promise.resolve(),
+            ]);
+        } else {
+            // 新規評価
+            await Promise.all([
+                ratingRef.set({ score: s, updatedAt: Date.now() }),
+                appRef.update({
+                    ratingSum: admin.firestore.FieldValue.increment(s),
+                    ratingCount: admin.firestore.FieldValue.increment(1),
+                }),
+            ]);
+        }
+        _cacheInvalidate();
+
+        const appSnap = await appRef.get();
+        const { ratingSum = 0, ratingCount = 0 } = appSnap.data();
+        res.json({
+            myScore: s,
+            ratingSum,
+            ratingCount,
+            ratingAvg: ratingCount > 0 ? Math.round((ratingSum / ratingCount) * 10) / 10 : 0,
+        });
+    } catch (e) { console.error('rating error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── 自分の星評価を取得
+app.get('/store/apps/:id/rating', async (req, res) => {
+    try {
+        const { email } = req.query;
+        if (!email) return res.status(400).json({ myScore: null });
+        const snap = await appsCol().doc(req.params.id).collection('ratings').doc(email).get();
+        res.json({ myScore: snap.exists ? snap.data().score : null });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── 通報
+// store_reports コレクションに保存。同一ユーザー×同一アプリは24h1回まで。
+const _reportCooldown = new Map(); // `${email}:${appId}` → timestamp
+
+app.post('/store/apps/:id/report', async (req, res) => {
+    try {
+        if (!_rateLimit(req, 'report')) return res.status(429).json({ error: 'Too many requests' });
+        const { email, reason, detail } = req.body;
+        if (!email) return res.status(400).json({ error: 'email is required' });
+        if (!reason) return res.status(400).json({ error: 'reason is required' });
+
+        const VALID_REASONS = ['spam', 'malware', 'inappropriate', 'phishing', 'other'];
+        if (!VALID_REASONS.includes(reason)) return res.status(400).json({ error: 'Invalid reason' });
+
+        // 24hクールダウン
+        const coolKey = `${email}:${req.params.id}`;
+        const lastReport = _reportCooldown.get(coolKey);
+        if (lastReport && Date.now() - lastReport < 24 * 60 * 60 * 1000) {
+            return res.status(429).json({ error: 'すでにこのアプリを通報済みです。24時間後に再通報できます。' });
+        }
+
+        const appSnap = await appsCol().doc(req.params.id).get();
+        if (!appSnap.exists) return res.status(404).json({ error: 'App not found' });
+
+        await db.collection('store_reports').add({
+            appId: req.params.id,
+            appTitle: appSnap.data().title,
+            reporterEmail: email,
+            reason,
+            detail: (detail || '').slice(0, 500),
+            reportedAt: Date.now(),
+            status: 'pending', // pending | reviewed | dismissed
+        });
+
+        _reportCooldown.set(coolKey, Date.now());
+        console.warn(`[REPORT] app="${appSnap.data().title}" (${req.params.id}) by=${email} reason=${reason}`);
+
+        res.json({ success: true });
+    } catch (e) { console.error('report error:', e); res.status(500).json({ error: 'Server error' }); }
+});
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Socket.io（リアルタイム通信 - 変更なし）
+// Socket.io（リアルタイム通信）
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 io.on('connection', (socket) => {
     let currentUserEmail = null;
@@ -499,10 +696,8 @@ io.on('connection', (socket) => {
             const { from, to } = payload;
             const chatID = [from, to].sort().join('__');
             const msgId = payload.id || `${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
-            // サブコレクションに保存（1ドキュメントに全メッセージを詰めない→速度改善）
             await chatsCol().doc(chatID).set({ users: [from, to], lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
             await chatsCol().doc(chatID).collection('messages').doc(msgId).set({ ...payload, id: msgId });
-            // リアルタイム配信
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('private_message', { ...payload, id: msgId });
             const senderSocketId = onlineUsers[from];
@@ -515,7 +710,6 @@ io.on('connection', (socket) => {
             const readerEmail = payload.from;
             const writerEmail = payload.to;
             const chatID = [readerEmail, writerEmail].sort().join('__');
-            // サブコレクションの未読メッセージを一括既読
             const unreadSnap = await chatsCol().doc(chatID).collection('messages')
                 .where('to', '==', readerEmail).where('read', '==', false).get();
             const batch = db.batch();
@@ -545,7 +739,6 @@ io.on('connection', (socket) => {
     socket.on('delete_chat', async ({ user1, user2 }) => {
         try {
             const chatID = [user1, user2].sort().join('__');
-            // サブコレクションを全削除
             const msgsSnap = await chatsCol().doc(chatID).collection('messages').get();
             const batch = db.batch();
             msgsSnap.docs.forEach(d => batch.delete(d.ref));
@@ -555,7 +748,6 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('delete_chat error:', e); }
     });
 
-    // メッセージ編集
     socket.on('edit_message', async ({ from, to, messageId, newText }) => {
         try {
             const chatID = [from, to].sort().join('__');
@@ -569,7 +761,6 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('edit_message error:', e); }
     });
 
-    // リアクション追加・トグル
     socket.on('add_reaction', async ({ from, to, messageId, emoji }) => {
         try {
             const chatID = [from, to].sort().join('__');
@@ -599,7 +790,7 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('update_profile error:', e); }
     });
 
-    // WebRTC（変更なし）
+    // WebRTC
     socket.on('webrtc-offer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-offer', { from: socket.email, offer: payload.offer });
@@ -621,7 +812,7 @@ io.on('connection', (socket) => {
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-reject-call', { from: socket.email });
     });
 
-    // LiveCanvas（変更なし）
+    // LiveCanvas
     socket.on('live_canvas_invite', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('live_canvas_invite', { from: socket.email });
@@ -648,8 +839,7 @@ io.on('connection', (socket) => {
         if (recipientSocketId) io.to(recipientSocketId).emit('typing_stop', { from: payload.from });
     });
 
-    // ── 近距離共有 シグナリング ──────────────────────────
-    // 送信側 → 受信側に招待通知
+    // 近距離共有 シグナリング
     socket.on('proximity_offer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_share_invite', {
@@ -661,21 +851,17 @@ io.on('connection', (socket) => {
         });
     });
 
-    // 受信側の承認/拒否を送信側に通知
     socket.on('proximity_share_response', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (!recipientSocketId) return;
-        // 承認・拒否どちらもそのまま送信側に転送する（proximity_ready_ack は廃止）
         io.to(recipientSocketId).emit('proximity_share_response', { from: socket.email, accepted: payload.accepted });
     });
 
-    // 受信側準備完了 → 送信側にOffer送信を促す
     socket.on('proximity_ready', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_offer', { from: socket.email });
     });
 
-    // WebRTC Offer中継（送信側→受信側）
     socket.on('proximity_do_answer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_answer', {
@@ -684,7 +870,6 @@ io.on('connection', (socket) => {
         });
     });
 
-    // WebRTC Answer中継（受信側→送信側）
     socket.on('proximity_answer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_answer', {
@@ -693,7 +878,6 @@ io.on('connection', (socket) => {
         });
     });
 
-    // ICE候補中継（双方向）
     socket.on('proximity_ice', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_ice', {
@@ -701,8 +885,7 @@ io.on('connection', (socket) => {
             candidate: payload.candidate,
         });
     });
-    
-    // 受信完了通知中継（受信側→送信側）
+
     socket.on('proximity_received', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_received', {
@@ -711,7 +894,6 @@ io.on('connection', (socket) => {
         });
     });
 
-    // キャンセル通知中継（送信側→受信側 または 受信側→送信側）
     socket.on('proximity_cancel', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_cancel', {
@@ -721,6 +903,6 @@ io.on('connection', (socket) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// サーバー起動（MongoDBへの接続不要になったので直接起動）
+// サーバー起動
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-server.listen(PORT, () => console.log(`Rivift Connect Server v5.0 (Firebase) is running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Rivift Connect Server v5.1 (Firebase) is running on port ${PORT}`));
