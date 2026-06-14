@@ -654,11 +654,10 @@ app.get('/store/apps/:id/comments', async (req, res) => {
         const cached = _commentCacheGet(cacheKey);
         if (cached) return res.json({ comments: cached, _cached: true });
 
-        let q = commentsCol()
-            .where('appId', '==', appId)
-            .orderBy('createdAt', 'desc')
-            .limit(limit);
+        // Firestore: where は orderBy より前に指定する必要がある
+        let q = commentsCol().where('appId', '==', appId);
         if (before) q = q.where('createdAt', '<', before);
+        q = q.orderBy('createdAt', 'desc').limit(limit);
 
         const snap = await q.get();
         // メールアドレスは返さない
@@ -699,8 +698,8 @@ app.post('/store/apps/:id/comments', async (req, res) => {
             createdAt: now,
         });
 
-        _commentCacheInvalidate(req.params.id);
-
+        // レスポンスを先に返してからキャッシュ無効化
+        // （Firestoreの書き込み反映を待ってから次のGETが正しい値を取れるよう少し遅延）
         res.json({
             success: true,
             comment: {
@@ -712,6 +711,7 @@ app.post('/store/apps/:id/comments', async (req, res) => {
                 createdAt: now,
             },
         });
+        setTimeout(() => _commentCacheInvalidate(req.params.id), 500);
     } catch (e) { console.error('comments POST error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -728,9 +728,8 @@ app.delete('/store/apps/:id/comments/:commentId', async (req, res) => {
         if (commentSnap.data().appId !== req.params.id) return res.status(400).json({ error: 'App ID mismatch' });
 
         await commentRef.delete();
-        _commentCacheInvalidate(req.params.id);
-
         res.json({ success: true });
+        setTimeout(() => _commentCacheInvalidate(req.params.id), 500);
     } catch (e) { console.error('comments DELETE error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
