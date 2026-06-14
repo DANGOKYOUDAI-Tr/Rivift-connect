@@ -25,6 +25,7 @@ const db = admin.firestore();
 const usersCol = () => db.collection('users');
 const chatsCol = () => db.collection('chats');
 const appsCol = () => db.collection('store_apps');
+const commentsCol = () => db.collection('store_comments');
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Firestore ヘルパー
@@ -86,18 +87,48 @@ function _cacheInvalidate() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// App Store: コメントキャッシュ
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const _commentCache = new Map();
+const COMMENT_CACHE_TTL = 30_000; // 30秒
+const COMMENT_CACHE_MAX = 50;
+
+function _commentCacheGet(key) {
+    const entry = _commentCache.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expireAt) { _commentCache.delete(key); return null; }
+    return entry.data;
+}
+
+function _commentCacheSet(key, data) {
+    if (_commentCache.size >= COMMENT_CACHE_MAX) {
+        const oldest = [..._commentCache.entries()].sort((a, b) => a[1].expireAt - b[1].expireAt)[0];
+        if (oldest) _commentCache.delete(oldest[0]);
+    }
+    _commentCache.set(key, { data, expireAt: Date.now() + COMMENT_CACHE_TTL });
+}
+
+function _commentCacheInvalidate(appId) {
+    // 対象アプリのコメントキャッシュをすべて削除
+    for (const key of _commentCache.keys()) {
+        if (key.startsWith(`${appId}:`)) _commentCache.delete(key);
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // App Store: レートリミット（IPベース・メモリ内）
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const _rateLimitMap = new Map();
 const RATE_LIMIT_MAX = 10;
 const RATE_LIMIT_WINDOW = 60_000; // 1分
 
-function _rateLimit(req, endpoint) {
+function _rateLimit(req, endpoint, maxRequests) {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
     const key = `${ip}:${endpoint}`;
     const now = Date.now();
+    const limit = maxRequests || RATE_LIMIT_MAX;
     const timestamps = (_rateLimitMap.get(key) || []).filter(t => now - t < RATE_LIMIT_WINDOW);
-    if (timestamps.length >= RATE_LIMIT_MAX) return false;
+    if (timestamps.length >= limit) return false;
     timestamps.push(now);
     _rateLimitMap.set(key, timestamps);
     // メモリ肥大化防止
@@ -606,6 +637,101 @@ app.post('/store/apps/:id/report', async (req, res) => {
 
         res.json({ success: true });
     } catch (e) { console.error('report error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// App Store: コメント機能
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ── コメント一覧取得（新着順・カーソルページネーション・30秒キャッシュ）
+app.get('/store/apps/:id/comments', async (req, res) => {
+    try {
+        const appId = req.params.id;
+        const limit = Math.min(Number(req.query.limit) || 20, 50);
+        const before = req.query.before ? Number(req.query.before) : null;
+
+        const cacheKey = `${appId}:${limit}:${before || 'latest'}`;
+        const cached = _commentCacheGet(cacheKey);
+        if (cached) return res.json({ comments: cached, _cached: true });
+
+        let q = commentsCol()
+            .where('appId', '==', appId)
+            .orderBy('createdAt', 'desc')
+            .limit(limit);
+        if (before) q = q.where('createdAt', '<', before);
+
+        const snap = await q.get();
+        // メールアドレスは返さない
+        const comments = snap.docs.map(d => {
+            const { email, ...rest } = d.data();
+            return { id: d.id, ...rest };
+        });
+
+        _commentCacheSet(cacheKey, comments);
+        res.json({ comments });
+    } catch (e) { console.error('comments GET error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── コメント投稿
+app.post('/store/apps/:id/comments', async (req, res) => {
+    try {
+        if (!_rateLimit(req, 'comments-post', 3)) return res.status(429).json({ error: 'コメントは1分間に3件までです。しばらく待ってから再試行してください。' });
+
+        const { email, body } = req.body;
+        if (!email) return res.status(400).json({ error: 'email is required' });
+        if (!body || typeof body !== 'string') return res.status(400).json({ error: 'body is required' });
+        const trimmed = body.trim();
+        if (trimmed.length < 1 || trimmed.length > 200) return res.status(400).json({ error: 'コメントは1〜200文字で入力してください' });
+
+        const user = await getUser(email);
+        if (!user) return res.status(401).json({ error: 'アカウントが見つかりません' });
+
+        const appSnap = await appsCol().doc(req.params.id).get();
+        if (!appSnap.exists) return res.status(404).json({ error: 'App not found' });
+
+        const now = Date.now();
+        const docRef = await commentsCol().add({
+            appId: req.params.id,
+            email,
+            displayName: user.displayName || email,
+            icon: user.icon || null,
+            body: trimmed,
+            createdAt: now,
+        });
+
+        _commentCacheInvalidate(req.params.id);
+
+        res.json({
+            success: true,
+            comment: {
+                id: docRef.id,
+                appId: req.params.id,
+                displayName: user.displayName || email,
+                icon: user.icon || null,
+                body: trimmed,
+                createdAt: now,
+            },
+        });
+    } catch (e) { console.error('comments POST error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── コメント削除（投稿者本人のみ）
+app.delete('/store/apps/:id/comments/:commentId', async (req, res) => {
+    try {
+        const { email } = req.body;
+        if (!email) return res.status(400).json({ error: 'email is required' });
+
+        const commentRef = commentsCol().doc(req.params.commentId);
+        const commentSnap = await commentRef.get();
+        if (!commentSnap.exists) return res.status(404).json({ error: 'Comment not found' });
+        if (commentSnap.data().email !== email) return res.status(403).json({ error: '削除する権限がありません' });
+        if (commentSnap.data().appId !== req.params.id) return res.status(400).json({ error: 'App ID mismatch' });
+
+        await commentRef.delete();
+        _commentCacheInvalidate(req.params.id);
+
+        res.json({ success: true });
+    } catch (e) { console.error('comments DELETE error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
