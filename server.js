@@ -334,7 +334,7 @@ app.get('/extract', async (req, res) => {
 // Rivift App Store API
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// ── アプリ一覧取得（キャッシュ付き・htmlContent/iconImageは返さない）
+// ── アプリ一覧取得（キャッシュ付き・htmlContentは返さない）
 app.get('/store/apps', async (req, res) => {
     try {
         const { category = 'all', sort = 'newest', limit = 30, offset = 0 } = req.query;
@@ -348,7 +348,7 @@ app.get('/store/apps', async (req, res) => {
         q = q.orderBy(sortField, 'desc').limit(Number(limit)).offset(Number(offset));
         const snap = await q.get();
         const apps = snap.docs.map(d => {
-            const { htmlContent, iconImage, ...rest } = d.data();
+            const { htmlContent, ...rest } = d.data();
             return { id: d.id, ...rest };
         });
         _cacheSet(cacheKey, apps);
