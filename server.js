@@ -404,7 +404,7 @@ app.get('/store/my-apps', async (req, res) => {
             const { htmlContent, iconImage, ...rest } = d.data();
             return { id: d.id, ...rest };
         });
-        .sort((a, b) => b.createdAt - a.createdAt); 
+        apps.sort((a, b) => b.createdAt - a.createdAt); 
         res.json({ apps });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
