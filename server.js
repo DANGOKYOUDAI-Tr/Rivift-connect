@@ -7,6 +7,8 @@ const path = require('path');
 const axios = require('axios');
 const fetch = require('node-fetch');
 const twilio = require('twilio');
+const helmet = require('helmet');
+const jwt = require('jsonwebtoken');
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Firebase Admin SDK
@@ -26,6 +28,8 @@ const usersCol = () => db.collection('users');
 const chatsCol = () => db.collection('chats');
 const appsCol = () => db.collection('store_apps');
 const commentsCol = () => db.collection('store_comments');
+const mailCol = () => db.collection('mail_messages');
+const authCodesCol = () => db.collection('auth_codes');
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Firestore ヘルパー
@@ -42,16 +46,61 @@ async function getChat(chatID) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// セキュリティ定数
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) console.warn('[WARN] JWT_SECRET が設定されていません。認証エンドポイントは機能しません。');
+
+const ALLOWED_ORIGINS = [
+    'https://rivift.app',
+    'http://localhost:5500',
+    'http://localhost:3000',
+    'http://127.0.0.1:5500',
+    'null', // file:// で開いた場合
+];
+
+// SSRF対策ブロックリスト
+const BLOCKED_HOSTNAMES = ['localhost', '127.0.0.1', '0.0.0.0', '::1'];
+const BLOCKED_PREFIXES = ['169.254.', '10.', '192.168.', '172.16.', '172.17.', '172.18.',
+    '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
+    '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.'];
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// バリデーションヘルパー
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function isValidEmail(email) {
+    return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
+}
+
+function sanitizeString(str, maxLen) {
+    return typeof str === 'string' ? str.trim().slice(0, maxLen) : '';
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Express / Socket.io セットアップ
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const app = express();
-app.use(cors({ origin: "*" }));
-app.use(express.json({ limit: '50mb' }));
+
+// Helmet（HTTPヘッダー強化）
+app.use(helmet());
+
+// CORS 厳格化
+app.use(cors({
+    origin: (origin, cb) => {
+        // originなし（同一オリジン・curl等）は許可
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+        cb(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+}));
+
+// グローバルリクエストサイズ制限（1MB）
+app.use(express.json({ limit: '1mb' }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] },
-    maxHttpBufferSize: 50e6
+    cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] },
+    maxHttpBufferSize: 5e6, // 5MB（旧50MBから縮小）
 });
 const PORT = process.env.PORT || 3001;
 
@@ -141,19 +190,52 @@ function _rateLimit(req, endpoint, maxRequests) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// グローバルレートリミットミドルウェア
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function globalRateLimit(req, res, next) {
+    if (!_rateLimit(req, 'global', 120)) {
+        return res.status(429).json({ error: 'リクエストが多すぎます。しばらく待ってから再試行してください。' });
+    }
+    next();
+}
+app.use(globalRateLimit);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// JWT 認証ミドルウェア
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function requireAuth(req, res, next) {
+    const token = req.headers['authorization']?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: '認証が必要です' });
+    if (!JWT_SECRET) return res.status(500).json({ error: 'サーバー設定エラー' });
+    try {
+        req.user = jwt.verify(token, JWT_SECRET); // { email, displayName }
+        next();
+    } catch {
+        res.status(401).json({ error: 'トークンが無効または期限切れです' });
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // REST API
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v5.1 (Firebase) is Active!</h1>'));
+app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v6.0 (Firebase) is Active!</h1>'));
+
+// スリープ対策 ping
+app.get('/ping', (req, res) => res.json({ ok: true }));
 
 // ユーザー作成
 app.post('/createUser', async (req, res) => {
+    if (!_rateLimit(req, 'create-user', 3)) return res.status(429).json({ error: 'Too many requests' });
     try {
         const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon } = req.body;
+        if (!isValidEmail(email)) return res.status(400).json({ error: 'メールアドレスが無効です' });
+        const safeDisplayName = sanitizeString(displayName, 50);
+        if (!safeDisplayName) return res.status(400).json({ error: '表示名は必須です' });
         const existing = await getUser(email);
         if (existing) return res.status(400).json({ error: 'User already exists' });
         await usersCol().doc(email).set({
-            email, displayName, publicKeyJwk, encryptedPrivateKeyPayload,
+            email, displayName: safeDisplayName, publicKeyJwk, encryptedPrivateKeyPayload,
             icon: icon || null, friends: [], requests: [], sentRequests: []
         });
         res.json({ success: true });
@@ -314,6 +396,20 @@ app.post('/proxy', async (req, res) => {
     try {
         const { url, method, headers, body } = req.body;
         if (!url) return res.status(400).send('URL is required.');
+
+        // URLスキームチェック
+        if (!/^https?:\/\//i.test(url)) return res.status(400).send('Invalid URL scheme.');
+
+        // SSRF対策：内部IPブロック
+        let hostname;
+        try { hostname = new URL(url).hostname; } catch { return res.status(400).send('Invalid URL.'); }
+        if (BLOCKED_HOSTNAMES.includes(hostname) || BLOCKED_PREFIXES.some(p => hostname.startsWith(p))) {
+            return res.status(403).send('Blocked.');
+        }
+
+        // レートリミット（30回/分）
+        if (!_rateLimit(req, 'proxy', 30)) return res.status(429).send('Rate limit exceeded.');
+
         const fetchOptions = {
             method, headers: { ...headers }, body: body ? Buffer.from(body, 'base64') : null, redirect: 'follow'
         };
@@ -397,10 +493,11 @@ app.get('/store/apps/:id', async (req, res) => {
 });
 
 // ── アプリ投稿
-app.post('/store/apps', async (req, res) => {
+app.post('/store/apps', express.json({ limit: '10mb' }), requireAuth, async (req, res) => {
     try {
-        const { email, title, description, category, htmlContent, iconEmoji, iconImage, version } = req.body;
-        if (!email || !title || !htmlContent) return res.status(400).json({ error: 'email, title, htmlContent は必須です' });
+        const email = req.user.email; // JWTから取得（body.emailは信用しない）
+        const { title, description, category, htmlContent, iconEmoji, iconImage, version } = req.body;
+        if (!title || !htmlContent) return res.status(400).json({ error: 'title, htmlContent は必須です' });
         const user = await getUser(email);
         if (!user) return res.status(401).json({ error: 'Connectアカウントが見つかりません' });
         if (Buffer.byteLength(htmlContent, 'utf8') > 1_000_000) return res.status(400).json({ error: 'HTMLが大きすぎます（最大1MB）' });
@@ -430,9 +527,10 @@ app.post('/store/apps', async (req, res) => {
 });
 
 // ── アプリ更新
-app.put('/store/apps/:id', async (req, res) => {
+app.put('/store/apps/:id', express.json({ limit: '10mb' }), requireAuth, async (req, res) => {
     try {
-        const { email, title, description, category, htmlContent, iconEmoji, iconImage, version } = req.body;
+        const email = req.user.email;
+        const { title, description, category, htmlContent, iconEmoji, iconImage, version } = req.body;
         const snap = await appsCol().doc(req.params.id).get();
         if (!snap.exists) return res.status(404).json({ error: 'App not found' });
         if (snap.data().authorEmail !== email) return res.status(403).json({ error: '権限がありません' });
@@ -459,9 +557,9 @@ app.put('/store/apps/:id', async (req, res) => {
 });
 
 // ── アプリ削除
-app.delete('/store/apps/:id', async (req, res) => {
+app.delete('/store/apps/:id', requireAuth, async (req, res) => {
     try {
-        const { email } = req.body;
+        const email = req.user.email;
         const snap = await appsCol().doc(req.params.id).get();
         if (!snap.exists) return res.status(404).json({ error: 'App not found' });
         if (snap.data().authorEmail !== email) return res.status(403).json({ error: '権限がありません' });
@@ -499,11 +597,10 @@ app.get('/store/my-apps', async (req, res) => {
 
 // ── ハート（いいね）トグル
 // サブコレクション likes/{email} で管理。1ユーザー1いいねを確実に保証。
-app.post('/store/apps/:id/like', async (req, res) => {
+app.post('/store/apps/:id/like', requireAuth, async (req, res) => {
     try {
         if (!_rateLimit(req, 'like')) return res.status(429).json({ error: 'Too many requests' });
-        const { email } = req.body;
-        if (!email) return res.status(400).json({ error: 'email is required' });
+        const email = req.user.email;
 
         const appRef = appsCol().doc(req.params.id);
         const likeRef = appRef.collection('likes').doc(email);
@@ -545,11 +642,11 @@ app.get('/store/apps/:id/like', async (req, res) => {
 // ── 星評価（1〜5）
 // サブコレクション ratings/{email} で1人1評価。変更可。
 // 集計は ratingSum/ratingCount に保持し毎回全件集計しない。
-app.post('/store/apps/:id/rating', async (req, res) => {
+app.post('/store/apps/:id/rating', requireAuth, async (req, res) => {
     try {
         if (!_rateLimit(req, 'rating')) return res.status(429).json({ error: 'Too many requests' });
-        const { email, score } = req.body;
-        if (!email) return res.status(400).json({ error: 'email is required' });
+        const email = req.user.email;
+        const { score } = req.body;
         const s = Number(score);
         if (!s || s < 1 || s > 5 || !Number.isInteger(s)) return res.status(400).json({ error: 'score must be 1-5 integer' });
 
@@ -674,12 +771,12 @@ app.get('/store/apps/:id/comments', async (req, res) => {
 });
 
 // ── コメント投稿
-app.post('/store/apps/:id/comments', async (req, res) => {
+app.post('/store/apps/:id/comments', requireAuth, async (req, res) => {
     try {
         if (!_rateLimit(req, 'comments-post', 3)) return res.status(429).json({ error: 'コメントは1分間に3件までです。しばらく待ってから再試行してください。' });
 
-        const { email, body } = req.body;
-        if (!email) return res.status(400).json({ error: 'email is required' });
+        const email = req.user.email;
+        const { body } = req.body;
         if (!body || typeof body !== 'string') return res.status(400).json({ error: 'body is required' });
         const trimmed = body.trim();
         if (trimmed.length < 1 || trimmed.length > 200) return res.status(400).json({ error: 'コメントは1〜200文字で入力してください' });
@@ -718,10 +815,9 @@ app.post('/store/apps/:id/comments', async (req, res) => {
 });
 
 // ── コメント削除（投稿者本人のみ）
-app.delete('/store/apps/:id/comments/:commentId', async (req, res) => {
+app.delete('/store/apps/:id/comments/:commentId', requireAuth, async (req, res) => {
     try {
-        const { email } = req.body;
-        if (!email) return res.status(400).json({ error: 'email is required' });
+        const email = req.user.email;
 
         const commentRef = commentsCol().doc(req.params.commentId);
         const commentSnap = await commentRef.get();
@@ -1030,6 +1126,425 @@ io.on('connection', (socket) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 1: 認証エンドポイント（/auth/*）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ── サインイン → JWT発行
+app.post('/auth/login', async (req, res) => {
+    if (!_rateLimit(req, 'auth-login', 5)) return res.status(429).json({ error: 'リクエストが多すぎます' });
+    try {
+        const { email, password } = req.body;
+        if (!isValidEmail(email) || !password) return res.status(400).json({ error: 'email と password は必須です' });
+
+        const user = await getUser(email);
+        if (!user) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
+        if (!user.passwordHash) return res.status(401).json({ error: 'このアカウントはパスワードが設定されていません' });
+
+        // Web Crypto 互換のパスワード検証（PBKDF2 SHA-256）
+        // パスワードハッシュは { salt: hex, hash: hex } 形式で保存
+        const { salt, hash: storedHash } = user.passwordHash;
+        const encoder = new TextEncoder();
+        const keyMaterial = await crypto.subtle.importKey(
+            'raw', encoder.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']
+        );
+        const derivedBits = await crypto.subtle.deriveBits(
+            { name: 'PBKDF2', salt: Buffer.from(salt, 'hex'), iterations: 100000, hash: 'SHA-256' },
+            keyMaterial, 256
+        );
+        const computedHash = Buffer.from(derivedBits).toString('hex');
+        if (computedHash !== storedHash) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
+
+        const token = jwt.sign(
+            { email: user.email, displayName: user.displayName },
+            JWT_SECRET,
+            { expiresIn: '30d' }
+        );
+        res.json({ token, user: { email: user.email, displayName: user.displayName, icon: user.icon } });
+    } catch (e) { console.error('auth/login error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── JWT検証（トークン更新・自動サインイン確認）
+app.post('/auth/verify', requireAuth, (req, res) => {
+    // requireAuthが成功した時点でトークンは有効
+    res.json({ valid: true, user: { email: req.user.email, displayName: req.user.displayName } });
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 2: アカウント管理（確認コード・パスワード変更・削除）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const { Resend } = require('resend');
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+async function sendAuthCode(email, purpose) {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expireAt = Date.now() + 10 * 60 * 1000; // 10分
+    await authCodesCol().doc(email).set({ purpose, code, expireAt });
+
+    const purposeLabels = {
+        'change-password': 'パスワード変更',
+        'reset-password': 'パスワードリセット',
+        'delete-account': 'アカウント削除',
+    };
+    const label = purposeLabels[purpose] || '操作';
+
+    await resend.emails.send({
+        from: 'Rivift <noreply@rivift.app>',
+        to: email,
+        subject: `Rivift ${label}の確認コード`,
+        html: `
+            <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#fff;">
+                <h2 style="font-size:20px;font-weight:600;color:#1a1a1a;margin:0 0 8px;">${label}の確認</h2>
+                <p style="color:#555;margin:0 0 24px;">Riviftアカウントの${label}リクエストを受け付けました。</p>
+                <div style="background:#f5f5f5;border-radius:12px;padding:24px;text-align:center;margin:0 0 24px;">
+                    <p style="color:#888;font-size:13px;margin:0 0 8px;">確認コード</p>
+                    <p style="font-size:36px;font-weight:700;letter-spacing:8px;color:#1a1a1a;margin:0;">${code}</p>
+                    <p style="color:#888;font-size:12px;margin:8px 0 0;">10分間有効</p>
+                </div>
+                <p style="color:#888;font-size:12px;margin:0;">このメールに心当たりがない場合は無視してください。</p>
+            </div>
+        `,
+    });
+    return code;
+}
+
+async function verifyAuthCode(email, code, purpose) {
+    const snap = await authCodesCol().doc(email).get();
+    if (!snap.exists) return false;
+    const data = snap.data();
+    if (data.purpose !== purpose) return false;
+    if (data.code !== code) return false;
+    if (Date.now() > data.expireAt) return false;
+    await authCodesCol().doc(email).delete(); // 使用済み削除
+    return true;
+}
+
+// Web Crypto 互換のパスワードハッシュ生成（Node.js側）
+async function hashPassword(password) {
+    const salt = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('hex');
+    const encoder = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+        'raw', encoder.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']
+    );
+    const derivedBits = await crypto.subtle.deriveBits(
+        { name: 'PBKDF2', salt: Buffer.from(salt, 'hex'), iterations: 100000, hash: 'SHA-256' },
+        keyMaterial, 256
+    );
+    const hash = Buffer.from(derivedBits).toString('hex');
+    return { salt, hash };
+}
+
+// ── 確認コード送信
+app.post('/auth/send-code', async (req, res) => {
+    if (!_rateLimit(req, 'auth-send-code', 3)) return res.status(429).json({ error: 'しばらく待ってから再試行してください' });
+    const { email, purpose } = req.body;
+    const VALID_PURPOSES = ['change-password', 'reset-password', 'delete-account'];
+    if (!isValidEmail(email) || !VALID_PURPOSES.includes(purpose)) return res.status(400).json({ error: '入力が無効です' });
+
+    // reset-password はユーザー存在確認攻撃対策で常に成功を返す
+    if (purpose === 'reset-password') {
+        const user = await getUser(email);
+        if (user) await sendAuthCode(email, purpose).catch(e => console.error('sendAuthCode error:', e));
+        return res.json({ success: true }); // ユーザー不在でも同じレスポンス
+    }
+
+    // change-password / delete-account は JWT 必須
+    const token = req.headers['authorization']?.replace('Bearer ', '');
+    if (!token || !JWT_SECRET) return res.status(401).json({ error: '認証が必要です' });
+    let authUser;
+    try { authUser = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'トークンが無効です' }); }
+    if (authUser.email !== email) return res.status(403).json({ error: '権限がありません' });
+
+    try {
+        await sendAuthCode(email, purpose);
+        res.json({ success: true });
+    } catch (e) { console.error('send-code error:', e); res.status(500).json({ error: 'メール送信に失敗しました' }); }
+});
+
+// ── パスワード変更（ログイン済み）
+app.post('/auth/change-password', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const { code, newPassword } = req.body;
+        if (!code || !newPassword || newPassword.length < 8) return res.status(400).json({ error: 'コードと新しいパスワード（8文字以上）は必須です' });
+
+        const valid = await verifyAuthCode(email, code, 'change-password');
+        if (!valid) return res.status(400).json({ error: 'コードが無効または期限切れです' });
+
+        const passwordHash = await hashPassword(newPassword);
+        await usersCol().doc(email).update({ passwordHash });
+        res.json({ success: true });
+    } catch (e) { console.error('change-password error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── パスワードリセット（未ログイン）
+app.post('/auth/reset-password', async (req, res) => {
+    try {
+        const { email, code, newPassword } = req.body;
+        if (!isValidEmail(email) || !code || !newPassword || newPassword.length < 8) {
+            return res.status(400).json({ error: '入力が無効です' });
+        }
+
+        const valid = await verifyAuthCode(email, code, 'reset-password');
+        if (!valid) return res.status(400).json({ error: 'コードが無効または期限切れです' });
+
+        const user = await getUser(email);
+        if (!user) return res.status(400).json({ error: '入力が無効です' }); // 存在確認攻撃対策
+
+        const passwordHash = await hashPassword(newPassword);
+        await usersCol().doc(email).update({ passwordHash });
+        res.json({ success: true });
+    } catch (e) { console.error('reset-password error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── アカウント削除
+app.post('/auth/delete-account', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const { code } = req.body;
+        if (!code) return res.status(400).json({ error: '確認コードは必須です' });
+
+        const valid = await verifyAuthCode(email, code, 'delete-account');
+        if (!valid) return res.status(400).json({ error: 'コードが無効または期限切れです' });
+
+        const batchSize = 400; // Firestoreバッチ上限 500 に余裕を持たせる
+
+        // 1. store_apps（自分の投稿）
+        const myAppsSnap = await appsCol().where('authorEmail', '==', email).get();
+        for (let i = 0; i < myAppsSnap.docs.length; i += batchSize) {
+            const batch = db.batch();
+            myAppsSnap.docs.slice(i, i + batchSize).forEach(d => batch.delete(d.ref));
+            await batch.commit();
+        }
+
+        // 2. store_comments
+        const myCommentsSnap = await commentsCol().where('email', '==', email).get();
+        for (let i = 0; i < myCommentsSnap.docs.length; i += batchSize) {
+            const batch = db.batch();
+            myCommentsSnap.docs.slice(i, i + batchSize).forEach(d => batch.delete(d.ref));
+            await batch.commit();
+        }
+
+        // 3. mail_messages（from or to）
+        const mailFromSnap = await mailCol().where('from', '==', email).get();
+        const mailToSnap = await mailCol().where('to', '==', email).get();
+        const mailDocs = [...new Map([...mailFromSnap.docs, ...mailToSnap.docs].map(d => [d.id, d])).values()];
+        for (let i = 0; i < mailDocs.length; i += batchSize) {
+            const batch = db.batch();
+            mailDocs.slice(i, i + batchSize).forEach(d => batch.delete(d.ref));
+            await batch.commit();
+        }
+
+        // 4. chats（サブコレクション含む）
+        const user = await getUser(email);
+        if (user && user.friends) {
+            for (const friendEmail of user.friends) {
+                const chatID = [email, friendEmail].sort().join('__');
+                const msgsSnap = await chatsCol().doc(chatID).collection('messages').get();
+                for (let i = 0; i < msgsSnap.docs.length; i += batchSize) {
+                    const batch = db.batch();
+                    msgsSnap.docs.slice(i, i + batchSize).forEach(d => batch.delete(d.ref));
+                    await batch.commit();
+                }
+                await chatsCol().doc(chatID).delete();
+                // 相手のフレンドリストからも削除
+                await usersCol().doc(friendEmail).update({ friends: admin.firestore.FieldValue.arrayRemove(email) });
+            }
+        }
+
+        // 5. auth_codes
+        await authCodesCol().doc(email).delete().catch(() => {});
+
+        // 6. users
+        await usersCol().doc(email).delete();
+
+        res.json({ success: true });
+    } catch (e) { console.error('delete-account error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 4: Rivift Mail エンドポイント（全て requireAuth）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ── 受信箱
+app.get('/mail/inbox', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const limit = Math.min(Number(req.query.limit) || 20, 50);
+        const before = req.query.before ? Number(req.query.before) : null;
+
+        let q = mailCol()
+            .where('to', '==', email)
+            .where('trashBy', 'not-in', [[email]]) // ゴミ箱除外（単純化のため配列チェックはクライアント側で補完）
+            .orderBy('sentAt', 'desc')
+            .limit(limit);
+        if (before) q = q.where('sentAt', '<', before);
+
+        const snap = await q.get();
+        // deletedBy に含まれるものを除外
+        const messages = snap.docs
+            .map(d => ({ id: d.id, ...d.data() }))
+            .filter(m => !(m.deletedBy || []).includes(email) && !(m.trashBy || []).includes(email));
+
+        res.json({ messages });
+    } catch (e) { console.error('mail/inbox error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── 送信済み
+app.get('/mail/sent', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const limit = Math.min(Number(req.query.limit) || 20, 50);
+        const before = req.query.before ? Number(req.query.before) : null;
+
+        let q = mailCol()
+            .where('from', '==', email)
+            .orderBy('sentAt', 'desc')
+            .limit(limit);
+        if (before) q = q.where('sentAt', '<', before);
+
+        const snap = await q.get();
+        const messages = snap.docs
+            .map(d => ({ id: d.id, ...d.data() }))
+            .filter(m => !(m.deletedBy || []).includes(email));
+
+        res.json({ messages });
+    } catch (e) { console.error('mail/sent error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── ゴミ箱
+app.get('/mail/trash', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const limit = Math.min(Number(req.query.limit) || 20, 50);
+
+        // trashBy に email が含まれるものを取得（Firestore array-contains）
+        let q = mailCol()
+            .where('trashBy', 'array-contains', email)
+            .orderBy('sentAt', 'desc')
+            .limit(limit);
+
+        const snap = await q.get();
+        const messages = snap.docs
+            .map(d => ({ id: d.id, ...d.data() }))
+            .filter(m => !(m.deletedBy || []).includes(email));
+
+        res.json({ messages });
+    } catch (e) { console.error('mail/trash error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── メール送信
+app.post('/mail/send', requireAuth, async (req, res) => {
+    if (!_rateLimit(req, 'mail-send', 10)) return res.status(429).json({ error: 'メール送信が多すぎます' });
+    try {
+        const from = req.user.email; // JWTから取得（改ざん不可）
+        const { to, subject, body } = req.body;
+
+        if (!isValidEmail(to)) return res.status(400).json({ error: '宛先メールアドレスが無効です' });
+        if (from === to) return res.status(400).json({ error: '自分自身には送れません' });
+        const safeSubject = sanitizeString(subject, 100);
+        const safeBody = sanitizeString(body, 5000);
+        if (!safeSubject || !safeBody) return res.status(400).json({ error: '件名と本文は必須です' });
+
+        // 受信者がRiviftアカウントを持っているか確認
+        const recipient = await getUser(to);
+        if (!recipient) return res.status(404).json({ error: 'Riviftアカウントが見つかりません' });
+
+        const now = Date.now();
+        const docRef = await mailCol().add({
+            from, to, subject: safeSubject, body: safeBody,
+            sentAt: now, readAt: null, deletedBy: [], trashBy: [],
+        });
+
+        // リアルタイム通知
+        const recipientSocketId = onlineUsers[to];
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('new_mail', {
+                messageId: docRef.id, from, subject: safeSubject, sentAt: now,
+            });
+        }
+
+        res.json({ success: true, messageId: docRef.id });
+    } catch (e) { console.error('mail/send error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── 既読
+app.post('/mail/read', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const { messageId } = req.body;
+        if (!messageId) return res.status(400).json({ error: 'messageId は必須です' });
+
+        const ref = mailCol().doc(messageId);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ error: 'メッセージが見つかりません' });
+        if (snap.data().to !== email) return res.status(403).json({ error: '権限がありません' });
+
+        await ref.update({ readAt: Date.now() });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── ゴミ箱へ移動
+app.post('/mail/trash', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const { messageId } = req.body;
+        if (!messageId) return res.status(400).json({ error: 'messageId は必須です' });
+
+        const ref = mailCol().doc(messageId);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ error: 'メッセージが見つかりません' });
+        const data = snap.data();
+        if (data.from !== email && data.to !== email) return res.status(403).json({ error: '権限がありません' });
+
+        await ref.update({ trashBy: admin.firestore.FieldValue.arrayUnion(email) });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── 削除（物理削除：両者が deletedBy に入ったら完全削除）
+app.post('/mail/delete', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const { messageId } = req.body;
+        if (!messageId) return res.status(400).json({ error: 'messageId は必須です' });
+
+        const ref = mailCol().doc(messageId);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ error: 'メッセージが見つかりません' });
+        const data = snap.data();
+        if (data.from !== email && data.to !== email) return res.status(403).json({ error: '権限がありません' });
+
+        const newDeletedBy = [...new Set([...(data.deletedBy || []), email])];
+        // 両者が削除済みなら物理削除
+        const bothDeleted = [data.from, data.to].every(e => newDeletedBy.includes(e));
+        if (bothDeleted) {
+            await ref.delete();
+        } else {
+            await ref.update({ deletedBy: newDeletedBy });
+        }
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── 未読件数
+app.get('/mail/unread-count', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const snap = await mailCol()
+            .where('to', '==', email)
+            .where('readAt', '==', null)
+            .get();
+        const count = snap.docs.filter(d => {
+            const data = d.data();
+            return !(data.deletedBy || []).includes(email) && !(data.trashBy || []).includes(email);
+        }).length;
+        res.json({ count });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // サーバー起動
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-server.listen(PORT, () => console.log(`Rivift Connect Server v5.1 (Firebase) is running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Rivift Connect Server v6.0 (Firebase) is running on port ${PORT}`));
