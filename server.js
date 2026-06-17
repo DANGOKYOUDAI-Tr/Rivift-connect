@@ -1201,9 +1201,14 @@ app.post('/auth/login', async (req, res) => {
 });
 
 // ── JWT検証（トークン更新・自動サインイン確認）
-app.post('/auth/verify', requireAuth, (req, res) => {
-    // requireAuthが成功した時点でトークンは有効
-    res.json({ valid: true, user: { email: req.user.email, displayName: req.user.displayName } });
+app.post('/auth/verify', requireAuth, async (req, res) => {
+    // requireAuthが成功した時点でトークンは有効。iconはJWTに含めていないため軽く1回だけ補完する。
+    try {
+        const user = await getUser(req.user.email);
+        res.json({ valid: true, user: { email: req.user.email, displayName: req.user.displayName, icon: user?.icon || '' } });
+    } catch (e) {
+        res.json({ valid: true, user: { email: req.user.email, displayName: req.user.displayName, icon: '' } });
+    }
 });
 
 // ── パスワード移行（Phase1以前に作成された古いアカウント用）
@@ -1368,6 +1373,20 @@ app.post('/auth/change-password', requireAuth, async (req, res) => {
     } catch (e) { console.error('change-password error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
+// ── アイコン更新（設定アプリのアイコン変更をRiviftアカウントにも反映）
+app.post('/auth/update-icon', requireAuth, async (req, res) => {
+    if (!_rateLimit(req, 'update-icon', 20)) return res.status(429).json({ error: 'リクエストが多すぎます' });
+    try {
+        const email = req.user.email;
+        const { icon } = req.body;
+        if (typeof icon !== 'string' || icon.length > 400000) { // 約300KBのicon想定+base64オーバーヘッド余裕
+            return res.status(400).json({ error: 'iconが無効です' });
+        }
+        await usersCol().doc(email).update({ icon });
+        res.json({ success: true, icon });
+    } catch (e) { console.error('update-icon error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
 // ── パスワードリセット（未ログイン）
 app.post('/auth/reset-password', async (req, res) => {
     try {
@@ -1470,7 +1489,6 @@ app.get('/mail/inbox', requireAuth, async (req, res) => {
 
         let q = mailCol()
             .where('to', '==', email)
-            .where('trashBy', 'not-in', [[email]]) // ゴミ箱除外（単純化のため配列チェックはクライアント側で補完）
             .orderBy('sentAt', 'desc')
             .limit(limit);
         if (before) q = q.where('sentAt', '<', before);
