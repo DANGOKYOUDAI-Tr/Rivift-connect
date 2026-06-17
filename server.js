@@ -1183,6 +1183,34 @@ app.post('/auth/verify', requireAuth, (req, res) => {
     res.json({ valid: true, user: { email: req.user.email, displayName: req.user.displayName } });
 });
 
+// ── パスワード移行（Phase1以前に作成された古いアカウント用）
+// /createUser 経由で作られたアカウントは passwordHash が存在しないため /auth/login が使えない。
+// クライアント側で encryptedPrivateKeyPayload の復号に成功した（= 本人確認済み）後にこのエンドポイントを呼ぶ。
+// [SEC] passwordHash が既に存在するアカウントには絶対に上書きしない（乗っ取り防止）。
+app.post('/auth/migrate-password', async (req, res) => {
+    if (!_rateLimit(req, 'migrate-password', 3)) return res.status(429).json({ error: 'リクエストが多すぎます' });
+    try {
+        const { email, password } = req.body;
+        if (!isValidEmail(email) || !password || password.length < 8) {
+            return res.status(400).json({ error: '入力が無効です' });
+        }
+        const user = await getUser(email);
+        if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+        // [重要] すでに passwordHash がある場合は絶対に上書きしない
+        if (user.passwordHash) return res.status(400).json({ error: 'このアカウントは既に移行済みです' });
+
+        const passwordHash = await hashPassword(password);
+        await usersCol().doc(email).update({ passwordHash });
+
+        const token = jwt.sign(
+            { email: user.email, displayName: user.displayName },
+            JWT_SECRET,
+            { expiresIn: '30d' }
+        );
+        res.json({ success: true, token, user: { email: user.email, displayName: user.displayName, icon: user.icon } });
+    } catch (e) { console.error('migrate-password error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Phase 2: アカウント管理（確認コード・パスワード変更・削除）
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
