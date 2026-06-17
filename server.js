@@ -431,14 +431,32 @@ app.post('/proxy', async (req, res) => {
         if (!_rateLimit(req, 'proxy', 30)) return res.status(429).send('Rate limit exceeded.');
 
         const fetchOptions = {
-            method, headers: { ...headers }, body: body ? Buffer.from(body, 'base64') : null, redirect: 'follow'
+            method, headers: { ...headers }, body: body ? Buffer.from(body, 'base64') : null, redirect: 'manual'
         };
         delete fetchOptions.headers['host'];
         delete fetchOptions.headers['origin'];
         delete fetchOptions.headers['referer'];
         delete fetchOptions.headers['content-length'];
         fetchOptions.headers['user-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36';
-        const response = await fetch(url, fetchOptions);
+
+        // リダイレクトを手動で追跡し、各ホップで内部IPチェックを行う（DNS rebinding/リダイレクトSSRF対策）
+        let currentUrl = url;
+        let response;
+        for (let hop = 0; hop < 5; hop++) {
+            response = await fetch(currentUrl, fetchOptions);
+            if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+                const nextUrl = new URL(response.headers.get('location'), currentUrl).href;
+                if (!/^https?:\/\//i.test(nextUrl)) return res.status(400).send('Invalid redirect URL scheme.');
+                const nextHostname = new URL(nextUrl).hostname;
+                if (BLOCKED_HOSTNAMES.includes(nextHostname) || BLOCKED_PREFIXES.some(p => nextHostname.startsWith(p))) {
+                    return res.status(403).send('Blocked (redirect target).');
+                }
+                currentUrl = nextUrl;
+                continue;
+            }
+            break;
+        }
+
         res.setHeader('x-proxy-headers', JSON.stringify(Object.fromEntries(response.headers)));
         response.body.pipe(res);
     } catch (e) { console.error('Proxy error:', e.message); res.status(500).send(e.message); }
@@ -1196,7 +1214,7 @@ app.post('/auth/migrate-password', async (req, res) => {
     if (!_rateLimit(req, 'migrate-password', 3)) return res.status(429).json({ error: 'リクエストが多すぎます' });
     try {
         const { email, password } = req.body;
-        if (!isValidEmail(email) || !password || password.length < 8) {
+        if (!isValidEmail(email) || !password || typeof password !== 'string') {
             return res.status(400).json({ error: '入力が無効です' });
         }
         const user = await getUser(email);
