@@ -240,16 +240,21 @@ app.get('/ping', (req, res) => res.json({ ok: true }));
 app.post('/createUser', async (req, res) => {
     if (!_rateLimit(req, 'create-user', 3)) return res.status(429).json({ error: 'Too many requests' });
     try {
-        const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon } = req.body;
+        const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon, passwordHash } = req.body;
         if (!isValidEmail(email)) return res.status(400).json({ error: 'メールアドレスが無効です' });
         const safeDisplayName = sanitizeString(displayName, 50);
         if (!safeDisplayName) return res.status(400).json({ error: '表示名は必須です' });
         const existing = await getUser(email);
         if (existing) return res.status(400).json({ error: 'User already exists' });
-        await usersCol().doc(email).set({
+        // passwordHash があれば保存（Rivift ConnectアカウントのJWT認証で使う）
+        const userData = {
             email, displayName: safeDisplayName, publicKeyJwk, encryptedPrivateKeyPayload,
             icon: icon || null, friends: [], requests: [], sentRequests: []
-        });
+        };
+        if (passwordHash && passwordHash.salt && passwordHash.hash) {
+            userData.passwordHash = passwordHash;
+        }
+        await usersCol().doc(email).set(userData);
         res.json({ success: true });
     } catch (e) { console.error('createUser error:', e); res.status(500).json({ error: 'Server error' }); }
 });
