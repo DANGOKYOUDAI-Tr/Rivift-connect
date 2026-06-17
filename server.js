@@ -1547,17 +1547,29 @@ app.get('/mail/trash', requireAuth, async (req, res) => {
 });
 
 // ── メール送信
+// [SEC] E2EE化：subject/bodyは平文で受け取らない。クライアント側でAES-GCM暗号化済みの
+// ペイロードと、受信者・送信者それぞれの公開鍵で包んだAES鍵を受け取り、そのまま保存する。
+// サーバーは暗号文の中身を一切復号できない。
 app.post('/mail/send', requireAuth, async (req, res) => {
     if (!_rateLimit(req, 'mail-send', 10)) return res.status(429).json({ error: 'メール送信が多すぎます' });
     try {
         const from = req.user.email; // JWTから取得（改ざん不可）
-        const { to, subject, body } = req.body;
+        const { to, encryptedPayload, keyForRecipient, keyForSender } = req.body;
 
         if (!isValidEmail(to)) return res.status(400).json({ error: '宛先メールアドレスが無効です' });
         if (from === to) return res.status(400).json({ error: '自分自身には送れません' });
-        const safeSubject = sanitizeString(subject, 100);
-        const safeBody = sanitizeString(body, 5000);
-        if (!safeSubject || !safeBody) return res.status(400).json({ error: '件名と本文は必須です' });
+
+        // 暗号化ペイロードの形式チェック（中身は検証できないが、構造とサイズだけは見る）
+        if (!encryptedPayload || typeof encryptedPayload.iv !== 'string' || typeof encryptedPayload.data !== 'string') {
+            return res.status(400).json({ error: '暗号化データが無効です' });
+        }
+        if (typeof keyForRecipient !== 'string' || typeof keyForSender !== 'string') {
+            return res.status(400).json({ error: '暗号化鍵が無効です' });
+        }
+        // 異常に大きいペイロードはDoS対策として弾く（5000文字本文+件名を暗号化してもこの範囲に収まる）
+        if (encryptedPayload.data.length > 50000 || keyForRecipient.length > 2000 || keyForSender.length > 2000) {
+            return res.status(400).json({ error: 'データサイズが大きすぎます' });
+        }
 
         // 受信者がRiviftアカウントを持っているか確認
         const recipient = await getUser(to);
@@ -1565,15 +1577,19 @@ app.post('/mail/send', requireAuth, async (req, res) => {
 
         const now = Date.now();
         const docRef = await mailCol().add({
-            from, to, subject: safeSubject, body: safeBody,
+            from, to,
+            encryptedPayload,      // { iv, data } — subject/bodyの暗号文（サーバーは復号不可）
+            keyForRecipient,       // 受信者の公開鍵で包んだAES鍵
+            keyForSender,          // 送信者の公開鍵で包んだAES鍵（送信者が後で読み返すため）
             sentAt: now, readAt: null, deletedBy: [], trashBy: [],
         });
 
-        // リアルタイム通知
+        // リアルタイム通知：件名は暗号化されているためサーバーからは送れない。
+        // 新着があった事実とmessageIdのみ通知し、クライアント側で復号してから表示する。
         const recipientSocketId = onlineUsers[to];
         if (recipientSocketId) {
             io.to(recipientSocketId).emit('new_mail', {
-                messageId: docRef.id, from, subject: safeSubject, sentAt: now,
+                messageId: docRef.id, from, sentAt: now,
             });
         }
 
