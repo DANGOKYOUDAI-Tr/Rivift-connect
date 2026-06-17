@@ -252,6 +252,9 @@ app.post('/getUserData', async (req, res) => {
 });
 
 // サイドバーデータ取得
+// [PERF] 未読数の算出はここでのみ行う（初回ロード用）。
+//        以降の未読数更新はSocket.ioの 'unread_update' イベントで差分通知されるため、
+//        メッセージ送受信のたびにこのエンドポイントを叩く必要はない。
 app.post('/getSidebarData', async (req, res) => {
     try {
         const { email } = req.body;
@@ -925,6 +928,13 @@ io.on('connection', (socket) => {
             if (recipientSocketId) io.to(recipientSocketId).emit('private_message', { ...payload, id: msgId });
             const senderSocketId = onlineUsers[from];
             if (senderSocketId) io.to(senderSocketId).emit('db_updated_notification');
+
+            // [PERF] 未読数はSocket.io差分通知（getSidebarDataの再取得を避ける）
+            if (recipientSocketId) {
+                const unreadSnap = await chatsCol().doc(chatID).collection('messages')
+                    .where('to', '==', to).where('read', '==', false).get();
+                io.to(recipientSocketId).emit('unread_update', { partnerEmail: from, count: unreadSnap.size });
+            }
         } catch (e) { console.error('private_message error:', e); }
     });
 
@@ -942,6 +952,9 @@ io.on('connection', (socket) => {
             const writerSocketId = onlineUsers[writerEmail];
             if (readerSocketId) io.to(readerSocketId).emit('messages_marked_as_read', { chatPartner: writerEmail });
             if (writerSocketId) io.to(writerSocketId).emit('messages_marked_as_read', { chatPartner: readerEmail });
+
+            // [PERF] 未読数差分通知：このチャットの未読は0になった
+            if (readerSocketId) io.to(readerSocketId).emit('unread_update', { partnerEmail: writerEmail, count: 0 });
         } catch (e) { console.error('read_receipt error:', e); }
     });
 
