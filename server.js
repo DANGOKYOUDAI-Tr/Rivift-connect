@@ -1153,19 +1153,8 @@ app.post('/auth/login', async (req, res) => {
         if (!user) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
         if (!user.passwordHash) return res.status(401).json({ error: 'このアカウントはパスワードが設定されていません' });
 
-        // Web Crypto 互換のパスワード検証（PBKDF2 SHA-256）
-        // パスワードハッシュは { salt: hex, hash: hex } 形式で保存
-        const { salt, hash: storedHash } = user.passwordHash;
-        const encoder = new TextEncoder();
-        const keyMaterial = await crypto.subtle.importKey(
-            'raw', encoder.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']
-        );
-        const derivedBits = await crypto.subtle.deriveBits(
-            { name: 'PBKDF2', salt: Buffer.from(salt, 'hex'), iterations: 100000, hash: 'SHA-256' },
-            keyMaterial, 256
-        );
-        const computedHash = Buffer.from(derivedBits).toString('hex');
-        if (computedHash !== storedHash) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
+        const ok = await verifyPassword(password, user.passwordHash);
+        if (!ok) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
 
         const token = jwt.sign(
             { email: user.email, displayName: user.displayName },
@@ -1187,9 +1176,24 @@ app.post('/auth/verify', requireAuth, (req, res) => {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const { Resend } = require('resend');
-const resend = new Resend(process.env.RESEND_API_KEY);
+// [FIX] APIキー未設定時に new Resend() がコンストラクタで即時例外を投げ、
+//       サーバープロセス全体が起動できなくなる問題を防ぐため遅延初期化にする。
+//       実際にメール送信が必要になった時点で初めてインスタンス化し、
+//       キーが無ければ明確なエラーメッセージを返す（サーバー全体は落とさない）。
+let _resend = null;
+function getResend() {
+    if (!process.env.RESEND_API_KEY) return null;
+    if (!_resend) _resend = new Resend(process.env.RESEND_API_KEY);
+    return _resend;
+}
+if (!process.env.RESEND_API_KEY) {
+    console.warn('[WARN] RESEND_API_KEY が設定されていません。確認コードのメール送信は機能しません。');
+}
 
 async function sendAuthCode(email, purpose) {
+    const resend = getResend();
+    if (!resend) throw new Error('メール送信が設定されていません（RESEND_API_KEY未設定）。サーバー管理者にお問い合わせください。');
+
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const expireAt = Date.now() + 10 * 60 * 1000; // 10分
     await authCodesCol().doc(email).set({ purpose, code, expireAt });
@@ -1247,42 +1251,53 @@ async function hashPassword(password) {
     return { salt, hash };
 }
 
+// [SEC] パスワード検証共通関数（/auth/login, /auth/change-password, /auth/delete-account で共用）
+// passwordHash は { salt: hex, hash: hex } 形式（PBKDF2-SHA256, 100000 iterations）
+async function verifyPassword(plainPassword, passwordHash) {
+    if (!passwordHash || !plainPassword) return false;
+    const { salt, hash: storedHash } = passwordHash;
+    const encoder = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+        'raw', encoder.encode(plainPassword), { name: 'PBKDF2' }, false, ['deriveBits']
+    );
+    const derivedBits = await crypto.subtle.deriveBits(
+        { name: 'PBKDF2', salt: Buffer.from(salt, 'hex'), iterations: 100000, hash: 'SHA-256' },
+        keyMaterial, 256
+    );
+    const computedHash = Buffer.from(derivedBits).toString('hex');
+    return computedHash === storedHash;
+}
+
 // ── 確認コード送信
+// [SEC] パスワード変更・アカウント削除は「現在のパスワード再入力」方式に変更したため、
+//       このエンドポイントは reset-password（パスワードを忘れた場合の再設定）専用とする。
+//       reset-password はメール送信（RESEND_API_KEY）が未設定の間は機能しない（保留中の機能）。
 app.post('/auth/send-code', async (req, res) => {
     if (!_rateLimit(req, 'auth-send-code', 3)) return res.status(429).json({ error: 'しばらく待ってから再試行してください' });
     const { email, purpose } = req.body;
-    const VALID_PURPOSES = ['change-password', 'reset-password', 'delete-account'];
-    if (!isValidEmail(email) || !VALID_PURPOSES.includes(purpose)) return res.status(400).json({ error: '入力が無効です' });
+    if (!isValidEmail(email) || purpose !== 'reset-password') return res.status(400).json({ error: '入力が無効です' });
 
-    // reset-password はユーザー存在確認攻撃対策で常に成功を返す
-    if (purpose === 'reset-password') {
-        const user = await getUser(email);
-        if (user) await sendAuthCode(email, purpose).catch(e => console.error('sendAuthCode error:', e));
-        return res.json({ success: true }); // ユーザー不在でも同じレスポンス
-    }
-
-    // change-password / delete-account は JWT 必須
-    const token = req.headers['authorization']?.replace('Bearer ', '');
-    if (!token || !JWT_SECRET) return res.status(401).json({ error: '認証が必要です' });
-    let authUser;
-    try { authUser = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'トークンが無効です' }); }
-    if (authUser.email !== email) return res.status(403).json({ error: '権限がありません' });
-
-    try {
-        await sendAuthCode(email, purpose);
-        res.json({ success: true });
-    } catch (e) { console.error('send-code error:', e); res.status(500).json({ error: 'メール送信に失敗しました' }); }
+    // ユーザー存在確認攻撃対策で常に同じレスポンスを返す
+    const user = await getUser(email);
+    if (user) await sendAuthCode(email, purpose).catch(e => console.error('sendAuthCode error:', e));
+    res.json({ success: true });
 });
 
-// ── パスワード変更（ログイン済み）
+// ── パスワード変更（ログイン済み・現在のパスワード再入力で本人確認）
 app.post('/auth/change-password', requireAuth, async (req, res) => {
+    if (!_rateLimit(req, 'change-password', 5)) return res.status(429).json({ error: 'リクエストが多すぎます。しばらく待ってから再試行してください' });
     try {
         const email = req.user.email;
-        const { code, newPassword } = req.body;
-        if (!code || !newPassword || newPassword.length < 8) return res.status(400).json({ error: 'コードと新しいパスワード（8文字以上）は必須です' });
+        const { currentPassword, newPassword } = req.body;
+        if (!currentPassword || !newPassword || newPassword.length < 8) {
+            return res.status(400).json({ error: '現在のパスワードと新しいパスワード（8文字以上）は必須です' });
+        }
 
-        const valid = await verifyAuthCode(email, code, 'change-password');
-        if (!valid) return res.status(400).json({ error: 'コードが無効または期限切れです' });
+        const user = await getUser(email);
+        if (!user || !user.passwordHash) return res.status(400).json({ error: 'このアカウントはパスワードが設定されていません' });
+
+        const ok = await verifyPassword(currentPassword, user.passwordHash);
+        if (!ok) return res.status(401).json({ error: '現在のパスワードが正しくありません' });
 
         const passwordHash = await hashPassword(newPassword);
         await usersCol().doc(email).update({ passwordHash });
@@ -1310,15 +1325,20 @@ app.post('/auth/reset-password', async (req, res) => {
     } catch (e) { console.error('reset-password error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── アカウント削除
+// ── アカウント削除（現在のパスワード再入力で本人確認）
 app.post('/auth/delete-account', requireAuth, async (req, res) => {
+    if (!_rateLimit(req, 'delete-account', 5)) return res.status(429).json({ error: 'リクエストが多すぎます。しばらく待ってから再試行してください' });
     try {
         const email = req.user.email;
-        const { code } = req.body;
-        if (!code) return res.status(400).json({ error: '確認コードは必須です' });
+        const { currentPassword } = req.body;
+        if (!currentPassword) return res.status(400).json({ error: '現在のパスワードは必須です' });
 
-        const valid = await verifyAuthCode(email, code, 'delete-account');
-        if (!valid) return res.status(400).json({ error: 'コードが無効または期限切れです' });
+        const user = await getUser(email);
+        if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+        if (!user.passwordHash) return res.status(400).json({ error: 'このアカウントはパスワードが設定されていません' });
+
+        const ok = await verifyPassword(currentPassword, user.passwordHash);
+        if (!ok) return res.status(401).json({ error: '現在のパスワードが正しくありません' });
 
         const batchSize = 400; // Firestoreバッチ上限 500 に余裕を持たせる
 
@@ -1349,7 +1369,6 @@ app.post('/auth/delete-account', requireAuth, async (req, res) => {
         }
 
         // 4. chats（サブコレクション含む）
-        const user = await getUser(email);
         if (user && user.friends) {
             for (const friendEmail of user.friends) {
                 const chatID = [email, friendEmail].sort().join('__');
