@@ -507,15 +507,17 @@ app.get('/store/apps', async (req, res) => {
         const cached = _cacheGet(cacheKey);
         if (cached) return res.json({ apps: cached, _cached: true });
 
-        let q = appsCol();
-        if (category && category !== 'all') q = q.where('category', '==', category);
+        // [FIX] Firestoreの複合インデックスが不要になるよう、
+        // categoryフィルタはJS側で行う（where+orderByの複合インデックス問題を回避）
         const sortField = sort === 'popular' ? 'downloads' : sort === 'liked' ? 'likeCount' : 'createdAt';
-        q = q.orderBy(sortField, 'desc').limit(Number(limit)).offset(Number(offset));
+        const q = appsCol().orderBy(sortField, 'desc');
         const snap = await q.get();
-        const apps = snap.docs.map(d => {
+        let apps = snap.docs.map(d => {
             const { htmlContent, ...rest } = d.data();
             return { id: d.id, ...rest };
         });
+        if (category && category !== 'all') apps = apps.filter(a => a.category === category);
+        apps = apps.slice(Number(offset), Number(offset) + Number(limit));
         _cacheSet(cacheKey, apps);
         res.json({ apps });
     } catch (e) { console.error('store/apps error:', e); res.status(500).json({ error: 'Server error' }); }
