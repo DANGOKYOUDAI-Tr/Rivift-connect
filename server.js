@@ -563,9 +563,13 @@ app.get('/store/apps/:id', async (req, res) => {
         const snap = await appsCol().doc(req.params.id).get();
         if (!snap.exists) return res.status(404).json({ error: 'App not found' });
         const data = snap.data();
-        // 圧縮されている場合は解凍して返す
-        if (data.htmlContent) {
-            data.htmlContent = await decompressHtmlContent(data.htmlContent);
+        // [COMPRESS] gz: プレフィックス付きはクライアント側で解凍できるよう htmlContentGz で返す
+        // これによりサーバー側の解凍コストを削減できる
+        if (data.htmlContent && typeof data.htmlContent === 'string' && data.htmlContent.startsWith('gz:')) {
+            data.htmlContentGz = data.htmlContent.slice(3); // gz: を除いたbase64をそのまま返す
+            delete data.htmlContent;
+        } else if (data.htmlContent) {
+            // 平文保存のもの（旧データ）はそのまま返す
         }
         res.json({ app: { id: snap.id, ...data } });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
@@ -575,16 +579,26 @@ app.get('/store/apps/:id', async (req, res) => {
 app.post('/store/apps', express.json({ limit: '10mb' }), requireAuth, async (req, res) => {
     try {
         const email = req.user.email; // JWTから取得（body.emailは信用しない）
-        const { title, description, category, htmlContent, iconEmoji, iconImage, version } = req.body;
-        if (!title || !htmlContent) return res.status(400).json({ error: 'title, htmlContent は必須です' });
+        const { title, description, category, htmlContent, htmlContentGz, iconEmoji, iconImage, version } = req.body;
+        if (!title || (!htmlContent && !htmlContentGz)) return res.status(400).json({ error: 'title, htmlContent は必須です' });
         const user = await getUser(email);
         if (!user) return res.status(401).json({ error: 'Connectアカウントが見つかりません' });
-        if (Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます（最大3MB）' });
+        // [COMPRESS] クライアント側gzip済み(htmlContentGz)を優先。なければ平文(htmlContent)をサーバー側で圧縮。
+        let compressedHtml;
+        if (htmlContentGz) {
+            // クライアントが既にgzip+base64済み → そのまま gz: プレフィックスを付けて保存
+            // サイズチェック：base64デコード後が APP_HTML_MAX_SIZE 以下であることを確認
+            const estimatedSize = Math.floor(htmlContentGz.length * 0.75); // base64 → bytes の概算
+            if (estimatedSize > APP_HTML_MAX_SIZE * 1.05) return res.status(400).json({ error: 'HTMLが大きすぎます（最大3MB）' });
+            compressedHtml = 'gz:' + htmlContentGz; // クライアント側のgzip base64をそのまま使う
+        } else {
+            if (Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます（最大3MB）' });
+            // [PERF] htmlContentはgzip圧縮してFirestoreストレージを節約
+            compressedHtml = await compressHtmlContent(htmlContent);
+        }
         if (iconImage && Buffer.byteLength(iconImage, 'utf8') > 400_000) return res.status(400).json({ error: 'アイコン画像が大きすぎます（最大300KB）' });
         const now = Date.now();
         const docRef = appsCol().doc();
-        // [PERF] htmlContentはgzip圧縮してFirestoreストレージを節約
-        const compressedHtml = await compressHtmlContent(htmlContent);
         await docRef.set({
             title: title.slice(0, 60),
             description: (description || '').slice(0, 500),
@@ -619,10 +633,16 @@ app.put('/store/apps/:id', express.json({ limit: '10mb' }), requireAuth, async (
         if (title) update.title = title.slice(0, 60);
         if (description !== undefined) update.description = description.slice(0, 500);
         if (category) update.category = ['tool', 'game', 'entertainment', 'other'].includes(category) ? category : 'other';
-        if (htmlContent) {
-            if (Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます' });
-            // [PERF] htmlContentはgzip圧縮してFirestoreストレージを節約
-            update.htmlContent = await compressHtmlContent(htmlContent);
+        const { htmlContentGz: putHtmlContentGz } = req.body;
+        if (htmlContent || putHtmlContentGz) {
+            if (putHtmlContentGz) {
+                const estimatedSize = Math.floor(putHtmlContentGz.length * 0.75);
+                if (estimatedSize > APP_HTML_MAX_SIZE * 1.05) return res.status(400).json({ error: 'HTMLが大きすぎます' });
+                update.htmlContent = 'gz:' + putHtmlContentGz;
+            } else {
+                if (Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます' });
+                update.htmlContent = await compressHtmlContent(htmlContent);
+            }
         }
         if (iconImage !== undefined) {
             if (iconImage && Buffer.byteLength(iconImage, 'utf8') > 400_000) return res.status(400).json({ error: 'アイコン画像が大きすぎます' });
