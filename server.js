@@ -9,6 +9,10 @@ const fetch = require('node-fetch');
 const twilio = require('twilio');
 const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
+const zlib = require('zlib');
+const { promisify } = require('util');
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Firebase Admin SDK
@@ -106,7 +110,7 @@ app.use((err, req, res, next) => {
     next(err);
 });
 
-// グローバルリクエストサイズ制限（1MB）
+// グローバルリクエストサイズ制限（通常リクエスト用）
 app.use(express.json({ limit: '1mb' }));
 
 const server = http.createServer(app);
@@ -120,6 +124,36 @@ const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 
 let onlineUsers = {};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// App Store: HTML圧縮ヘルパー
+// htmlContent はサーバー保存時に gzip 圧縮し、Base64 エンコードして保存。
+// 取得時は "gz:" プレフィックスで圧縮済みと判別し、解凍して返す。
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const APP_HTML_MAX_SIZE = 3_000_000; // 3MB（圧縮前バイト数）
+
+async function compressHtmlContent(html) {
+    try {
+        const buf = await gzip(Buffer.from(html, 'utf8'), { level: 9 });
+        return 'gz:' + buf.toString('base64');
+    } catch (e) {
+        console.warn('[AppStore] HTML圧縮失敗、平文で保存します:', e.message);
+        return html;
+    }
+}
+
+async function decompressHtmlContent(stored) {
+    if (typeof stored === 'string' && stored.startsWith('gz:')) {
+        try {
+            const buf = await gunzip(Buffer.from(stored.slice(3), 'base64'));
+            return buf.toString('utf8');
+        } catch (e) {
+            console.warn('[AppStore] HTML解凍失敗:', e.message);
+            return stored; // フォールバック：圧縮データをそのまま返す
+        }
+    }
+    return stored;
+}
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // App Store: インメモリキャッシュ（Firestore読み取り節約）
@@ -528,7 +562,12 @@ app.get('/store/apps/:id', async (req, res) => {
     try {
         const snap = await appsCol().doc(req.params.id).get();
         if (!snap.exists) return res.status(404).json({ error: 'App not found' });
-        res.json({ app: { id: snap.id, ...snap.data() } });
+        const data = snap.data();
+        // 圧縮されている場合は解凍して返す
+        if (data.htmlContent) {
+            data.htmlContent = await decompressHtmlContent(data.htmlContent);
+        }
+        res.json({ app: { id: snap.id, ...data } });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -540,17 +579,19 @@ app.post('/store/apps', express.json({ limit: '10mb' }), requireAuth, async (req
         if (!title || !htmlContent) return res.status(400).json({ error: 'title, htmlContent は必須です' });
         const user = await getUser(email);
         if (!user) return res.status(401).json({ error: 'Connectアカウントが見つかりません' });
-        if (Buffer.byteLength(htmlContent, 'utf8') > 1_000_000) return res.status(400).json({ error: 'HTMLが大きすぎます（最大1MB）' });
+        if (Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます（最大3MB）' });
         if (iconImage && Buffer.byteLength(iconImage, 'utf8') > 400_000) return res.status(400).json({ error: 'アイコン画像が大きすぎます（最大300KB）' });
         const now = Date.now();
         const docRef = appsCol().doc();
+        // [PERF] htmlContentはgzip圧縮してFirestoreストレージを節約
+        const compressedHtml = await compressHtmlContent(htmlContent);
         await docRef.set({
             title: title.slice(0, 60),
             description: (description || '').slice(0, 500),
             category: ['tool', 'game', 'entertainment', 'other'].includes(category) ? category : 'other',
             authorEmail: email,
             authorName: user.displayName || email,
-            htmlContent,
+            htmlContent: compressedHtml,
             iconEmoji: iconImage ? '' : (iconEmoji || '📦').slice(0, 2),
             iconImage: iconImage || null,
             version: (version || '1.0.0').slice(0, 20),
@@ -579,8 +620,9 @@ app.put('/store/apps/:id', express.json({ limit: '10mb' }), requireAuth, async (
         if (description !== undefined) update.description = description.slice(0, 500);
         if (category) update.category = ['tool', 'game', 'entertainment', 'other'].includes(category) ? category : 'other';
         if (htmlContent) {
-            if (Buffer.byteLength(htmlContent, 'utf8') > 1_000_000) return res.status(400).json({ error: 'HTMLが大きすぎます' });
-            update.htmlContent = htmlContent;
+            if (Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます' });
+            // [PERF] htmlContentはgzip圧縮してFirestoreストレージを節約
+            update.htmlContent = await compressHtmlContent(htmlContent);
         }
         if (iconImage !== undefined) {
             if (iconImage && Buffer.byteLength(iconImage, 'utf8') > 400_000) return res.status(400).json({ error: 'アイコン画像が大きすぎます' });
