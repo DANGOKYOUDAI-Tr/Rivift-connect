@@ -950,16 +950,42 @@ io.on('connection', (socket) => {
     });
 
     socket.on('accept_friend_request', async ({ from: requesterEmail }) => {
-        const to = currentUserEmail;
-        await usersCol().doc(requesterEmail).update({
-            requests: admin.firestore.FieldValue.arrayRemove(to),
-            friends: admin.firestore.FieldValue.arrayUnion(to)
-        });
-        await usersCol().doc(to).update({
-            sentRequests: admin.firestore.FieldValue.arrayRemove(requesterEmail),
-            friends: admin.firestore.FieldValue.arrayUnion(requesterEmail)
-        });
-        notifyUsers([requesterEmail, to]);
+        try {
+            const to = currentUserEmail;
+            // [FIX] requesterEmail は「requests」を持つ側(=自分)ではなく相手なので、
+            // 更新するドキュメントと配列の組み合わせが元コードでは逆になっていた。
+            // (自分のrequestsから相手を削除 / 相手のsentRequestsから自分を削除、が正しい)
+            if (!requesterEmail || requesterEmail === to) return;
+            await usersCol().doc(to).update({
+                requests: admin.firestore.FieldValue.arrayRemove(requesterEmail),
+                friends: admin.firestore.FieldValue.arrayUnion(requesterEmail)
+            });
+            await usersCol().doc(requesterEmail).update({
+                sentRequests: admin.firestore.FieldValue.arrayRemove(to),
+                friends: admin.firestore.FieldValue.arrayUnion(to)
+            });
+            notifyUsers([requesterEmail, to]);
+        } catch (e) { console.error('accept_friend_request error:', e); }
+    });
+
+    socket.on('reject_friend_request', async ({ from: requesterEmail }) => {
+        try {
+            const to = currentUserEmail;
+            if (!requesterEmail || requesterEmail === to) return;
+            await usersCol().doc(to).update({ requests: admin.firestore.FieldValue.arrayRemove(requesterEmail) });
+            await usersCol().doc(requesterEmail).update({ sentRequests: admin.firestore.FieldValue.arrayRemove(to) });
+            notifyUsers([requesterEmail, to]);
+        } catch (e) { console.error('reject_friend_request error:', e); }
+    });
+
+    socket.on('cancel_friend_request', async ({ to: targetEmail }) => {
+        try {
+            const from = currentUserEmail;
+            if (!targetEmail || targetEmail === from) return;
+            await usersCol().doc(from).update({ sentRequests: admin.firestore.FieldValue.arrayRemove(targetEmail) });
+            await usersCol().doc(targetEmail).update({ requests: admin.firestore.FieldValue.arrayRemove(from) });
+            notifyUsers([from, targetEmail]);
+        } catch (e) { console.error('cancel_friend_request error:', e); }
     });
 
     socket.on('delete_friend', async ({ to }) => {
