@@ -291,9 +291,12 @@ app.post('/getUserData', optionalAuth, async (req, res) => {
     } catch (e) { console.error('getUserData error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/getSidebarData', async (req, res) => {
+app.post('/getSidebarData', requireAuth, async (req, res) => {
     try {
         const { email } = req.body;
+        // [SEC] friends/requests/sentRequestsは本人の非公開データなので、
+        // 認証済み本人以外が他人のemailを指定して取得できないようにする。
+        if (req.user.email !== email) return res.status(403).json({ error: '権限がありません' });
         const user = await getUser(email);
         if (!user) return res.status(404).json({ error: 'User not found' });
 
@@ -346,9 +349,11 @@ app.post('/getUsersData', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/getMessageHistory', async (req, res) => {
+app.post('/getMessageHistory', requireAuth, async (req, res) => {
     try {
         const { user1, user2, limit = 50, lastTimestamp = null } = req.body;
+        // [SEC] 会話の当事者本人以外はメッセージ履歴を取得できないようにする
+        if (req.user.email !== user1 && req.user.email !== user2) return res.status(403).json({ error: '権限がありません' });
         const chatID = [user1, user2].sort().join('__');
         let q = chatsCol().doc(chatID).collection('messages')
             .orderBy('timestamp', 'desc')
@@ -362,14 +367,17 @@ app.post('/getMessageHistory', async (req, res) => {
     } catch (e) { console.error('getMessageHistory error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/saveMessage', async (req, res) => {
+app.post('/saveMessage', requireAuth, async (req, res) => {
     try {
         const { user1, user2, message } = req.body;
+        // [SEC] 当事者本人以外が他人のチャットにメッセージを書き込めてしまう問題を修正。
+        // message.fromも信用せず、認証済み本人のメールで上書きする。
+        if (req.user.email !== user1 && req.user.email !== user2) return res.status(403).json({ error: '権限がありません' });
         const chatID = [user1, user2].sort().join('__');
         const chatRef = chatsCol().doc(chatID);
         await chatRef.set({
             users: [user1, user2],
-            messages: admin.firestore.FieldValue.arrayUnion({ chatID, ...message })
+            messages: admin.firestore.FieldValue.arrayUnion({ chatID, ...message, from: req.user.email })
         }, { merge: true });
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
@@ -1417,6 +1425,11 @@ app.post('/auth/update-icon', requireAuth, async (req, res) => {
 });
 
 // ── パスワードリセット（未ログイン）
+// [一時停止中] クライアント側の「パスワードを忘れた場合」UIは現在無効化されています。
+// 理由：Resendの送信元アドレスがサンドボックスドメイン(onboarding@resend.dev)のままで、
+// Resend側の仕様により実際に送信できるのはResendアカウント登録者本人のメールアドレスのみ。
+// rivift.appドメインをResend側でDNS認証すれば、任意の宛先に送れるようになりUIを復活できる。
+// このエンドポイント自体は残しているが、上記の理由で通常のユーザーには届かない。
 // [SEC/RECOVERY] 秘密鍵は「昔のパスワードで暗号化されたまま」なので、パスワードだけ
 // 変えても古い鍵は復号できない。そのためリセット時はクライアント側で新しい鍵ペアを
 // 生成させ、newPublicKeyJwk/newEncryptedPrivateKeyPayloadが渡された場合は
