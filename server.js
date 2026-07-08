@@ -1388,9 +1388,14 @@ app.post('/auth/update-icon', requireAuth, async (req, res) => {
     } catch (e) { console.error('update-icon error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
+// ── パスワードリセット（未ログイン）
+// [SEC/RECOVERY] 秘密鍵は「昔のパスワードで暗号化されたまま」なので、パスワードだけ
+// 変えても古い鍵は復号できない。そのためリセット時はクライアント側で新しい鍵ペアを
+// 生成させ、newPublicKeyJwk/newEncryptedPrivateKeyPayloadが渡された場合は
+// まとめて置き換える（過去のE2E暗号化データは読めなくなるが、アカウントは使えるようになる）。
 app.post('/auth/reset-password', async (req, res) => {
     try {
-        const { email, code, newPassword } = req.body;
+        const { email, code, newPassword, newPublicKeyJwk, newEncryptedPrivateKeyPayload } = req.body;
         if (!isValidEmail(email) || !code || !newPassword || newPassword.length < 8) {
             return res.status(400).json({ error: '入力が無効です' });
         }
@@ -1402,8 +1407,16 @@ app.post('/auth/reset-password', async (req, res) => {
         if (!user) return res.status(400).json({ error: '入力が無効です' });
 
         const passwordHash = await hashPassword(newPassword);
-        await usersCol().doc(email).update({ passwordHash });
-        res.json({ success: true });
+        const update = { passwordHash };
+        if (newPublicKeyJwk && newEncryptedPrivateKeyPayload
+            && newEncryptedPrivateKeyPayload.salt && newEncryptedPrivateKeyPayload.iv && newEncryptedPrivateKeyPayload.encryptedData) {
+            update.publicKeyJwk = newPublicKeyJwk;
+            update.encryptedPrivateKeyPayload = newEncryptedPrivateKeyPayload;
+        }
+        await usersCol().doc(email).update(update);
+
+        const token = jwt.sign({ email: user.email, displayName: user.displayName }, JWT_SECRET, { expiresIn: '30d' });
+        res.json({ success: true, token, user: { email: user.email, displayName: user.displayName, icon: user.icon }, keysReset: !!update.encryptedPrivateKeyPayload });
     } catch (e) { console.error('reset-password error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
