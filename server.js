@@ -1285,7 +1285,9 @@ async function sendAuthCode(email, purpose) {
     const label = purposeLabels[purpose] || '操作';
 
     await resend.emails.send({
-        from: 'Rivift <noreply@rivift.app>',
+        // [TEMP] rivift.app ドメインがResend側で未認証のため、認証不要な共有アドレスを暫定使用。
+        // ドメイン認証（DNSにTXT/CNAME追加）が完了したら 'Rivift <noreply@rivift.app>' に戻すこと。
+        from: 'Rivift <onboarding@resend.dev>',
         to: email,
         subject: `Rivift ${label}の確認コード`,
         html: `
