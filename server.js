@@ -104,6 +104,76 @@ const authToken = process.env.TWILIO_AUTH_TOKEN;
 let onlineUsers = {};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 近くの人モード（Nearby Share）: ログイン不要・匿名の状態管理
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ip: 同一ネットワーク（≒同じグローバルIP）ごとにグルーピングするためのキー
+// nearbyRooms: Map<ip, Map<nickname, socketId>>  — そのIPグループ内で今ONの端末一覧
+// nearbySocketInfo: Map<socketId, { nickname, ip }>  — 逆引き用（disconnect/リレー時に使用）
+const nearbyRooms = new Map();
+const nearbySocketInfo = new Map();
+const NEARBY_ROOM_MAX = 200; // 1グループあたりの同時参加上限（乱用・過負荷対策）
+const NEARBY_ANIMALS = [
+    'しろくま', 'うさぎ', 'ぺんぎん', 'こあら', 'たぬき', 'きつね', 'ぱんだ', 'いるか',
+    'からす', 'ふくろう', 'とら', 'らいおん', 'ぞう', 'きりん', 'かめ', 'いぬ', 'ねこ',
+    'うま', 'ひつじ', 'やぎ', 'くじゃく', 'はりねずみ', 'かわうそ', 'あざらし', 'わに',
+    'とかげ', 'りす', 'はむすたー', 'もぐら', 'うぐいす',
+];
+
+function _getNearbyGroupKey(handshake) {
+    // [SEC] Renderのようなプロキシ配下では x-forwarded-for の先頭が実際のクライアントIP。
+    // 完全に正確な位置情報ではないが、「同じWi-Fi/NAT配下の端末をまとめる」目的には十分。
+    const raw = handshake.headers['x-forwarded-for']?.split(',')[0]?.trim() || handshake.address || 'unknown';
+    return raw;
+}
+
+function _generateNearbyNickname(existingNicknames) {
+    for (let i = 0; i < 20; i++) {
+        const animal = NEARBY_ANIMALS[Math.floor(Math.random() * NEARBY_ANIMALS.length)];
+        const num = Math.floor(1000 + Math.random() * 9000);
+        const nickname = `${animal}-${num}`;
+        if (!existingNicknames.has(nickname)) return nickname;
+    }
+    return `ゲスト-${Date.now() % 10000}`; // フォールバック（衝突しても実用上は問題ない一意性）
+}
+
+function _nearbyPeerList(ip, excludeSocketId) {
+    const room = nearbyRooms.get(ip);
+    if (!room) return [];
+    const peers = [];
+    for (const [nickname, socketId] of room.entries()) {
+        if (socketId === excludeSocketId) continue;
+        peers.push(nickname);
+    }
+    return peers;
+}
+
+function _broadcastNearbyPeers(nsp, ip) {
+    const room = nearbyRooms.get(ip);
+    if (!room) return;
+    for (const [nickname, socketId] of room.entries()) {
+        nsp.to(socketId).emit('peers_updated', { peers: _nearbyPeerList(ip, socketId) });
+    }
+}
+
+// 近くの人モード専用の簡易レート制限（IPごと）
+const _nearbyRateMap = new Map();
+function _nearbyRateLimit(ip, action, maxRequests, windowMs) {
+    const key = `${ip}:${action}`;
+    const now = Date.now();
+    const win = windowMs || 60_000;
+    const timestamps = (_nearbyRateMap.get(key) || []).filter(t => now - t < win);
+    if (timestamps.length >= maxRequests) return false;
+    timestamps.push(now);
+    _nearbyRateMap.set(key, timestamps);
+    if (_nearbyRateMap.size > 2000) {
+        for (const [k, ts] of _nearbyRateMap.entries()) {
+            if (ts.every(t => now - t > win)) _nearbyRateMap.delete(k);
+        }
+    }
+    return true;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // App Store: HTML圧縮ヘルパー
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const APP_HTML_MAX_SIZE = 3_000_000;
@@ -1228,6 +1298,82 @@ io.on('connection', (socket) => {
             from: socket.email,
         });
     });
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 近くの人モード（Nearby Share）: 匿名・ログイン不要のP2Pファイル共有
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// [SEC] このnamespaceは意図的に上の io.use() (JWT必須ミドルウェア) の対象外。
+// Connectアプリへのログインなしで使えるようにするための設計であり、
+// その代わりに要求できることは「同じネットワーク内での発見とシグナリングの中継」のみに限定する。
+// ファイルの中身は一切サーバーを経由しない（WebRTC DataChannelで直接P2P、DTLSで暗号化済み）。
+const nearbyNsp = io.of('/nearby');
+
+nearbyNsp.on('connection', (socket) => {
+    const ip = _getNearbyGroupKey(socket.handshake);
+    let myNickname = null;
+
+    socket.on('join', (payload, callback) => {
+        if (typeof callback !== 'function') return;
+        if (!_nearbyRateLimit(ip, 'join', 20)) return callback({ error: 'しばらく待ってから再試行してください' });
+        if (myNickname) return callback({ nickname: myNickname }); // 二重join対策
+
+        let room = nearbyRooms.get(ip);
+        if (!room) { room = new Map(); nearbyRooms.set(ip, room); }
+        if (room.size >= NEARBY_ROOM_MAX) return callback({ error: '近くの端末が多すぎます。しばらくしてからお試しください' });
+
+        const nickname = _generateNearbyNickname(new Set(room.keys()));
+        room.set(nickname, socket.id);
+        nearbySocketInfo.set(socket.id, { nickname, ip });
+        myNickname = nickname;
+
+        callback({ nickname });
+        socket.emit('peers_updated', { peers: _nearbyPeerList(ip, socket.id) });
+        _broadcastNearbyPeers(nearbyNsp, ip);
+    });
+
+    function _leaveNearby() {
+        if (!myNickname) return;
+        const room = nearbyRooms.get(ip);
+        if (room) {
+            room.delete(myNickname);
+            if (room.size === 0) nearbyRooms.delete(ip);
+        }
+        nearbySocketInfo.delete(socket.id);
+        myNickname = null;
+        _broadcastNearbyPeers(nearbyNsp, ip);
+    }
+
+    socket.on('leave', () => _leaveNearby());
+    socket.on('disconnect', () => _leaveNearby());
+
+    // [SEC] 送信元(from)は必ずサーバー側で管理している myNickname を使う。
+    // クライアントから送られてくる from は一切信用しない（なりすまし防止）。
+    function _relayTo(eventOut, payload) {
+        if (!myNickname) return; // join前のリレーは無視
+        const room = nearbyRooms.get(ip);
+        const targetSocketId = room?.get(payload.toNickname);
+        if (!targetSocketId) return; // 相手が見つからない（既にOFF/圏外）
+        const { toNickname, ...rest } = payload;
+        nearbyNsp.to(targetSocketId).emit(eventOut, { ...rest, from: myNickname });
+    }
+
+    socket.on('send_offer', (payload) => {
+        if (!_nearbyRateLimit(ip, 'offer', 20)) return;
+        const fileName = sanitizeString(payload?.fileName, 255);
+        const fileSize = Number(payload?.fileSize) || 0;
+        const fileType = sanitizeString(payload?.fileType, 100);
+        if (!fileName || fileSize <= 0 || fileSize > 500 * 1024 * 1024) return;
+        _relayTo('incoming_offer', { toNickname: payload.toNickname, fileName, fileSize, fileType });
+    });
+
+    socket.on('respond', (payload) => _relayTo('offer_response', { toNickname: payload.toNickname, accepted: !!payload.accepted }));
+    socket.on('ready', (payload) => _relayTo('do_offer', { toNickname: payload.toNickname }));
+    socket.on('webrtc_offer', (payload) => _relayTo('webrtc_offer', { toNickname: payload.toNickname, offer: payload.offer }));
+    socket.on('webrtc_answer', (payload) => _relayTo('webrtc_answer', { toNickname: payload.toNickname, answer: payload.answer }));
+    socket.on('ice', (payload) => _relayTo('ice', { toNickname: payload.toNickname, candidate: payload.candidate }));
+    socket.on('received', (payload) => _relayTo('received', { toNickname: payload.toNickname, fileName: sanitizeString(payload?.fileName, 255) }));
+    socket.on('cancel', (payload) => _relayTo('cancel', { toNickname: payload.toNickname }));
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
