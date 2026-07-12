@@ -1398,7 +1398,9 @@ nearbyNsp.on('connection', (socket) => {
         const fileSize = Number(payload?.fileSize) || 0;
         const fileType = sanitizeString(payload?.fileType, 100);
         if (!fileName || fileSize <= 0 || fileSize > 500 * 1024 * 1024) return;
-        _relayTo('incoming_offer', { toNickname: payload.toNickname, fileName, fileSize, fileType });
+        // [FIX] batchAutoAccept が中継時に落ちており、一括承認済みのファイルでも
+        // 受信側で毎回個別の確認トーストが出てしまっていた。他のフィールドと同様に中継する。
+        _relayTo('incoming_offer', { toNickname: payload.toNickname, fileName, fileSize, fileType, batchAutoAccept: !!payload.batchAutoAccept });
     });
 
     socket.on('respond', (payload) => _relayTo('offer_response', { toNickname: payload.toNickname, accepted: !!payload.accepted }));
