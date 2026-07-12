@@ -1246,6 +1246,30 @@ io.on('connection', (socket) => {
             fileSize: payload.fileSize,
             fileType: payload.fileType,
             destType: payload.destType,
+            batchAutoAccept: !!payload.batchAutoAccept,
+        });
+    });
+
+    // [ADD] 複数ファイル一括共有: 送信前にファイル一覧をまとめて相手に提示し、
+    // 「受け取る（全部）」「拒否」「選択してダウンロード」をまとめて判断できるようにする。
+    socket.on('proximity_batch_offer', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('proximity_batch_invite', {
+            from: socket.email,
+            files: payload.files, // [{name, size, type}]
+            destType: payload.destType,
+            batchId: payload.batchId,
+        });
+    });
+
+    socket.on('proximity_batch_response', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (!recipientSocketId) return;
+        io.to(recipientSocketId).emit('proximity_batch_response', {
+            from: socket.email,
+            decision: payload.decision, // 'acceptAll' | 'reject' | 'selected'
+            selectedNames: payload.selectedNames || null,
+            batchId: payload.batchId,
         });
     });
 
