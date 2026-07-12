@@ -1355,8 +1355,19 @@ nearbyNsp.on('connection', (socket) => {
         } else {
             nickname = _generateNearbyNickname(new Set(room.keys()));
         }
-        // アイコンは絵文字1〜数文字程度を想定。念のため短く制限しておく。
-        const icon = sanitizeString(payload?.icon, 8) || null;
+        // [FIX] 以前はここで一律8文字に切り詰めており、絵文字は問題なかったが
+        // VFSの画像から作ったデータURL（数千〜数万文字）が壊れて相手に表示されなかった。
+        // 絵文字（短い文字列）と画像データURL（サイズ上限つき）の両方を許可する。
+        const NEARBY_ICON_IMAGE_MAX_LEN = 40000; // クライアント側のICON_IMAGE_MAX_LENと合わせる
+        let icon = null;
+        if (typeof payload?.icon === 'string') {
+            const rawIcon = payload.icon.trim();
+            if (rawIcon.startsWith('data:image/')) {
+                if (rawIcon.length <= NEARBY_ICON_IMAGE_MAX_LEN) icon = rawIcon;
+            } else {
+                icon = sanitizeString(rawIcon, 8) || null;
+            }
+        }
         room.set(nickname, { socketId: socket.id, icon });
         nearbySocketInfo.set(socket.id, { nickname, ip });
         myNickname = nickname;
