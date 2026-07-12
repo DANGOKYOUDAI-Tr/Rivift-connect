@@ -1408,6 +1408,34 @@ nearbyNsp.on('connection', (socket) => {
     socket.on('ice', (payload) => _relayTo('ice', { toNickname: payload.toNickname, candidate: payload.candidate }));
     socket.on('received', (payload) => _relayTo('received', { toNickname: payload.toNickname, fileName: sanitizeString(payload?.fileName, 255) }));
     socket.on('cancel', (payload) => _relayTo('cancel', { toNickname: payload.toNickname }));
+
+    // [ADD] 複数ファイル一括共有（バッチ）の意思確認オファーをリレーする。
+    // ファイルの中身は含まず、名前/サイズ/種類の一覧（マニフェスト）のみを中継する。
+    socket.on('send_batch_offer', (payload) => {
+        if (!_nearbyRateLimit(ip, 'batch_offer', 20)) return;
+        const files = Array.isArray(payload?.files) ? payload.files.slice(0, 200).map(f => ({
+            name: sanitizeString(f?.name, 255),
+            size: Number(f?.size) || 0,
+            type: sanitizeString(f?.type, 100),
+        })).filter(f => f.name && f.size > 0 && f.size <= 500 * 1024 * 1024) : [];
+        if (files.length === 0) return;
+        const batchId = sanitizeString(payload?.batchId, 64) || `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        _relayTo('incoming_batch_offer', { toNickname: payload.toNickname, files, batchId });
+    });
+
+    // バッチ提案への回答（全部受け取る/選択/拒否）を提案元に中継する。
+    socket.on('batch_response', (payload) => {
+        const decision = sanitizeString(payload?.decision, 20);
+        if (!['acceptAll', 'selected', 'reject'].includes(decision)) return;
+        _relayTo('batch_response', {
+            toNickname: payload.toNickname,
+            decision,
+            selectedNames: Array.isArray(payload?.selectedNames)
+                ? payload.selectedNames.slice(0, 200).map(n => sanitizeString(n, 255))
+                : null,
+            batchId: sanitizeString(payload?.batchId, 64),
+        });
+    });
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
