@@ -107,7 +107,7 @@ let onlineUsers = {};
 // 近くの人モード（Nearby Share）: ログイン不要・匿名の状態管理
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // ip: 同一ネットワーク（≒同じグローバルIP）ごとにグルーピングするためのキー
-// nearbyRooms: Map<ip, Map<nickname, socketId>>  — そのIPグループ内で今ONの端末一覧
+// nearbyRooms: Map<ip, Map<nickname, { socketId, icon }>>  — そのIPグループ内で今ONの端末一覧
 // nearbySocketInfo: Map<socketId, { nickname, ip }>  — 逆引き用（disconnect/リレー時に使用）
 const nearbyRooms = new Map();
 const nearbySocketInfo = new Map();
@@ -140,9 +140,9 @@ function _nearbyPeerList(ip, excludeSocketId) {
     const room = nearbyRooms.get(ip);
     if (!room) return [];
     const peers = [];
-    for (const [nickname, socketId] of room.entries()) {
-        if (socketId === excludeSocketId) continue;
-        peers.push(nickname);
+    for (const [nickname, info] of room.entries()) {
+        if (info.socketId === excludeSocketId) continue;
+        peers.push({ nickname, icon: info.icon || null });
     }
     return peers;
 }
@@ -150,8 +150,8 @@ function _nearbyPeerList(ip, excludeSocketId) {
 function _broadcastNearbyPeers(nsp, ip) {
     const room = nearbyRooms.get(ip);
     if (!room) return;
-    for (const [nickname, socketId] of room.entries()) {
-        nsp.to(socketId).emit('peers_updated', { peers: _nearbyPeerList(ip, socketId) });
+    for (const [nickname, info] of room.entries()) {
+        nsp.to(info.socketId).emit('peers_updated', { peers: _nearbyPeerList(ip, info.socketId) });
     }
 }
 
@@ -1336,7 +1336,9 @@ nearbyNsp.on('connection', (socket) => {
         } else {
             nickname = _generateNearbyNickname(new Set(room.keys()));
         }
-        room.set(nickname, socket.id);
+        // アイコンは絵文字1〜数文字程度を想定。念のため短く制限しておく。
+        const icon = sanitizeString(payload?.icon, 8) || null;
+        room.set(nickname, { socketId: socket.id, icon });
         nearbySocketInfo.set(socket.id, { nickname, ip });
         myNickname = nickname;
 
@@ -1365,10 +1367,10 @@ nearbyNsp.on('connection', (socket) => {
     function _relayTo(eventOut, payload) {
         if (!myNickname) return; // join前のリレーは無視
         const room = nearbyRooms.get(ip);
-        const targetSocketId = room?.get(payload.toNickname);
-        if (!targetSocketId) return; // 相手が見つからない（既にOFF/圏外）
+        const target = room?.get(payload.toNickname);
+        if (!target) return; // 相手が見つからない（既にOFF/圏外）
         const { toNickname, ...rest } = payload;
-        nearbyNsp.to(targetSocketId).emit(eventOut, { ...rest, from: myNickname });
+        nearbyNsp.to(target.socketId).emit(eventOut, { ...rest, from: myNickname });
     }
 
     socket.on('send_offer', (payload) => {
