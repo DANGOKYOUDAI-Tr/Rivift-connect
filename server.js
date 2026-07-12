@@ -388,12 +388,8 @@ app.post('/getSidebarData', requireAuth, async (req, res) => {
         const unreadCounts = {};
         for (const friendEmail of friends) {
             const chatID = [email, friendEmail].sort().join('__');
-            const chat = await getChat(chatID);
-            if (chat && chat.messages) {
-                unreadCounts[friendEmail] = chat.messages.filter(m => m.to === email && !m.read).length;
-            } else {
-                unreadCounts[friendEmail] = 0;
-            }
+            const messagesSnap = await chatsCol().doc(chatID).collection('messages').where('to', '==', email).get();
+            unreadCounts[friendEmail] = messagesSnap.docs.filter(doc => doc.data().read !== true).length;
         }
 
         res.json({ friends, requests, sentRequests, usersData, unreadCounts });
@@ -1084,16 +1080,16 @@ io.on('connection', (socket) => {
             const chatID = [from, to].sort().join('__');
             const msgId = payload.id || `${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
             await chatsCol().doc(chatID).set({ users: [from, to], lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-            await chatsCol().doc(chatID).collection('messages').doc(msgId).set({ ...payload, from, id: msgId });
+            await chatsCol().doc(chatID).collection('messages').doc(msgId).set({ ...payload, from, id: msgId, read: false });
             const recipientSocketId = onlineUsers[to];
-            if (recipientSocketId) io.to(recipientSocketId).emit('private_message', { ...payload, from, id: msgId });
+            if (recipientSocketId) io.to(recipientSocketId).emit('private_message', { ...payload, from, id: msgId, read: false });
             const senderSocketId = onlineUsers[from];
             if (senderSocketId) io.to(senderSocketId).emit('db_updated_notification');
 
             if (recipientSocketId) {
-                const unreadSnap = await chatsCol().doc(chatID).collection('messages')
-                    .where('to', '==', to).where('read', '==', false).get();
-                io.to(recipientSocketId).emit('unread_update', { partnerEmail: from, count: unreadSnap.size });
+                const unreadSnap = await chatsCol().doc(chatID).collection('messages').where('to', '==', to).get();
+                const unreadCount = unreadSnap.docs.filter(doc => doc.data().read !== true).length;
+                io.to(recipientSocketId).emit('unread_update', { partnerEmail: from, count: unreadCount });
             }
         } catch (e) { console.error('private_message error:', e); }
     });
@@ -1103,10 +1099,9 @@ io.on('connection', (socket) => {
             const readerEmail = currentUserEmail;
             const writerEmail = payload.to;
             const chatID = [readerEmail, writerEmail].sort().join('__');
-            const unreadSnap = await chatsCol().doc(chatID).collection('messages')
-                .where('to', '==', readerEmail).where('read', '==', false).get();
+            const unreadSnap = await chatsCol().doc(chatID).collection('messages').where('to', '==', readerEmail).get();
             const batch = db.batch();
-            unreadSnap.docs.forEach(d => batch.update(d.ref, { read: true }));
+            unreadSnap.docs.filter(d => d.data().read !== true).forEach(d => batch.update(d.ref, { read: true }));
             await batch.commit();
             const readerSocketId = onlineUsers[readerEmail];
             const writerSocketId = onlineUsers[writerEmail];
