@@ -1322,7 +1322,20 @@ nearbyNsp.on('connection', (socket) => {
         if (!room) { room = new Map(); nearbyRooms.set(ip, room); }
         if (room.size >= NEARBY_ROOM_MAX) return callback({ error: '近くの端末が多すぎます。しばらくしてからお試しください' });
 
-        const nickname = _generateNearbyNickname(new Set(room.keys()));
+        // 設定アプリで名前を設定していればそれを使う（同室内で重複する場合のみ末尾に番号を振る）。
+        // 未設定なら従来通りランダム生成。
+        const requestedName = sanitizeString(payload?.nickname, 20);
+        let nickname;
+        if (requestedName) {
+            nickname = requestedName;
+            if (room.has(nickname)) {
+                let n = 2;
+                while (room.has(`${requestedName} (${n})`) && n < 100) n++;
+                nickname = `${requestedName} (${n})`;
+            }
+        } else {
+            nickname = _generateNearbyNickname(new Set(room.keys()));
+        }
         room.set(nickname, socket.id);
         nearbySocketInfo.set(socket.id, { nickname, ip });
         myNickname = nickname;
