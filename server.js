@@ -34,6 +34,8 @@ const appsCol = () => db.collection('store_apps');
 const commentsCol = () => db.collection('store_comments');
 const mailCol = () => db.collection('mail_messages');
 const authCodesCol = () => db.collection('auth_codes');
+const collabDocsCol = () => db.collection('collab_docs');           // { appType, ownerEmail, title, collaborators:{email:role}, updatedAt }
+const collabInvitesCol = () => db.collection('collab_invites');     // { code, docId, role, createdBy, expiresAt, maxUses, uses }
 
 async function getUser(email) {
     const snap = await usersCol().doc(email).get();
@@ -69,6 +71,34 @@ function isValidEmail(email) {
 
 function sanitizeString(str, maxLen) {
     return typeof str === 'string' ? str.trim().slice(0, maxLen) : '';
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 共同編集（Office系アプリ共通基盤）: 権限・招待コード
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// role階層: viewer(閲覧のみ) < commenter(コメント可) < editor(編集可) < owner(権限管理可)
+const COLLAB_ROLES = ['viewer', 'commenter', 'editor', 'owner'];
+const COLLAB_ROLE_RANK = { viewer: 0, commenter: 1, editor: 2, owner: 3 };
+const COLLAB_INVITE_MAX_USES = 200;
+const COLLAB_INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 招待コードの既定有効期限: 7日
+
+function _collabRoleOf(docData, email) {
+    if (!docData) return null;
+    if (docData.ownerEmail === email) return 'owner';
+    return docData.collaborators?.[email] || null;
+}
+
+function _collabHasAtLeast(role, required) {
+    if (!role) return false;
+    return (COLLAB_ROLE_RANK[role] ?? -1) >= (COLLAB_ROLE_RANK[required] ?? 99);
+}
+
+function _generateInviteCode() {
+    // 見間違いにくい文字だけを使う（0/O, 1/I を除外）
+    const CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 8; i++) code += CHARS[Math.floor(Math.random() * CHARS.length)];
+    return `${code.slice(0, 4)}-${code.slice(4)}`;
 }
 
 const app = express();
@@ -1004,6 +1034,77 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         if (currentUserEmail) { delete onlineUsers[currentUserEmail]; notifyFriendsOfStatusChange(currentUserEmail, false); }
+        _collabJoinedRooms.forEach(docId => {
+            socket.to(`collab:${docId}`).emit('collab_presence_left', { docId, email: currentUserEmail });
+        });
+        _collabJoinedRooms.clear();
+    });
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 共同編集（Office系アプリ共通基盤）: ルーム参加・操作同期・カーソル共有
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const _collabJoinedRooms = new Set(); // このsocketが参加中のdocIdの集合（disconnect時の後片付け用）
+
+    socket.on('collab_join_room', async ({ docId }, callback) => {
+        try {
+            if (!docId || typeof docId !== 'string') return callback?.({ error: 'docId が不正です' });
+            const snap = await collabDocsCol().doc(docId).get();
+            if (!snap.exists) return callback?.({ error: 'ドキュメントが見つかりません' });
+            const data = snap.data();
+            const role = _collabRoleOf(data, currentUserEmail);
+            if (!role) return callback?.({ error: 'このドキュメントへのアクセス権がありません' });
+
+            socket.join(`collab:${docId}`);
+            _collabJoinedRooms.add(docId);
+
+            // 既に部屋にいる人たちのプレゼンスを新規参加者に返す
+            const roomSockets = await io.in(`collab:${docId}`).fetchSockets();
+            const peers = roomSockets
+                .filter(s => s.id !== socket.id)
+                .map(s => ({ email: s.email, role: _collabRoleOf(data, s.email) }));
+
+            socket.to(`collab:${docId}`).emit('collab_presence_joined', { docId, email: currentUserEmail, role });
+            callback?.({ success: true, role, peers });
+        } catch (e) {
+            console.error('collab_join_room error:', e);
+            callback?.({ error: 'Server error' });
+        }
+    });
+
+    socket.on('collab_leave_room', ({ docId }) => {
+        socket.leave(`collab:${docId}`);
+        _collabJoinedRooms.delete(docId);
+        socket.to(`collab:${docId}`).emit('collab_presence_left', { docId, email: currentUserEmail });
+    });
+
+    // 実際の編集内容（セル変更・テキスト差分・図形の移動など）を同室の他ユーザーへ中継。
+    // [SEC] 権限チェックはサーバー側で必ず行う（クライアントのUI制御だけに頼らない）。
+    socket.on('collab_op', async ({ docId, op }) => {
+        try {
+            if (!docId || !op) return;
+            const snap = await collabDocsCol().doc(docId).get();
+            if (!snap.exists) return;
+            const role = _collabRoleOf(snap.data(), currentUserEmail);
+            if (!_collabHasAtLeast(role, 'editor')) return; // editor未満は変更を送れない
+            socket.to(`collab:${docId}`).emit('collab_op', { docId, op, from: currentUserEmail, at: Date.now() });
+        } catch (e) { console.error('collab_op error:', e); }
+    });
+
+    // コメント権限があればコメントの追加/返信も中継（編集はできないがコメントは可、を許容）
+    socket.on('collab_comment', async ({ docId, comment }) => {
+        try {
+            if (!docId || !comment) return;
+            const snap = await collabDocsCol().doc(docId).get();
+            if (!snap.exists) return;
+            const role = _collabRoleOf(snap.data(), currentUserEmail);
+            if (!_collabHasAtLeast(role, 'commenter')) return;
+            socket.to(`collab:${docId}`).emit('collab_comment', { docId, comment, from: currentUserEmail, at: Date.now() });
+        } catch (e) { console.error('collab_comment error:', e); }
+    });
+
+    // カーソル位置・選択範囲の共有（閲覧権限だけでもOK。編集内容ではないので軽い権限で許可）
+    socket.on('collab_cursor', async ({ docId, cursor }) => {
+        socket.to(`collab:${docId}`).emit('collab_cursor', { docId, cursor, from: currentUserEmail });
     });
 
     const notifyUsers = (userEmails) => {
@@ -1921,6 +2022,151 @@ app.get('/mail/unread-count', requireAuth, async (req, res) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// サーバー起動
+// 共同編集（Office系アプリ共通基盤）エンドポイント
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ドキュメントの共同編集セッションを作成（まだ無ければ）。appType: 'cell' | 'docs' | 'slides' 等
+app.post('/collab/docs', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const { docId, appType, title } = req.body;
+        if (!docId || typeof docId !== 'string' || docId.length > 200) {
+            return res.status(400).json({ error: 'docId が不正です' });
+        }
+        if (!['cell', 'docs', 'slides'].includes(appType)) {
+            return res.status(400).json({ error: 'appType が不正です' });
+        }
+        const ref = collabDocsCol().doc(docId);
+        const snap = await ref.get();
+        if (snap.exists) {
+            const data = snap.data();
+            const role = _collabRoleOf(data, email);
+            if (!role) return res.status(403).json({ error: 'このドキュメントへのアクセス権がありません' });
+            return res.json({ success: true, doc: { id: docId, ...data, yourRole: role } });
+        }
+        const doc = {
+            appType, ownerEmail: email,
+            title: sanitizeString(title, 200) || '無題',
+            collaborators: {}, // { email: role } ※ownerは含めない
+            createdAt: Date.now(), updatedAt: Date.now(),
+        };
+        await ref.set(doc);
+        res.json({ success: true, doc: { id: docId, ...doc, yourRole: 'owner' } });
+    } catch (e) { console.error('collab/docs create error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ドキュメントの共有状態（コラボレーター一覧と各自の権限）を取得
+app.get('/collab/docs/:docId', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const snap = await collabDocsCol().doc(req.params.docId).get();
+        if (!snap.exists) return res.status(404).json({ error: 'ドキュメントが見つかりません' });
+        const data = snap.data();
+        const role = _collabRoleOf(data, email);
+        if (!role) return res.status(403).json({ error: 'アクセス権がありません' });
+        res.json({ doc: { id: req.params.docId, ...data, yourRole: role } });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// 招待コードを発行（オーナーのみ）。role: 招待経由で参加した人に付与する初期権限
+app.post('/collab/docs/:docId/invite', requireAuth, async (req, res) => {
+    if (!_rateLimit(req, 'collab-invite', 20)) return res.status(429).json({ error: 'リクエストが多すぎます' });
+    try {
+        const email = req.user.email;
+        const { role = 'editor', maxUses = 20 } = req.body;
+        if (!['viewer', 'commenter', 'editor'].includes(role)) {
+            return res.status(400).json({ error: 'role が不正です' });
+        }
+        const docRef = collabDocsCol().doc(req.params.docId);
+        const snap = await docRef.get();
+        if (!snap.exists) return res.status(404).json({ error: 'ドキュメントが見つかりません' });
+        if (snap.data().ownerEmail !== email) return res.status(403).json({ error: 'オーナーのみ招待コードを発行できます' });
+
+        const code = _generateInviteCode();
+        await collabInvitesCol().doc(code).set({
+            code, docId: req.params.docId, role,
+            createdBy: email,
+            createdAt: Date.now(),
+            expiresAt: Date.now() + COLLAB_INVITE_TTL_MS,
+            maxUses: Math.min(Math.max(Number(maxUses) || 20, 1), COLLAB_INVITE_MAX_USES),
+            uses: 0,
+        });
+        res.json({ success: true, code, role, expiresAt: Date.now() + COLLAB_INVITE_TTL_MS });
+    } catch (e) { console.error('collab/invite error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// 招待コードを使ってドキュメントに参加
+app.post('/collab/join', requireAuth, async (req, res) => {
+    if (!_rateLimit(req, 'collab-join', 20)) return res.status(429).json({ error: 'リクエストが多すぎます' });
+    try {
+        const email = req.user.email;
+        const code = sanitizeString(req.body.code, 20).toUpperCase();
+        if (!code) return res.status(400).json({ error: '招待コードを入力してください' });
+
+        const inviteRef = collabInvitesCol().doc(code);
+        const inviteSnap = await inviteRef.get();
+        if (!inviteSnap.exists) return res.status(404).json({ error: '招待コードが無効です' });
+        const invite = inviteSnap.data();
+        if (invite.expiresAt < Date.now()) return res.status(410).json({ error: '招待コードの有効期限が切れています' });
+        if (invite.uses >= invite.maxUses) return res.status(410).json({ error: '招待コードの利用上限に達しています' });
+
+        const docRef = collabDocsCol().doc(invite.docId);
+        const docSnap = await docRef.get();
+        if (!docSnap.exists) return res.status(404).json({ error: 'ドキュメントが見つかりません' });
+        const docData = docSnap.data();
+
+        if (docData.ownerEmail !== email) {
+            // 既存の権限より低い権限には落とさない（例: 既にeditorの人がviewer招待コードを踏んでも降格しない）
+            const currentRole = docData.collaborators?.[email];
+            if (!currentRole || _collabRoleOf(docData, email) === null || COLLAB_ROLE_RANK[invite.role] > (COLLAB_ROLE_RANK[currentRole] ?? -1)) {
+                await docRef.update({ [`collaborators.${email}`]: invite.role, updatedAt: Date.now() });
+            }
+        }
+        await inviteRef.update({ uses: admin.firestore.FieldValue.increment(1) });
+
+        const updatedSnap = await docRef.get();
+        const updated = updatedSnap.data();
+        res.json({ success: true, doc: { id: invite.docId, ...updated, yourRole: _collabRoleOf(updated, email) } });
+
+        // オーナー・既存参加者に通知（オンラインなら）
+        const notifyList = [updated.ownerEmail, ...Object.keys(updated.collaborators || {})];
+        notifyList.forEach(e => {
+            if (e === email) return;
+            const sid = onlineUsers[e];
+            if (sid) io.to(sid).emit('collab_collaborator_joined', { docId: invite.docId, email });
+        });
+    } catch (e) { console.error('collab/join error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// コラボレーターの権限を個別に変更、または削除（オーナーのみ）
+app.post('/collab/docs/:docId/permission', requireAuth, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const { targetEmail, role } = req.body; // role が null/'' なら共有解除
+        const docRef = collabDocsCol().doc(req.params.docId);
+        const snap = await docRef.get();
+        if (!snap.exists) return res.status(404).json({ error: 'ドキュメントが見つかりません' });
+        const data = snap.data();
+        if (data.ownerEmail !== email) return res.status(403).json({ error: 'オーナーのみ権限を変更できます' });
+        if (!isValidEmail(targetEmail) || targetEmail === email) return res.status(400).json({ error: '対象メールアドレスが不正です' });
+
+        if (!role) {
+            await docRef.update({ [`collaborators.${targetEmail}`]: admin.firestore.FieldValue.delete(), updatedAt: Date.now() });
+        } else {
+            if (!['viewer', 'commenter', 'editor'].includes(role)) return res.status(400).json({ error: 'role が不正です' });
+            await docRef.update({ [`collaborators.${targetEmail}`]: role, updatedAt: Date.now() });
+        }
+
+        const targetSocketId = onlineUsers[targetEmail];
+        if (targetSocketId) {
+            io.to(targetSocketId).emit('collab_permission_changed', { docId: req.params.docId, role: role || null });
+        }
+        // 同じドキュメントを開いている全員に、コラボレーター一覧の更新を通知
+        io.to(`collab:${req.params.docId}`).emit('collab_collaborators_updated', { docId: req.params.docId });
+
+        res.json({ success: true });
+    } catch (e) { console.error('collab/permission error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+
 server.listen(PORT, () => console.log(`Rivift Connect Server v6.0 (Firebase) is running on port ${PORT}`));
