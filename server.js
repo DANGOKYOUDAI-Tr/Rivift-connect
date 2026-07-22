@@ -125,6 +125,11 @@ const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] },
     maxHttpBufferSize: 5e6,
+    // [PERF] 共同編集機能でページ全体のHTML（画像のbase64込み）を送受信することがあるため、
+    // WebSocketフレームの圧縮を有効化して実通信量を減らす。
+    perMessageDeflate: {
+        threshold: 1024, // 1KB未満は圧縮のオーバーヘッドの方が大きいのでそのまま送る
+    },
 });
 const PORT = process.env.PORT || 3001;
 
