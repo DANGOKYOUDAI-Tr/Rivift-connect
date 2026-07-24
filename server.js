@@ -1112,6 +1112,17 @@ io.on('connection', (socket) => {
         socket.to(`collab:${docId}`).emit('collab_cursor', { docId, cursor, from: currentUserEmail });
     });
 
+    // 新規参加者が「今の最新内容」を持っていないため、同室の他の人に一度だけ呼びかけて取り直す。
+    // サーバーは中身を保持せず、あくまで橋渡しだけを行う（誰かがdocを開いていないと解決できない点に注意）。
+    socket.on('collab_request_snapshot', ({ docId }) => {
+        if (!docId) return;
+        socket.to(`collab:${docId}`).emit('collab_snapshot_request', { docId, requesterSocketId: socket.id });
+    });
+    socket.on('collab_snapshot_response', ({ docId, toSocketId, title, pages }) => {
+        if (!docId || !toSocketId) return;
+        io.to(toSocketId).emit('collab_snapshot', { docId, title, pages });
+    });
+
     const notifyUsers = (userEmails) => {
         userEmails.forEach(email => {
             const socketId = onlineUsers[email];
