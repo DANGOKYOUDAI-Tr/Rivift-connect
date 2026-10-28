@@ -11,6 +11,9 @@ const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const zlib = require('zlib');
 const { promisify } = require('util');
+const nodeCrypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 
@@ -57,13 +60,77 @@ const ALLOWED_ORIGINS = [
     'http://localhost:5500',
     'http://localhost:3000',
     'http://127.0.0.1:5500',
-    'null',
 ];
 
-const BLOCKED_HOSTNAMES = ['localhost', '127.0.0.1', '0.0.0.0', '::1'];
-const BLOCKED_PREFIXES = ['169.254.', '10.', '192.168.', '172.16.', '172.17.', '172.18.',
-    '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
-    '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.'];
+// SSRF対策: プライベート/ループバック/リンクローカル/メタデータIPの判定
+function isPrivateOrBlockedIp(ipStr) {
+    if (!ipStr || typeof ipStr !== 'string') return true;
+    const ip = ipStr.trim();
+    if (net.isIPv4(ip)) {
+        const parts = ip.split('.').map(Number);
+        if (parts.length !== 4 || parts.some(p => isNaN(p) || p < 0 || p > 255)) return true;
+        if (parts[0] === 0) return true; // 0.0.0.0/8
+        if (parts[0] === 10) return true; // 10.0.0.0/8
+        if (parts[0] === 127) return true; // 127.0.0.0/8
+        if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true; // 100.64.0.0/10
+        if (parts[0] === 169 && parts[1] === 254) return true; // 169.254.0.0/16
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true; // 172.16.0.0/12
+        if (parts[0] === 192 && parts[1] === 0 && (parts[2] === 0 || parts[2] === 2)) return true;
+        if (parts[0] === 192 && parts[1] === 168) return true; // 192.168.0.0/16
+        if (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19)) return true;
+        if (parts[0] === 198 && parts[1] === 51 && parts[2] === 100) return true;
+        if (parts[0] === 203 && parts[1] === 0 && parts[2] === 113) return true;
+        if (parts[0] >= 224) return true; // 224.0.0.0+ (Multicast, Reserved, Broadcast)
+        return false;
+    }
+    if (net.isIPv6(ip)) {
+        const lower = ip.toLowerCase();
+        if (lower === '::1' || lower === '::' || lower === '0:0:0:0:0:0:0:1' || lower === '0:0:0:0:0:0:0:0') return true;
+        if (lower.startsWith('::ffff:')) {
+            const mapped = lower.slice(7);
+            if (net.isIPv4(mapped)) return isPrivateOrBlockedIp(mapped);
+            return true;
+        }
+        if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // Unique local
+        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return true; // Link-local
+        return false;
+    }
+    return true;
+}
+
+// SSRF検証ヘルパー (DNS解決して全IPを検証)
+async function assertSafeUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') throw new Error('Invalid URL');
+    let parsed;
+    try {
+        parsed = new URL(rawUrl);
+    } catch {
+        throw new Error('Invalid URL format');
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('Only HTTP/HTTPS protocols are allowed');
+    }
+    if (parsed.username || parsed.password) {
+        throw new Error('URLs with embedded credentials are not allowed');
+    }
+
+    const hostname = parsed.hostname.toLowerCase();
+    const blockedHostnames = ['localhost', 'metadata.google.internal', 'instance-data', '169.254.169.254'];
+    if (blockedHostnames.includes(hostname) || hostname.endsWith('.local') || hostname.endsWith('.internal')) {
+        throw new Error('Access to internal hostnames is blocked');
+    }
+
+    const addresses = await dns.lookup(hostname, { all: true });
+    if (!addresses || addresses.length === 0) {
+        throw new Error('Could not resolve hostname');
+    }
+    for (const record of addresses) {
+        if (isPrivateOrBlockedIp(record.address)) {
+            throw new Error(`Access to private/local IP (${record.address}) is blocked`);
+        }
+    }
+    return parsed;
+}
 
 function isValidEmail(email) {
     return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
@@ -94,14 +161,16 @@ function _collabHasAtLeast(role, required) {
 }
 
 function _generateInviteCode() {
-    // 見間違いにくい文字だけを使う（0/O, 1/I を除外）
+    // 見間違いにくい文字だけを使う（0/O, 1/I を除外）、CSPRNGで暗号論的に安全に生成
     const CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
-    for (let i = 0; i < 8; i++) code += CHARS[Math.floor(Math.random() * CHARS.length)];
+    const bytes = nodeCrypto.randomBytes(8);
+    for (let i = 0; i < 8; i++) code += CHARS[bytes[i] % CHARS.length];
     return `${code.slice(0, 4)}-${code.slice(4)}`;
 }
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(helmet());
 
 app.use(cors({
@@ -155,9 +224,8 @@ const NEARBY_ANIMALS = [
 ];
 
 function _getNearbyGroupKey(handshake) {
-    // [SEC] Renderのようなプロキシ配下では x-forwarded-for の先頭が実際のクライアントIP。
-    // 完全に正確な位置情報ではないが、「同じWi-Fi/NAT配下の端末をまとめる」目的には十分。
-    const raw = handshake.headers['x-forwarded-for']?.split(',')[0]?.trim() || handshake.address || 'unknown';
+    // [SEC] プロキシ配下では handshake.address (trust proxy有効時) または x-forwarded-for を安全に参照
+    const raw = handshake.address || handshake.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
     return raw;
 }
 
@@ -289,7 +357,8 @@ const RATE_LIMIT_MAX = 10;
 const RATE_LIMIT_WINDOW = 60_000;
 
 function _rateLimit(req, endpoint, maxRequests) {
-    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    // [SEC] app.set('trust proxy', 1) により信頼されたプロキシ経由のクライアント実IP (req.ip) を使用
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
     const key = `${ip}:${endpoint}`;
     const now = Date.now();
     const limit = maxRequests || RATE_LIMIT_MAX;
@@ -536,18 +605,15 @@ app.post('/proxy', async (req, res) => {
     try {
         const { url, method, headers, body } = req.body;
         if (!url) return res.status(400).send('URL is required.');
-        if (!/^https?:\/\//i.test(url)) return res.status(400).send('Invalid URL scheme.');
-
-        let hostname;
-        try { hostname = new URL(url).hostname; } catch { return res.status(400).send('Invalid URL.'); }
-        if (BLOCKED_HOSTNAMES.includes(hostname) || BLOCKED_PREFIXES.some(p => hostname.startsWith(p))) {
-            return res.status(403).send('Blocked.');
-        }
-
         if (!_rateLimit(req, 'proxy', 30)) return res.status(429).send('Rate limit exceeded.');
 
+        await assertSafeUrl(url);
+
         const fetchOptions = {
-            method, headers: { ...headers }, body: body ? Buffer.from(body, 'base64') : null, redirect: 'manual'
+            method: (typeof method === 'string' && ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) ? method.toUpperCase() : 'GET',
+            headers: (headers && typeof headers === 'object' && !Array.isArray(headers)) ? { ...headers } : {},
+            body: (body && typeof body === 'string') ? Buffer.from(body, 'base64') : null,
+            redirect: 'manual'
         };
         delete fetchOptions.headers['host'];
         delete fetchOptions.headers['origin'];
@@ -558,14 +624,11 @@ app.post('/proxy', async (req, res) => {
         let currentUrl = url;
         let response;
         for (let hop = 0; hop < 5; hop++) {
+            await assertSafeUrl(currentUrl);
             response = await fetch(currentUrl, fetchOptions);
             if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
                 const nextUrl = new URL(response.headers.get('location'), currentUrl).href;
-                if (!/^https?:\/\//i.test(nextUrl)) return res.status(400).send('Invalid redirect URL scheme.');
-                const nextHostname = new URL(nextUrl).hostname;
-                if (BLOCKED_HOSTNAMES.includes(nextHostname) || BLOCKED_PREFIXES.some(p => nextHostname.startsWith(p))) {
-                    return res.status(403).send('Blocked (redirect target).');
-                }
+                await assertSafeUrl(nextUrl);
                 currentUrl = nextUrl;
                 continue;
             }
@@ -574,7 +637,10 @@ app.post('/proxy', async (req, res) => {
 
         res.setHeader('x-proxy-headers', JSON.stringify(Object.fromEntries(response.headers)));
         response.body.pipe(res);
-    } catch (e) { console.error('Proxy error:', e.message); res.status(500).send(e.message); }
+    } catch (e) {
+        console.error('Proxy error:', e.message);
+        res.status(500).send(e.message || 'Proxy error');
+    }
 });
 
 const google = require('google-it');
@@ -595,9 +661,20 @@ const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
 app.get('/extract', async (req, res) => {
     const url = req.query.url;
-    if (!url) return res.status(400).json({ error: 'URL parameter is required.' });
+    if (!url || typeof url !== 'string') return res.status(400).json({ error: 'URL parameter is required.' });
+    if (!_rateLimit(req, 'extract', 20)) return res.status(429).json({ error: 'Rate limit exceeded.' });
     try {
-        const response = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } });
+        await assertSafeUrl(url);
+        const response = await axios.get(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+            timeout: 10000,
+            maxRedirects: 5,
+            maxContentLength: 5 * 1024 * 1024,
+            beforeRedirect: async (options, responseDetails) => {
+                const redirectUrl = new URL(responseDetails.headers.location, url).href;
+                await assertSafeUrl(redirectUrl);
+            }
+        });
         const dom = new JSDOM(response.data, { url });
         const article = new Readability(dom.window.document).parse();
         if (article) {
@@ -605,7 +682,10 @@ app.get('/extract', async (req, res) => {
         } else {
             res.status(404).json({ error: '記事のコンテンツを抽出できませんでした。' });
         }
-    } catch (e) { res.status(500).json({ error: 'ページの読み込みまたは解析に失敗しました。' }); }
+    } catch (e) {
+        console.error('Extract error:', e.message);
+        res.status(500).json({ error: 'ページの読み込みまたは解析に失敗しました。' });
+    }
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -852,17 +932,18 @@ app.get('/store/apps/:id/rating', async (req, res) => {
 
 const _reportCooldown = new Map();
 
-app.post('/store/apps/:id/report', async (req, res) => {
+app.post('/store/apps/:id/report', optionalAuth, async (req, res) => {
     try {
-        if (!_rateLimit(req, 'report')) return res.status(429).json({ error: 'Too many requests' });
-        const { email, reason, detail } = req.body;
-        if (!email) return res.status(400).json({ error: 'email is required' });
+        if (!_rateLimit(req, 'report', 5)) return res.status(429).json({ error: 'Too many requests' });
+        const { reason, detail } = req.body;
+        const reporterEmail = req.user ? req.user.email : req.body.email;
+        if (!isValidEmail(reporterEmail)) return res.status(400).json({ error: '有効なメールアドレスが必要です' });
         if (!reason) return res.status(400).json({ error: 'reason is required' });
 
         const VALID_REASONS = ['spam', 'malware', 'inappropriate', 'phishing', 'other'];
         if (!VALID_REASONS.includes(reason)) return res.status(400).json({ error: 'Invalid reason' });
 
-        const coolKey = `${email}:${req.params.id}`;
+        const coolKey = `${reporterEmail}:${req.params.id}`;
         const lastReport = _reportCooldown.get(coolKey);
         if (lastReport && Date.now() - lastReport < 24 * 60 * 60 * 1000) {
             return res.status(429).json({ error: 'すでにこのアプリを通報済みです。24時間後に再通報できます。' });
@@ -874,7 +955,7 @@ app.post('/store/apps/:id/report', async (req, res) => {
         await db.collection('store_reports').add({
             appId: req.params.id,
             appTitle: appSnap.data().title,
-            reporterEmail: email,
+            reporterEmail,
             reason,
             detail: (detail || '').slice(0, 500),
             reportedAt: Date.now(),
@@ -882,7 +963,7 @@ app.post('/store/apps/:id/report', async (req, res) => {
         });
 
         _reportCooldown.set(coolKey, Date.now());
-        console.warn(`[REPORT] app="${appSnap.data().title}" (${req.params.id}) by=${email} reason=${reason}`);
+        console.warn(`[REPORT] app="${appSnap.data().title}" (${req.params.id}) by=${reporterEmail} reason=${reason}`);
 
         res.json({ success: true });
     } catch (e) { console.error('report error:', e); res.status(500).json({ error: 'Server error' }); }
@@ -1195,7 +1276,7 @@ io.on('connection', (socket) => {
             const from = currentUserEmail;
             const { to } = payload;
             const chatID = [from, to].sort().join('__');
-            const msgId = payload.id || `${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+            const msgId = payload.id || `${Date.now()}_${nodeCrypto.randomBytes(4).toString('hex')}`;
             await chatsCol().doc(chatID).set({ users: [from, to], lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
             await chatsCol().doc(chatID).collection('messages').doc(msgId).set({ ...payload, from, id: msgId, read: false });
             const recipientSocketId = onlineUsers[to];
@@ -1549,7 +1630,7 @@ nearbyNsp.on('connection', (socket) => {
             type: sanitizeString(f?.type, 100),
         })).filter(f => f.name && f.size > 0 && f.size <= 500 * 1024 * 1024) : [];
         if (files.length === 0) return;
-        const batchId = sanitizeString(payload?.batchId, 64) || `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const batchId = sanitizeString(payload?.batchId, 64) || `${Date.now()}_${nodeCrypto.randomBytes(4).toString('hex')}`;
         _relayTo('incoming_batch_offer', { toNickname: payload.toNickname, files, batchId });
     });
 
@@ -1607,8 +1688,8 @@ app.post('/auth/migrate-password', async (req, res) => {
     if (!_rateLimit(req, 'migrate-password', 3)) return res.status(429).json({ error: 'リクエストが多すぎます' });
     try {
         const { email, password } = req.body;
-        if (!isValidEmail(email) || !password || typeof password !== 'string') {
-            return res.status(400).json({ error: '入力が無効です' });
+        if (!isValidEmail(email) || typeof password !== 'string' || password.length < 8) {
+            return res.status(400).json({ error: '入力が無効です（パスワードは8文字以上必要です）' });
         }
         const user = await getUser(email);
         if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
@@ -1645,9 +1726,11 @@ async function sendAuthCode(email, purpose) {
     const resend = getResend();
     if (!resend) throw new Error('メール送信が設定されていません（RESEND_API_KEY未設定）。サーバー管理者にお問い合わせください。');
 
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    // [SEC] 暗号論的疑似乱数生成器 (CSPRNG) を使用し、予測不可能な6桁PINを発行
+    const code = nodeCrypto.randomInt(100000, 1000000).toString();
     const expireAt = Date.now() + 10 * 60 * 1000;
-    await authCodesCol().doc(email).set({ purpose, code, expireAt });
+    // attempts: 0 を初期化してブルートフォース試行回数を管理
+    await authCodesCol().doc(email).set({ purpose, code, expireAt, attempts: 0 });
 
     const purposeLabels = {
         'change-password': 'パスワード変更',
@@ -1679,18 +1762,45 @@ async function sendAuthCode(email, purpose) {
 }
 
 async function verifyAuthCode(email, code, purpose) {
-    const snap = await authCodesCol().doc(email).get();
+    if (!email || !code || typeof code !== 'string') return false;
+    const ref = authCodesCol().doc(email);
+    const snap = await ref.get();
     if (!snap.exists) return false;
     const data = snap.data();
     if (data.purpose !== purpose) return false;
-    if (data.code !== code) return false;
-    if (Date.now() > data.expireAt) return false;
-    await authCodesCol().doc(email).delete();
+    if (Date.now() > data.expireAt) {
+        await ref.delete().catch(() => {});
+        return false;
+    }
+    // [SEC] ブルートフォース制限: 試行回数が5回以上の場合はコードを破棄して拒否
+    if ((data.attempts || 0) >= 5) {
+        await ref.delete().catch(() => {});
+        return false;
+    }
+
+    // [SEC] タイミング攻撃防止 (定時間比較)
+    const codeBuf = Buffer.from(code.trim());
+    const expectedBuf = Buffer.from(String(data.code).trim());
+    const isMatch = codeBuf.length === expectedBuf.length && nodeCrypto.timingSafeEqual(codeBuf, expectedBuf);
+
+    if (!isMatch) {
+        const nextAttempts = (data.attempts || 0) + 1;
+        if (nextAttempts >= 5) {
+            await ref.delete().catch(() => {}); // 5回連続失敗で即座に無効化
+        } else {
+            await ref.update({ attempts: admin.firestore.FieldValue.increment(1) }).catch(() => {});
+        }
+        return false;
+    }
+
+    // 成功したらワンタイムコードを即座に削除
+    await ref.delete().catch(() => {});
     return true;
 }
 
 async function hashPassword(password) {
-    const salt = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('hex');
+    if (typeof password !== 'string') throw new Error('Password must be a string');
+    const salt = nodeCrypto.randomBytes(32).toString('hex');
     const encoder = new TextEncoder();
     const keyMaterial = await crypto.subtle.importKey(
         'raw', encoder.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']
@@ -1704,24 +1814,45 @@ async function hashPassword(password) {
 }
 
 async function verifyPassword(plainPassword, passwordHash) {
-    if (!passwordHash || !plainPassword) return false;
+    if (typeof plainPassword !== 'string' || !passwordHash) return false;
     const { salt, hash: storedHash } = passwordHash;
-    const encoder = new TextEncoder();
-    const keyMaterial = await crypto.subtle.importKey(
-        'raw', encoder.encode(plainPassword), { name: 'PBKDF2' }, false, ['deriveBits']
-    );
-    const derivedBits = await crypto.subtle.deriveBits(
-        { name: 'PBKDF2', salt: Buffer.from(salt, 'hex'), iterations: 100000, hash: 'SHA-256' },
-        keyMaterial, 256
-    );
-    const computedHash = Buffer.from(derivedBits).toString('hex');
-    return computedHash === storedHash;
+    if (typeof salt !== 'string' || typeof storedHash !== 'string') return false;
+    try {
+        const encoder = new TextEncoder();
+        const keyMaterial = await crypto.subtle.importKey(
+            'raw', encoder.encode(plainPassword), { name: 'PBKDF2' }, false, ['deriveBits']
+        );
+        const derivedBits = await crypto.subtle.deriveBits(
+            { name: 'PBKDF2', salt: Buffer.from(salt, 'hex'), iterations: 100000, hash: 'SHA-256' },
+            keyMaterial, 256
+        );
+        const computedHash = Buffer.from(derivedBits).toString('hex');
+
+        // [SEC] タイミング攻撃防止 (定時間比較)
+        const compBuf = Buffer.from(computedHash, 'hex');
+        const storeBuf = Buffer.from(storedHash, 'hex');
+        if (compBuf.length !== storeBuf.length) return false;
+        return nodeCrypto.timingSafeEqual(compBuf, storeBuf);
+    } catch (e) {
+        console.error('verifyPassword error:', e);
+        return false;
+    }
 }
 
 app.post('/auth/send-code', async (req, res) => {
     if (!_rateLimit(req, 'auth-send-code', 3)) return res.status(429).json({ error: 'しばらく待ってから再試行してください' });
     const { email, purpose } = req.body;
     if (!isValidEmail(email) || purpose !== 'reset-password') return res.status(400).json({ error: '入力が無効です' });
+
+    // [SEC] 同一メールアドレス宛の送信頻度制限 (メールフラッディング対策)
+    const emailKey = `send-code-email:${email}`;
+    const now = Date.now();
+    const timestamps = (_rateLimitMap.get(emailKey) || []).filter(t => now - t < 60_000);
+    if (timestamps.length >= 2) {
+        return res.status(429).json({ error: 'このメールアドレスへの送信頻度が高すぎます。しばらく待ってから再試行してください。' });
+    }
+    timestamps.push(now);
+    _rateLimitMap.set(emailKey, timestamps);
 
     const user = await getUser(email);
     if (user) await sendAuthCode(email, purpose).catch(e => console.error('sendAuthCode error:', e));
@@ -1733,7 +1864,7 @@ app.post('/auth/change-password', requireAuth, async (req, res) => {
     try {
         const email = req.user.email;
         const { currentPassword, newPassword } = req.body;
-        if (!currentPassword || !newPassword || newPassword.length < 8) {
+        if (!currentPassword || !newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
             return res.status(400).json({ error: '現在のパスワードと新しいパスワード（8文字以上）は必須です' });
         }
 
@@ -1773,14 +1904,17 @@ app.post('/auth/update-icon', requireAuth, async (req, res) => {
 // 生成させ、newPublicKeyJwk/newEncryptedPrivateKeyPayloadが渡された場合は
 // まとめて置き換える（過去のE2E暗号化データは読めなくなるが、アカウントは使えるようになる）。
 app.post('/auth/reset-password', async (req, res) => {
+    if (!_rateLimit(req, 'reset-password', 5)) {
+        return res.status(429).json({ error: 'リクエストが多すぎます。しばらく待ってから再試行してください' });
+    }
     try {
         const { email, code, newPassword, newPublicKeyJwk, newEncryptedPrivateKeyPayload } = req.body;
-        if (!isValidEmail(email) || !code || !newPassword || newPassword.length < 8) {
-            return res.status(400).json({ error: '入力が無効です' });
+        if (!isValidEmail(email) || typeof code !== 'string' || typeof newPassword !== 'string' || newPassword.length < 8) {
+            return res.status(400).json({ error: '入力が無効です（パスワードは8文字以上必要です）' });
         }
 
         const valid = await verifyAuthCode(email, code, 'reset-password');
-        if (!valid) return res.status(400).json({ error: 'コードが無効または期限切れです' });
+        if (!valid) return res.status(400).json({ error: 'コードが無効または期限切れです（試行回数上限を超えた場合は再発行してください）' });
 
         const user = await getUser(email);
         if (!user) return res.status(400).json({ error: '入力が無効です' });
