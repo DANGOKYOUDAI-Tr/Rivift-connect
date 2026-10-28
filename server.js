@@ -60,6 +60,7 @@ const ALLOWED_ORIGINS = [
     'http://localhost:5500',
     'http://localhost:3000',
     'http://127.0.0.1:5500',
+    'null', // Chromebook等のローカルファイル (file://) 起動をサポート
 ];
 
 // SSRF対策: プライベート/ループバック/リンクローカル/メタデータIPの判定
