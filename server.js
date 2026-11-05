@@ -491,11 +491,29 @@ app.post('/getSidebarData', requireAuth, async (req, res) => {
         }
 
         const unreadCounts = {};
-        for (const friendEmail of friends) {
-            const chatID = [email, friendEmail].sort().join('__');
-            const messagesSnap = await chatsCol().doc(chatID).collection('messages').where('to', '==', email).get();
-            unreadCounts[friendEmail] = messagesSnap.docs.filter(doc => doc.data().read !== true).length;
-        }
+        await Promise.all((friends || []).map(async (friendEmail) => {
+            try {
+                const chatID = [email, friendEmail].sort().join('__');
+                const messagesSnap = await chatsCol().doc(chatID).collection('messages')
+                    .where('to', '==', email)
+                    .where('read', '==', false)
+                    .limit(100)
+                    .get();
+                unreadCounts[friendEmail] = messagesSnap.size;
+            } catch (err) {
+                // インデックス未作成等のフォールバック
+                try {
+                    const chatID = [email, friendEmail].sort().join('__');
+                    const messagesSnap = await chatsCol().doc(chatID).collection('messages')
+                        .where('to', '==', email)
+                        .limit(50)
+                        .get();
+                    unreadCounts[friendEmail] = messagesSnap.docs.filter(doc => doc.data().read !== true).length;
+                } catch (e2) {
+                    unreadCounts[friendEmail] = 0;
+                }
+            }
+        }));
 
         res.json({ friends, requests, sentRequests, usersData, unreadCounts });
     } catch (e) { console.error('getSidebarData error:', e); res.status(500).json({ error: 'Server error' }); }
@@ -522,16 +540,18 @@ app.post('/getUsersData', async (req, res) => {
 
 app.post('/getMessageHistory', requireAuth, async (req, res) => {
     try {
-        const { user1, user2, limit = 50, lastTimestamp = null } = req.body;
+        const { user1, user2, limit = 50, skip = 0, lastTimestamp = null } = req.body;
         // [SEC] 会話の当事者本人以外はメッセージ履歴を取得できないようにする
         if (req.user.email !== user1 && req.user.email !== user2) return res.status(403).json({ error: '権限がありません' });
         const chatID = [user1, user2].sort().join('__');
         let q = chatsCol().doc(chatID).collection('messages')
-            .orderBy('timestamp', 'desc')
-            .limit(limit);
+            .orderBy('timestamp', 'desc');
         if (lastTimestamp) {
             q = q.startAfter(lastTimestamp);
+        } else if (skip && Number.isInteger(skip) && skip > 0) {
+            q = q.offset(skip);
         }
+        q = q.limit(Math.min(limit, 100));
         const snap = await q.get();
         const history = snap.docs.map(d => d.data()).reverse();
         res.json({ history });
@@ -1081,13 +1101,28 @@ io.on('connection', (socket) => {
     let currentUserEmail = socket.verifiedEmail;
     socket.email = socket.verifiedEmail;
 
+    const DEFAULT_ICE_SERVERS = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
+    ];
+
     socket.on('get-ice-servers', async (payload, callback) => {
-        if (!accountSid || !authToken) return callback({ error: 'Twilioの認証情報が設定されていません。' });
+        if (typeof callback !== 'function') return;
+        if (!accountSid || !authToken) {
+            return callback({ iceServers: DEFAULT_ICE_SERVERS });
+        }
         try {
             const client = twilio(accountSid, authToken);
             const token = await client.tokens.create({ ttl: 3600 });
-            callback({ iceServers: token.iceServers });
-        } catch (e) { callback({ error: `Twilioとの通信に失敗しました: ${e.message}` }); }
+            const combined = [...(token.iceServers || []), ...DEFAULT_ICE_SERVERS];
+            callback({ iceServers: combined });
+        } catch (e) {
+            console.warn(`Twilioトークン取得失敗、公開STUNにフォールバック: ${e.message}`);
+            callback({ iceServers: DEFAULT_ICE_SERVERS });
+        }
     });
 
     const notifyFriendsOfStatusChange = async (email, isOnline) => {
@@ -1215,50 +1250,148 @@ io.on('connection', (socket) => {
     // [SEC] 以降の全イベントで、"from"（自分側）は必ず currentUserEmail（JWT検証済み）を使う。
     // payloadに from が含まれていても無視し、他人になりすませないようにする。
 
-    socket.on('send_friend_request', async ({ to }) => {
-        const from = currentUserEmail;
-        await usersCol().doc(to).update({ requests: admin.firestore.FieldValue.arrayUnion(from) });
-        await usersCol().doc(from).update({ sentRequests: admin.firestore.FieldValue.arrayUnion(to) });
-        notifyUsers([from, to]);
+    socket.on('send_friend_request', async ({ to }, callback) => {
+        try {
+            const from = (currentUserEmail || '').trim();
+            const target = (to || '').trim();
+            if (!target || !from || target.toLowerCase() === from.toLowerCase()) {
+                if (typeof callback === 'function') callback({ error: '無効なメールアドレスです' });
+                return;
+            }
+            const targetUser = await getUser(target);
+            if (!targetUser) {
+                if (typeof callback === 'function') callback({ error: 'ユーザーが見つかりません' });
+                return;
+            }
+            // 相手の requests に from を追加
+            await usersCol().doc(target).update({ requests: admin.firestore.FieldValue.arrayUnion(from) });
+            // 自分の sentRequests に target を追加
+            await usersCol().doc(from).update({ sentRequests: admin.firestore.FieldValue.arrayUnion(target) });
+            notifyUsers([from, target]);
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (e) {
+            console.error('send_friend_request error:', e);
+            if (typeof callback === 'function') callback({ error: e.message });
+        }
     });
 
-    socket.on('accept_friend_request', async ({ from: requesterEmail }) => {
+    socket.on('accept_friend_request', async ({ from: requesterEmail }, callback) => {
         try {
-            const to = currentUserEmail;
-            // [FIX] requesterEmail は「requests」を持つ側(=自分)ではなく相手なので、
-            // 更新するドキュメントと配列の組み合わせが元コードでは逆になっていた。
-            // (自分のrequestsから相手を削除 / 相手のsentRequestsから自分を削除、が正しい)
-            if (!requesterEmail || requesterEmail === to) return;
-            await usersCol().doc(to).update({
-                requests: admin.firestore.FieldValue.arrayRemove(requesterEmail),
-                friends: admin.firestore.FieldValue.arrayUnion(requesterEmail)
-            });
-            await usersCol().doc(requesterEmail).update({
-                sentRequests: admin.firestore.FieldValue.arrayRemove(to),
-                friends: admin.firestore.FieldValue.arrayUnion(to)
-            });
-            notifyUsers([requesterEmail, to]);
-        } catch (e) { console.error('accept_friend_request error:', e); }
+            const to = (currentUserEmail || '').trim();
+            const from = (requesterEmail || '').trim();
+            if (!from || !to || from.toLowerCase() === to.toLowerCase()) {
+                if (typeof callback === 'function') callback({ error: '無効な申請です' });
+                return;
+            }
+            const fromLower = from.toLowerCase();
+            const toLower = to.toLowerCase();
+
+            // 1. 自分のドキュメント: requestsから削除 & friendsに追加
+            const toDocRef = usersCol().doc(to);
+            const toDoc = await toDocRef.get();
+            if (toDoc.exists) {
+                const curRequests = toDoc.data().requests || [];
+                const updatedRequests = curRequests.filter(e => (e || '').trim().toLowerCase() !== fromLower);
+                const curFriends = toDoc.data().friends || [];
+                const updatedFriends = curFriends.some(e => (e || '').trim().toLowerCase() === fromLower)
+                    ? curFriends
+                    : [...curFriends, from];
+                await toDocRef.update({
+                    requests: updatedRequests,
+                    friends: updatedFriends
+                });
+            }
+
+            // 2. 相手のドキュメント: sentRequestsから削除 & friendsに追加
+            const fromDocRef = usersCol().doc(from);
+            const fromDoc = await fromDocRef.get();
+            if (fromDoc.exists) {
+                const curSent = fromDoc.data().sentRequests || [];
+                const updatedSent = curSent.filter(e => (e || '').trim().toLowerCase() !== toLower);
+                const curFriends = fromDoc.data().friends || [];
+                const updatedFriends = curFriends.some(e => (e || '').trim().toLowerCase() === toLower)
+                    ? curFriends
+                    : [...curFriends, to];
+                await fromDocRef.update({
+                    sentRequests: updatedSent,
+                    friends: updatedFriends
+                });
+            }
+
+            notifyUsers([from, to]);
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (e) {
+            console.error('accept_friend_request error:', e);
+            if (typeof callback === 'function') callback({ error: e.message });
+        }
     });
 
-    socket.on('reject_friend_request', async ({ from: requesterEmail }) => {
+    socket.on('reject_friend_request', async ({ from: requesterEmail }, callback) => {
         try {
-            const to = currentUserEmail;
-            if (!requesterEmail || requesterEmail === to) return;
-            await usersCol().doc(to).update({ requests: admin.firestore.FieldValue.arrayRemove(requesterEmail) });
-            await usersCol().doc(requesterEmail).update({ sentRequests: admin.firestore.FieldValue.arrayRemove(to) });
-            notifyUsers([requesterEmail, to]);
-        } catch (e) { console.error('reject_friend_request error:', e); }
+            const to = (currentUserEmail || '').trim();
+            const from = (requesterEmail || '').trim();
+            if (!from || !to || from.toLowerCase() === to.toLowerCase()) return;
+            const fromLower = from.toLowerCase();
+            const toLower = to.toLowerCase();
+
+            const toDocRef = usersCol().doc(to);
+            const toDoc = await toDocRef.get();
+            if (toDoc.exists) {
+                const curRequests = toDoc.data().requests || [];
+                await toDocRef.update({
+                    requests: curRequests.filter(e => (e || '').trim().toLowerCase() !== fromLower)
+                });
+            }
+
+            const fromDocRef = usersCol().doc(from);
+            const fromDoc = await fromDocRef.get();
+            if (fromDoc.exists) {
+                const curSent = fromDoc.data().sentRequests || [];
+                await fromDocRef.update({
+                    sentRequests: curSent.filter(e => (e || '').trim().toLowerCase() !== toLower)
+                });
+            }
+
+            notifyUsers([from, to]);
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (e) {
+            console.error('reject_friend_request error:', e);
+            if (typeof callback === 'function') callback({ error: e.message });
+        }
     });
 
-    socket.on('cancel_friend_request', async ({ to: targetEmail }) => {
+    socket.on('cancel_friend_request', async ({ to: targetEmail }, callback) => {
         try {
-            const from = currentUserEmail;
-            if (!targetEmail || targetEmail === from) return;
-            await usersCol().doc(from).update({ sentRequests: admin.firestore.FieldValue.arrayRemove(targetEmail) });
-            await usersCol().doc(targetEmail).update({ requests: admin.firestore.FieldValue.arrayRemove(from) });
-            notifyUsers([from, targetEmail]);
-        } catch (e) { console.error('cancel_friend_request error:', e); }
+            const from = (currentUserEmail || '').trim();
+            const target = (targetEmail || '').trim();
+            if (!target || !from || target.toLowerCase() === from.toLowerCase()) return;
+            const fromLower = from.toLowerCase();
+            const targetLower = target.toLowerCase();
+
+            const fromDocRef = usersCol().doc(from);
+            const fromDoc = await fromDocRef.get();
+            if (fromDoc.exists) {
+                const curSent = fromDoc.data().sentRequests || [];
+                await fromDocRef.update({
+                    sentRequests: curSent.filter(e => (e || '').trim().toLowerCase() !== targetLower)
+                });
+            }
+
+            const targetDocRef = usersCol().doc(target);
+            const targetDoc = await targetDocRef.get();
+            if (targetDoc.exists) {
+                const curRequests = targetDoc.data().requests || [];
+                await targetDocRef.update({
+                    requests: curRequests.filter(e => (e || '').trim().toLowerCase() !== fromLower)
+                });
+            }
+
+            notifyUsers([from, target]);
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (e) {
+            console.error('cancel_friend_request error:', e);
+            if (typeof callback === 'function') callback({ error: e.message });
+        }
     });
 
     socket.on('delete_friend', async ({ to }) => {
@@ -1387,7 +1520,13 @@ io.on('connection', (socket) => {
 
     socket.on('webrtc-offer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-offer', { from: socket.email, offer: payload.offer });
+        if (recipientSocketId) {
+            io.to(recipientSocketId).emit('webrtc-offer', {
+                from: socket.email,
+                offer: payload.offer,
+                callType: payload.callType || 'audio'
+            });
+        }
     });
     socket.on('webrtc-answer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
@@ -1404,6 +1543,26 @@ io.on('connection', (socket) => {
     socket.on('webrtc-reject-call', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-reject-call', { from: socket.email });
+    });
+    socket.on('webrtc-busy', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-busy', { from: socket.email });
+    });
+    socket.on('webrtc-glare-resolve', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-glare-resolve', { from: socket.email, winner: payload.winner });
+    });
+    socket.on('webrtc-turn-confirm-request', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-turn-confirm-request', { from: socket.email });
+    });
+    socket.on('mute_status_changed', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('mute_status_changed', { from: socket.email, isMuted: payload.isMuted });
+    });
+    socket.on('camera_status_changed', (payload) => {
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('camera_status_changed', { from: socket.email, isCameraOff: payload.isCameraOff });
     });
 
     socket.on('live_canvas_invite', (payload) => {
