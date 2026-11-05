@@ -1451,7 +1451,8 @@ io.on('connection', (socket) => {
             const msgRef = chatsCol().doc(chatID).collection('messages').doc(messageId);
             const msgSnap = await msgRef.get();
             if (msgSnap.exists && msgSnap.data().from === from) {
-                await msgRef.update({ type: 'deleted', content: 'メッセージが削除されました' });
+                // メッセージをDBから完全に削除
+                await msgRef.delete();
             }
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('message_deleted', { messageId });
