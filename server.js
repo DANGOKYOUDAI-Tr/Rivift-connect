@@ -390,6 +390,7 @@ function _rateLimit(req, endpoint, maxRequests) {
 }
 
 function globalRateLimit(req, res, next) {
+    if (req.path.startsWith('/chat/blob/')) return next(); // ファイル分割転送は専用の上限(_rateLimit 'blob')で数える
     if (!_rateLimit(req, 'global', 120)) {
         return res.status(429).json({ error: 'リクエストが多すぎます。しばらく待ってから再試行してください。' });
     }
@@ -1422,6 +1423,7 @@ io.on('connection', (socket) => {
             await usersCol().doc(to).update({ friends: admin.firestore.FieldValue.arrayRemove(from) });
             const chatID = [from, to].sort().join('__');
             await chatsCol().doc(chatID).delete();
+            deleteBlobs(chatID).catch(e => console.error('deleteBlobs error:', e));
             notifyUsers([from, to]);
         } catch (e) { console.error('delete_friend error:', e); }
     });
@@ -1434,6 +1436,12 @@ io.on('connection', (socket) => {
         const chatID = [from, to].sort().join('__');
         const msgId = payload.id || `${Date.now()}_${nodeCrypto.randomBytes(4).toString('hex')}`;
         const doc = { ...payload, from, id: msgId, read: false };
+        if (doc.fileBlob) {
+            const b = doc.fileBlob;
+            if (typeof b !== 'object' || b.id !== msgId || !Number.isInteger(b.chunks) || b.chunks < 1 || b.chunks > BLOB_MAX_CHUNKS) {
+                return reply({ ok: false, error: 'invalid_blob' });
+            }
+        }
 
         // Firestoreの1ドキュメント上限(1MiB)を超えるものは保存できない。
         // 以前は set() が失敗して握りつぶされ、送信者には「送信済み」に見えていた。
@@ -1454,8 +1462,11 @@ io.on('connection', (socket) => {
             console.error('private_message persist error:', e);
             // 保存に失敗したのに相手の画面にだけ出ている状態を避けるため取り消す
             if (delivered) io.to(_userRoom(to)).emit('message_deleted', { messageId: msgId });
+            if (doc.fileBlob) deleteBlobs(chatID, msgId).then(() => uploadMarkersCol().doc(_markerId(chatID, msgId)).delete()).catch(() => {});
             return reply({ ok: false, error: 'persist_failed' });
         }
+        // 送信が確定したので「未完了アップロード」の目印は不要
+        if (doc.fileBlob) uploadMarkersCol().doc(_markerId(chatID, msgId)).delete().catch(() => {});
         reply({ ok: true, id: msgId, delivered });
 
         // 以降は送信結果に影響しない後処理（失敗しても無視）
@@ -1495,7 +1506,9 @@ io.on('connection', (socket) => {
             const msgSnap = await msgRef.get();
             if (msgSnap.exists && msgSnap.data().from === from) {
                 // メッセージをDBから完全に削除
+                const _hadBlob = !!msgSnap.data().fileBlob;
                 await msgRef.delete();
+                if (_hadBlob) deleteBlobs(chatID, messageId).catch(e => console.error('deleteBlobs error:', e));
             }
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('message_deleted', { messageId });
@@ -1513,6 +1526,7 @@ io.on('connection', (socket) => {
             msgsSnap.docs.forEach(d => batch.delete(d.ref));
             batch.delete(chatsCol().doc(chatID));
             await batch.commit();
+            deleteBlobs(chatID).catch(e => console.error('deleteBlobs error:', e));
             notifyUsers([user1, user2]);
         } catch (e) { console.error('delete_chat error:', e); }
     });
@@ -2187,6 +2201,7 @@ app.post('/auth/delete-account', requireAuth, async (req, res) => {
                     msgsSnap.docs.slice(i, i + batchSize).forEach(d => batch.delete(d.ref));
                     await batch.commit();
                 }
+                await deleteBlobs(chatID).catch(() => {});
                 await chatsCol().doc(chatID).delete();
                 await usersCol().doc(friendEmail).update({ friends: admin.firestore.FieldValue.arrayRemove(email) });
             }
@@ -2524,5 +2539,124 @@ app.post('/collab/docs/:docId/permission', requireAuth, async (req, res) => {
     } catch (e) { console.error('collab/permission error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 大きいファイルの分割保存（チャットのファイル送信）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// クライアントが暗号化済みのバイト列を約700KBずつに分けて送り、Firestoreに保存する。
+// メッセージ本体(private_message)には id・分割数・サイズなど小さな情報だけが入る。
+// サーバーは暗号化済みデータしか見えない（中身は読めない）。
+const BLOB_MAX_CHUNKS = 24;               // 24 × 約700KB ≒ 16MBまで
+const BLOB_CHUNK_LIMIT = 780 * 1024;      // 1チャンクの受付上限（Firestore 1MiB/doc に収まる範囲）
+const _friendCache = new Map();           // `${a}|${b}` → expireAt
+async function _isFriendOf(me, partner) {
+    const key = `${me}|${partner}`, hit = _friendCache.get(key);
+    if (hit && hit > Date.now()) return true;
+    const u = await getUser(me);
+    const ok = !!(u && Array.isArray(u.friends) && u.friends.includes(partner));
+    if (ok) {
+        if (_friendCache.size > 2000) _friendCache.clear();
+        _friendCache.set(key, Date.now() + 60_000);
+    }
+    return ok;
+}
+function _blobParams(req) {
+    const msgId = req.params.msgId, index = Number(req.params.index), partner = String(req.query.partner || '');
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(msgId)) return null;
+    if (!Number.isInteger(index) || index < 0 || index >= BLOB_MAX_CHUNKS) return null;
+    if (!isValidEmail(partner)) return null;
+    return { msgId, index, partner, chatID: [req.user.email, partner].sort().join('__') };
+}
+const blobsCol = (chatID) => chatsCol().doc(chatID).collection('blobs');
+const uploadMarkersCol = () => db.collection('blob_uploads');
+const _markerId = (chatID, msgId) => `${chatID}__${msgId}`;
+
+// 送信を途中でやめた時など、クライアントから「このアップロードを破棄して」と頼むための窓口。
+// すでにメッセージとして送信済みのものは消さない（409）。
+app.delete('/chat/blob/:msgId', requireAuth, async (req, res) => {
+    try {
+        if (!_rateLimit(req, 'blob', 600)) return res.status(429).json({ error: 'Too many requests' });
+        const msgId = req.params.msgId, partner = String(req.query.partner || '');
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(msgId) || !isValidEmail(partner)) return res.status(400).json({ error: 'Bad request' });
+        const chatID = [req.user.email, partner].sort().join('__');
+        const sent = await chatsCol().doc(chatID).collection('messages').doc(msgId).get();
+        if (sent.exists) return res.status(409).json({ error: 'Already sent' });
+        const snap = await blobsCol(chatID).where('msgId', '==', msgId).get();
+        const mine = snap.docs.filter(d => d.data().uploader === req.user.email);
+        for (let i = 0; i < mine.length; i += 400) {
+            const batch = db.batch();
+            mine.slice(i, i + 400).forEach(d => batch.delete(d.ref));
+            await batch.commit();
+        }
+        await uploadMarkersCol().doc(_markerId(chatID, msgId)).delete().catch(() => {});
+        res.json({ ok: true, deleted: mine.length });
+    } catch (e) { console.error('blob discard error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// 保険の掃除: 最後のアップロードから60分以上たっても送信されていないものを、定期的に削除する。
+// （ネットワーク断・ブラウザ強制終了・キャンセル直後に遅れて届いたチャンクなど、クライアントから消せなかった分）
+async function sweepOrphanBlobs() {
+    try {
+        const cutoff = Date.now() - 60 * 60 * 1000;
+        const snap = await uploadMarkersCol().where('updatedAt', '<', cutoff).limit(50).get();
+        for (const m of snap.docs) {
+            const { chatID, msgId } = m.data();
+            try {
+                const sent = await chatsCol().doc(chatID).collection('messages').doc(msgId).get();
+                if (!sent.exists) await deleteBlobs(chatID, msgId);
+                await m.ref.delete();
+            } catch (e) { console.error('sweep item error:', e); }
+        }
+    } catch (e) { console.error('sweepOrphanBlobs error:', e); }
+}
+setInterval(sweepOrphanBlobs, 15 * 60 * 1000).unref();
+setTimeout(sweepOrphanBlobs, 60 * 1000).unref();
+
+app.post('/chat/blob/:msgId/:index', requireAuth, express.raw({ type: 'application/octet-stream', limit: BLOB_CHUNK_LIMIT }), async (req, res) => {
+    try {
+        if (!_rateLimit(req, 'blob', 600)) return res.status(429).json({ error: 'Too many requests' });
+        const p = _blobParams(req);
+        if (!p) return res.status(400).json({ error: 'Bad request' });
+        if (!Buffer.isBuffer(req.body) || req.body.length === 0) return res.status(400).json({ error: 'Empty body' });
+        if (!(await _isFriendOf(req.user.email, p.partner))) return res.status(403).json({ error: '権限がありません' });
+        const now = Date.now();
+        const batch = db.batch();
+        batch.set(blobsCol(p.chatID).doc(`${p.msgId}_${p.index}`), {
+            msgId: p.msgId, index: p.index, data: req.body, uploader: req.user.email, createdAt: now,
+        });
+        // 「送信が完了していないアップロード」の目印。メッセージの保存に成功すると消える。
+        // 途中でやめた・アプリを閉じた場合に残るので、掃除処理(下)がこれを頼りに残骸を消す。
+        batch.set(uploadMarkersCol().doc(`${p.chatID}__${p.msgId}`), {
+            chatID: p.chatID, msgId: p.msgId, uploader: req.user.email, updatedAt: now,
+        }, { merge: true });
+        await batch.commit();
+        res.json({ ok: true });
+    } catch (e) { console.error('blob upload error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.get('/chat/blob/:msgId/:index', requireAuth, async (req, res) => {
+    try {
+        if (!_rateLimit(req, 'blob', 600)) return res.status(429).json({ error: 'Too many requests' });
+        const p = _blobParams(req);
+        if (!p) return res.status(400).json({ error: 'Bad request' });
+        // chatID は「認証済み本人 + 相手」から作るので、当事者以外は他人の会話のデータに到達できない
+        const snap = await blobsCol(p.chatID).doc(`${p.msgId}_${p.index}`).get();
+        if (!snap.exists) return res.status(404).json({ error: 'Not found' });
+        const data = snap.data().data;
+        res.set('Content-Type', 'application/octet-stream');
+        res.set('Cache-Control', 'private, max-age=86400, immutable');
+        res.send(Buffer.from(data));
+    } catch (e) { console.error('blob download error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+async function deleteBlobs(chatID, msgId) {
+    let q = blobsCol(chatID);
+    const snap = msgId ? await q.where('msgId', '==', msgId).get() : await q.get();
+    for (let i = 0; i < snap.docs.length; i += 400) {
+        const batch = db.batch();
+        snap.docs.slice(i, i + 400).forEach(d => batch.delete(d.ref));
+        await batch.commit();
+    }
+}
 
 server.listen(PORT, () => console.log(`Rivift Connect Server v6.0 (Firebase) is running on port ${PORT}`));
