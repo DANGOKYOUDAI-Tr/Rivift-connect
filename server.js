@@ -195,6 +195,9 @@ const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] },
     maxHttpBufferSize: 5e6,
+    // [FIX] 死んだ接続(ゴースト)を早く検出する。既定(25s+20s)だと切断検出が最大45秒遅れる
+    pingInterval: 10000,
+    pingTimeout: 10000,
     // [PERF] 共同編集機能でページ全体のHTML（画像のbase64込み）を送受信することがあるため、
     // WebSocketフレームの圧縮を有効化して実通信量を減らす。
     perMessageDeflate: {
@@ -206,7 +209,18 @@ const PORT = process.env.PORT || 3001;
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 
-let onlineUsers = {};
+// [FIX] オンライン管理を「メール→socketId 1個」から Socket.IO のルーム方式に変更。
+// 旧方式は、古い接続の disconnect が遅れて届くと「新しい接続の登録」まで消してしまい、
+// 相手がオンラインなのにオフライン扱い（通話・メッセージが届かない）になっていた。
+// ルームは接続ごとに自動で出入りするので競合しない。複数タブ/複数端末にも同時に届く。
+// 既存コードの `onlineUsers[email]` → `io.to(...)` はそのまま動くよう Proxy で互換を保つ。
+const _userRoom = (email) => `user:${email}`;
+const isUserOnline = (email) => !!email && ((io.sockets.adapter.rooms.get(_userRoom(email))?.size || 0) > 0);
+const onlineUsers = new Proxy({}, {
+    get: (_t, email) => (typeof email === 'string' && isUserOnline(email)) ? _userRoom(email) : undefined,
+    set: () => true,
+    deleteProperty: () => true,
+});
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 近くの人モード（Nearby Share）: ログイン不要・匿名の状態管理
@@ -1139,10 +1153,13 @@ io.on('connection', (socket) => {
 
     // [SEC] 'login' はJWTで検証済みの本人（socket.verifiedEmail）としてのみ扱う。
     // クライアントから送られてくる payload.email は無視する（なりすまし防止）。
-    onlineUsers[currentUserEmail] = socket.id;
-    notifyFriendsOfStatusChange(currentUserEmail, true);
+    socket.join(_userRoom(currentUserEmail));
+    // 同じアカウントの2つ目以降の接続ではオンライン通知を重複させない
+    if ((io.sockets.adapter.rooms.get(_userRoom(currentUserEmail))?.size || 0) === 1) {
+        notifyFriendsOfStatusChange(currentUserEmail, true);
+    }
     socket.on('login', () => {
-        onlineUsers[currentUserEmail] = socket.id;
+        socket.join(_userRoom(currentUserEmail)); // 冪等。念のための再参加
     });
 
     socket.on('get_initial_statuses', async (payload, callback) => {
@@ -1155,7 +1172,11 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        if (currentUserEmail) { delete onlineUsers[currentUserEmail]; notifyFriendsOfStatusChange(currentUserEmail, false); }
+        if (currentUserEmail) {
+            // 再接続の一瞬の切れ目で「オフライン」がチカチカしないよう、3秒待って本当に全接続が無い時だけ通知
+            const _em = currentUserEmail;
+            setTimeout(() => { if (!isUserOnline(_em)) notifyFriendsOfStatusChange(_em, false); }, 3000);
+        }
         _collabJoinedRooms.forEach(docId => {
             socket.to(`collab:${docId}`).emit('collab_presence_left', { docId, email: currentUserEmail });
         });
@@ -1405,25 +1426,47 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('delete_friend error:', e); }
     });
 
-    socket.on('private_message', async (payload) => {
-        try {
-            const from = currentUserEmail;
-            const { to } = payload;
-            const chatID = [from, to].sort().join('__');
-            const msgId = payload.id || `${Date.now()}_${nodeCrypto.randomBytes(4).toString('hex')}`;
-            await chatsCol().doc(chatID).set({ users: [from, to], lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-            await chatsCol().doc(chatID).collection('messages').doc(msgId).set({ ...payload, from, id: msgId, read: false });
-            const recipientSocketId = onlineUsers[to];
-            if (recipientSocketId) io.to(recipientSocketId).emit('private_message', { ...payload, from, id: msgId, read: false });
-            const senderSocketId = onlineUsers[from];
-            if (senderSocketId) io.to(senderSocketId).emit('db_updated_notification');
+    socket.on('private_message', async (payload, ack) => {
+        const reply = (r) => { if (typeof ack === 'function') { try { ack(r); } catch (_) {} } };
+        const from = currentUserEmail;
+        const to = payload && payload.to;
+        if (!isValidEmail(to)) return reply({ ok: false, error: 'invalid_recipient' });
+        const chatID = [from, to].sort().join('__');
+        const msgId = payload.id || `${Date.now()}_${nodeCrypto.randomBytes(4).toString('hex')}`;
+        const doc = { ...payload, from, id: msgId, read: false };
 
-            if (recipientSocketId) {
-                const unreadSnap = await chatsCol().doc(chatID).collection('messages').where('to', '==', to).get();
-                const unreadCount = unreadSnap.docs.filter(doc => doc.data().read !== true).length;
-                io.to(recipientSocketId).emit('unread_update', { partnerEmail: from, count: unreadCount });
+        // Firestoreの1ドキュメント上限(1MiB)を超えるものは保存できない。
+        // 以前は set() が失敗して握りつぶされ、送信者には「送信済み」に見えていた。
+        if (Buffer.byteLength(JSON.stringify(doc), 'utf8') > 1_000_000) {
+            return reply({ ok: false, error: 'too_large' });
+        }
+
+        // [PERF] 先に相手へ配信（DB書き込みを待たない）。保存は並列で行う。
+        const delivered = isUserOnline(to);
+        if (delivered) io.to(_userRoom(to)).emit('private_message', doc);
+
+        try {
+            await Promise.all([
+                chatsCol().doc(chatID).set({ users: [from, to], lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true }),
+                chatsCol().doc(chatID).collection('messages').doc(msgId).set(doc),
+            ]);
+        } catch (e) {
+            console.error('private_message persist error:', e);
+            // 保存に失敗したのに相手の画面にだけ出ている状態を避けるため取り消す
+            if (delivered) io.to(_userRoom(to)).emit('message_deleted', { messageId: msgId });
+            return reply({ ok: false, error: 'persist_failed' });
+        }
+        reply({ ok: true, id: msgId, delivered });
+
+        // 以降は送信結果に影響しない後処理（失敗しても無視）
+        try {
+            io.to(_userRoom(from)).emit('db_updated_notification');
+            if (delivered) {
+                const unreadSnap = await chatsCol().doc(chatID).collection('messages')
+                    .where('to', '==', to).where('read', '==', false).get();
+                io.to(_userRoom(to)).emit('unread_update', { partnerEmail: from, count: unreadSnap.size });
             }
-        } catch (e) { console.error('private_message error:', e); }
+        } catch (e) { console.error('private_message post error:', e); }
     });
 
     socket.on('read_receipt', async (payload) => {
@@ -1431,7 +1474,7 @@ io.on('connection', (socket) => {
             const readerEmail = currentUserEmail;
             const writerEmail = payload.to;
             const chatID = [readerEmail, writerEmail].sort().join('__');
-            const unreadSnap = await chatsCol().doc(chatID).collection('messages').where('to', '==', readerEmail).get();
+            const unreadSnap = await chatsCol().doc(chatID).collection('messages').where('to', '==', readerEmail).where('read', '==', false).get();
             const batch = db.batch();
             unreadSnap.docs.filter(d => d.data().read !== true).forEach(d => batch.update(d.ref, { read: true }));
             await batch.commit();
@@ -1519,15 +1562,17 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('update_profile error:', e); }
     });
 
-    socket.on('webrtc-offer', (payload) => {
-        const recipientSocketId = onlineUsers[payload.to];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('webrtc-offer', {
+    socket.on('webrtc-offer', (payload, ack) => {
+        // [FIX] 届いたかどうかを発信側に返す（以前はオフラインだと黙って捨てていた）
+        const delivered = isUserOnline(payload && payload.to);
+        if (delivered) {
+            io.to(_userRoom(payload.to)).emit('webrtc-offer', {
                 from: socket.email,
                 offer: payload.offer,
                 callType: payload.callType || 'audio'
             });
         }
+        if (typeof ack === 'function') ack({ delivered });
     });
     socket.on('webrtc-answer', (payload) => {
         const recipientSocketId = onlineUsers[payload.to];
