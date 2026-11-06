@@ -150,10 +150,50 @@ const COLLAB_ROLE_RANK = { viewer: 0, commenter: 1, editor: 2, owner: 3 };
 const COLLAB_INVITE_MAX_USES = 200;
 const COLLAB_INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 招待コードの既定有効期限: 7日
 
+// [FIX] Firestoreの update({ 'collaborators.user@gmail.com': role }) は「.」をフィールドパスの区切りと
+// 解釈するため、実際には collaborators.user@gmail.com という入れ子 { 'user@gmail': { com: role } } で
+// 保存されてしまい、権限が一切読み出せなくなっていた（→「アクセス権がありません」）。
+// 書き込みは FieldPath で行い、読み取りは過去に壊れた形式で保存されたデータも救済できるよう正規化する。
+function _collabNormalize(collaborators) {
+    const out = {};
+    const walk = (obj, prefix) => {
+        for (const [k, v] of Object.entries(obj || {})) {
+            const key = prefix ? `${prefix}.${k}` : k;
+            if (typeof v === 'string') { if (COLLAB_ROLES.includes(v)) out[key] = v; }
+            else if (v && typeof v === 'object') walk(v, key);
+        }
+    };
+    walk(collaborators, '');
+    return out;
+}
+
 function _collabRoleOf(docData, email) {
-    if (!docData) return null;
+    if (!docData || !email) return null;
     if (docData.ownerEmail === email) return 'owner';
-    return docData.collaborators?.[email] || null;
+    return _collabNormalize(docData.collaborators)[email] || null;
+}
+
+// クライアントへ返すドキュメント情報（collaborators は正規化済みの { email: role }）
+function _collabPublicDoc(id, data, email) {
+    return { id, ...data, collaborators: _collabNormalize(data.collaborators), yourRole: _collabRoleOf(data, email) };
+}
+
+// コラボレーターの権限を書き込む（role が null なら削除）
+async function _collabSetRole(docRef, docData, email, role) {
+    const raw = docData.collaborators || {};
+    const hasLegacy = Object.values(raw).some(v => v && typeof v === 'object');
+    if (hasLegacy) {
+        // 過去の壊れた形式が残っている場合は、正規化したマップで丸ごと置き換えて修復する
+        const next = _collabNormalize(raw);
+        if (role) next[email] = role; else delete next[email];
+        await docRef.update({ collaborators: next, updatedAt: Date.now() });
+        return;
+    }
+    await docRef.update(
+        new admin.firestore.FieldPath('collaborators', email),
+        role ? role : admin.firestore.FieldValue.delete(),
+        'updatedAt', Date.now()
+    );
 }
 
 function _collabHasAtLeast(role, required) {
@@ -2413,7 +2453,7 @@ app.post('/collab/docs', requireAuth, async (req, res) => {
             const data = snap.data();
             const role = _collabRoleOf(data, email);
             if (!role) return res.status(403).json({ error: 'このドキュメントへのアクセス権がありません' });
-            return res.json({ success: true, doc: { id: docId, ...data, yourRole: role } });
+            return res.json({ success: true, doc: _collabPublicDoc(docId, data, email) });
         }
         const doc = {
             appType, ownerEmail: email,
@@ -2435,7 +2475,7 @@ app.get('/collab/docs/:docId', requireAuth, async (req, res) => {
         const data = snap.data();
         const role = _collabRoleOf(data, email);
         if (!role) return res.status(403).json({ error: 'アクセス権がありません' });
-        res.json({ doc: { id: req.params.docId, ...data, yourRole: role } });
+        res.json({ doc: _collabPublicDoc(req.params.docId, data, email) });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -2488,19 +2528,19 @@ app.post('/collab/join', requireAuth, async (req, res) => {
 
         if (docData.ownerEmail !== email) {
             // 既存の権限より低い権限には落とさない（例: 既にeditorの人がviewer招待コードを踏んでも降格しない）
-            const currentRole = docData.collaborators?.[email];
-            if (!currentRole || _collabRoleOf(docData, email) === null || COLLAB_ROLE_RANK[invite.role] > (COLLAB_ROLE_RANK[currentRole] ?? -1)) {
-                await docRef.update({ [`collaborators.${email}`]: invite.role, updatedAt: Date.now() });
+            const currentRole = _collabRoleOf(docData, email);
+            if (!currentRole || COLLAB_ROLE_RANK[invite.role] > (COLLAB_ROLE_RANK[currentRole] ?? -1)) {
+                await _collabSetRole(docRef, docData, email, invite.role);
             }
         }
         await inviteRef.update({ uses: admin.firestore.FieldValue.increment(1) });
 
         const updatedSnap = await docRef.get();
         const updated = updatedSnap.data();
-        res.json({ success: true, doc: { id: invite.docId, ...updated, yourRole: _collabRoleOf(updated, email) } });
+        res.json({ success: true, doc: _collabPublicDoc(invite.docId, updated, email) });
 
         // オーナー・既存参加者に通知（オンラインなら）
-        const notifyList = [updated.ownerEmail, ...Object.keys(updated.collaborators || {})];
+        const notifyList = [updated.ownerEmail, ...Object.keys(_collabNormalize(updated.collaborators))];
         notifyList.forEach(e => {
             if (e === email) return;
             const sid = onlineUsers[e];
@@ -2522,10 +2562,10 @@ app.post('/collab/docs/:docId/permission', requireAuth, async (req, res) => {
         if (!isValidEmail(targetEmail) || targetEmail === email) return res.status(400).json({ error: '対象メールアドレスが不正です' });
 
         if (!role) {
-            await docRef.update({ [`collaborators.${targetEmail}`]: admin.firestore.FieldValue.delete(), updatedAt: Date.now() });
+            await _collabSetRole(docRef, data, targetEmail, null);
         } else {
             if (!['viewer', 'commenter', 'editor'].includes(role)) return res.status(400).json({ error: 'role が不正です' });
-            await docRef.update({ [`collaborators.${targetEmail}`]: role, updatedAt: Date.now() });
+            await _collabSetRole(docRef, data, targetEmail, role);
         }
 
         const targetSocketId = onlineUsers[targetEmail];
