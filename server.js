@@ -19,16 +19,31 @@ const gunzip = promisify(zlib.gunzip);
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Firebase Admin SDK
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const admin = require('firebase-admin');
+try {
+    const { getFirestore, FieldPath, FieldValue } = require('firebase-admin/firestore');
+    if (!admin.firestore) {
+        admin.firestore = getFirestore;
+        admin.firestore.FieldPath = FieldPath;
+        admin.firestore.FieldValue = FieldValue;
+    }
+} catch (e) { }
 
-admin.initializeApp({
-    credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    })
-});
+if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY) {
+    admin.initializeApp({
+        credential: admin.credential.cert({
+            projectId: process.env.FIREBASE_PROJECT_ID,
+            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+            privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+        })
+    });
+} else {
+    try {
+        admin.initializeApp();
+    } catch (e) {
+        console.warn('[WARN] Firebase credentials not configured in env.');
+    }
+}
 
 const db = admin.firestore();
 const usersCol = () => db.collection('users');
@@ -318,6 +333,36 @@ function _generateInviteCode() {
     return `${code.slice(0, 4)}-${code.slice(4)}`;
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 共同編集: カーソル状態追跡 & オペレーション変換（OT競合解消）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const _collabRoomCursors = new Map(); // docId -> Map<email, { docId, from, displayName, color, cursor, updatedAt }>
+const _collabDocStates = new Map();   // docId -> { pages: Map<pageIndex, { rev, opsHistory: [] }> }
+
+function _transformPatch(p1, p2) {
+    if (!p1 || !p2) return p1;
+    let start = Number(p1.start ?? 0);
+    let delCount = Number(p1.delCount ?? 0);
+    const insert = typeof p1.insert === 'string' ? p1.insert : '';
+    const p2Start = Number(p2.start ?? 0);
+    const p2Del = Number(p2.delCount ?? 0);
+    const p2Ins = typeof p2.insert === 'string' ? p2.insert.length : 0;
+    const delta2 = p2Ins - p2Del;
+
+    if (p2Start <= start) {
+        if (p2Start + p2Del <= start) {
+            start += delta2;
+        } else {
+            const overlap = Math.min(p2Start + p2Del, start + delCount) - start;
+            start = p2Start + p2Ins;
+            delCount = Math.max(0, delCount - overlap);
+        }
+    } else if (p2Start < start + delCount) {
+        delCount += delta2;
+    }
+    return { start: Math.max(0, start), delCount: Math.max(0, delCount), insert };
+}
+
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet());
@@ -346,13 +391,11 @@ const io = new Server(server, {
     // [FIX] 死んだ接続(ゴースト)を早く検出する。既定(25s+20s)だと切断検出が最大45秒遅れる
     pingInterval: 10000,
     pingTimeout: 10000,
-    // [PERF] 共同編集機能でページ全体のHTML（画像のbase64込み）を送受信することがあるため、
-    // WebSocketフレームの圧縮を有効化して実通信量を減らす。
     perMessageDeflate: {
-        threshold: 1024, // 1KB未満は圧縮のオーバーヘッドの方が大きいのでそのまま送る
+        threshold: 1024,
     },
 });
-const PORT = process.env.PORT || 3001;
+const PORT = 3000;
 
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -585,7 +628,8 @@ function optionalAuth(req, res, next) {
     next();
 }
 
-app.get('/', (req, res) => res.send('<h1>Rivift Connect Server v6.0 (Firebase) is Active!</h1>'));
+app.use(express.static(__dirname));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/ping', (req, res) => res.json({ ok: true }));
 
 app.post('/createUser', async (req, res) => {
@@ -1341,6 +1385,21 @@ io.on('connection', (socket) => {
         }
     });
 
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 共同編集（Office系アプリ共通基盤）: ルーム参加・操作同期・カーソル共有
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const _collabJoinedRooms = new Set(); // このsocketが参加中のdocIdの集合（disconnect時の後片付け用）
+
+    const _cleanupCollabRoom = (docId) => {
+        socket.to(`collab:${docId}`).emit('collab_presence_left', { docId, email: currentUserEmail });
+        const rc = _collabRoomCursors.get(docId);
+        if (rc) {
+            rc.delete(currentUserEmail);
+            if (rc.size === 0) _collabRoomCursors.delete(docId);
+        }
+        socket.to(`collab:${docId}`).emit('collab_cursor_remove', { docId, from: currentUserEmail });
+    };
+
     socket.on('disconnect', () => {
         if (currentUserEmail) {
             // 再接続の一瞬の切れ目で「オフライン」がチカチカしないよう、3秒待って本当に全接続が無い時だけ通知
@@ -1348,15 +1407,10 @@ io.on('connection', (socket) => {
             setTimeout(() => { if (!isUserOnline(_em)) notifyFriendsOfStatusChange(_em, false); }, 3000);
         }
         _collabJoinedRooms.forEach(docId => {
-            socket.to(`collab:${docId}`).emit('collab_presence_left', { docId, email: currentUserEmail });
+            _cleanupCollabRoom(docId);
         });
         _collabJoinedRooms.clear();
     });
-
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 共同編集（Office系アプリ共通基盤）: ルーム参加・操作同期・カーソル共有
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    const _collabJoinedRooms = new Set(); // このsocketが参加中のdocIdの集合（disconnect時の後片付け用）
 
     socket.on('collab_join_room', async ({ docId }, callback) => {
         try {
@@ -1376,8 +1430,21 @@ io.on('connection', (socket) => {
                 .filter(s => s.id !== socket.id)
                 .map(s => ({ email: s.email, role: _collabRoleOf(data, s.email) }));
 
+            // 既存参加者のカーソル一覧
+            const rc = _collabRoomCursors.get(docId);
+            const cursors = rc ? Array.from(rc.values()) : [];
+
+            // ページごとの現在リビジョン番号
+            const docState = _collabDocStates.get(docId);
+            const pageRevs = {};
+            if (docState) {
+                for (const [pIdx, pState] of docState.pages.entries()) {
+                    pageRevs[pIdx] = pState.rev;
+                }
+            }
+
             socket.to(`collab:${docId}`).emit('collab_presence_joined', { docId, email: currentUserEmail, role });
-            callback?.({ success: true, role, peers });
+            callback?.({ success: true, role, peers, cursors, pageRevs });
         } catch (e) {
             console.error('collab_join_room error:', e);
             callback?.({ error: 'Server error' });
@@ -1387,11 +1454,12 @@ io.on('connection', (socket) => {
     socket.on('collab_leave_room', ({ docId }) => {
         socket.leave(`collab:${docId}`);
         _collabJoinedRooms.delete(docId);
-        socket.to(`collab:${docId}`).emit('collab_presence_left', { docId, email: currentUserEmail });
+        _cleanupCollabRoom(docId);
     });
 
     // 実際の編集内容（セル変更・テキスト差分・図形の移動など）を同室の他ユーザーへ中継。
-    // [SEC] 権限チェックはサーバー側で必ず行う（クライアントのUI制御だけに頼らない）。
+    // [SEC] 権限チェックはサーバー側で必ず行う。
+    // [OT] 競合対策: 送信元の baseRev を考慮し、サーバー間で発生した直近の操作と照らし合わせて位置を自動補正 (OT)
     socket.on('collab_op', async ({ docId, op }) => {
         try {
             if (!docId || !op) return;
@@ -1399,7 +1467,69 @@ io.on('connection', (socket) => {
             if (!snap.exists) return;
             const role = _collabRoleOf(snap.data(), currentUserEmail);
             if (!_collabHasAtLeast(role, 'editor')) return; // editor未満は変更を送れない
-            socket.to(`collab:${docId}`).emit('collab_op', { docId, op, from: currentUserEmail, at: Date.now() });
+
+            let docState = _collabDocStates.get(docId);
+            if (!docState) {
+                docState = { pages: new Map() };
+                _collabDocStates.set(docId, docState);
+            }
+            const pageIndex = op.pageIndex ?? 0;
+            let pageState = docState.pages.get(pageIndex);
+            if (!pageState) {
+                pageState = { rev: 0, opsHistory: [] };
+                docState.pages.set(pageIndex, pageState);
+            }
+
+            if (op.full) {
+                pageState.rev++;
+                pageState.opsHistory = [];
+                socket.to(`collab:${docId}`).emit('collab_op', {
+                    docId,
+                    op: { ...op, rev: pageState.rev },
+                    from: currentUserEmail,
+                    at: Date.now()
+                });
+                return;
+            }
+
+            let effectivePatch = op.patch;
+            const baseRev = Number(op.baseRev ?? pageState.rev);
+
+            // OT変換: クライアントが古いリビジョンで打鍵していた場合、その間に起きたパッチで位置を補正
+            if (baseRev < pageState.rev && pageState.opsHistory.length > 0 && effectivePatch) {
+                const missedOps = pageState.opsHistory.filter(o => o.rev > baseRev);
+                for (const pastOp of missedOps) {
+                    if (pastOp.patch) {
+                        effectivePatch = _transformPatch(effectivePatch, pastOp.patch);
+                    }
+                }
+            }
+
+            pageState.rev++;
+            pageState.opsHistory.push({ rev: pageState.rev, patch: effectivePatch, from: currentUserEmail });
+            if (pageState.opsHistory.length > 100) pageState.opsHistory.shift();
+
+            const transformedOp = {
+                ...op,
+                patch: effectivePatch,
+                rev: pageState.rev,
+                baseRev: baseRev
+            };
+
+            socket.to(`collab:${docId}`).emit('collab_op', {
+                docId,
+                op: transformedOp,
+                from: currentUserEmail,
+                at: Date.now()
+            });
+
+            // 送信クライアントへ確定通知（ack）
+            socket.emit('collab_op_ack', {
+                docId,
+                pageIndex,
+                clientOpId: op.clientOpId,
+                rev: pageState.rev
+            });
         } catch (e) { console.error('collab_op error:', e); }
     });
 
@@ -1415,10 +1545,24 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('collab_comment error:', e); }
     });
 
-    // カーソル位置・選択範囲の共有（閲覧権限だけでもOK。編集内容ではないので軽い権限で許可）
-    socket.on('collab_cursor', async ({ docId, cursor }) => {
+    // カーソル位置・選択範囲の共有（閲覧権限だけでもOK。キャレットとテキスト選択ハイライト情報を含む）
+    socket.on('collab_cursor', async ({ docId, cursor, displayName, color }) => {
         if (!docId || !socket.rooms.has(`collab:${docId}`)) return; // 参加していない部屋には送れない
-        socket.to(`collab:${docId}`).emit('collab_cursor', { docId, cursor, from: currentUserEmail });
+        let rc = _collabRoomCursors.get(docId);
+        if (!rc) {
+            rc = new Map();
+            _collabRoomCursors.set(docId, rc);
+        }
+        const cursorData = {
+            docId,
+            from: currentUserEmail,
+            displayName: sanitizeString(displayName, 50) || currentUserEmail.split('@')[0],
+            color: color || '#3b82f6',
+            cursor,
+            updatedAt: Date.now()
+        };
+        rc.set(currentUserEmail, cursorData);
+        socket.to(`collab:${docId}`).emit('collab_cursor', cursorData);
     });
 
     // 新規参加者が「今の最新内容」を持っていないため、同室の他の人に一度だけ呼びかけて取り直す。
