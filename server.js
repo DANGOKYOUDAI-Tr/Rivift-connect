@@ -14,6 +14,9 @@ const { promisify } = require('util');
 const nodeCrypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
+const https = require('https');
+const dnsCb = require('dns');
+const { Transform, pipeline } = require('stream');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 
@@ -79,82 +82,315 @@ const ALLOWED_ORIGINS = [
     'null', // Chromebook等のローカルファイル (file://) 起動をサポート
 ];
 
-// SSRF対策: プライベート/ループバック/リンクローカル/メタデータIPの判定
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SSRF対策（/proxy・/extract 共通）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// [SEC] 1) URL文字列の検証  2) DNS解決結果の検証  3) 実際に接続する瞬間のIP検証（DNSリバインディング対策）
+//       4) リダイレクトを1ホップずつ手動で追跡して毎回検証  5) ポート制限  6) サイズ・時間の上限
+class SsrfError extends Error { constructor(msg) { super(msg); this.name = 'SsrfError'; } }
+
+function _isBlockedIPv4(ip) {
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4 || parts.some(p => !Number.isInteger(p) || p < 0 || p > 255)) return true;
+    const [a, b, c] = parts;
+    if (a === 0 || a === 10 || a === 127) return true;               // 0/8, 10/8, 127/8
+    if (a === 100 && b >= 64 && b <= 127) return true;               // 100.64/10 (CGNAT)
+    if (a === 169 && b === 254) return true;                         // 169.254/16 (リンクローカル・クラウドメタデータ)
+    if (a === 172 && b >= 16 && b <= 31) return true;                // 172.16/12
+    if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;   // 192.0.0/24, 192.0.2/24
+    if (a === 192 && b === 88 && c === 99) return true;              // 6to4 relay
+    if (a === 192 && b === 168) return true;                         // 192.168/16
+    if (a === 198 && (b === 18 || b === 19)) return true;            // ベンチマーク用
+    if (a === 198 && b === 51 && c === 100) return true;             // TEST-NET-2
+    if (a === 203 && b === 0 && c === 113) return true;              // TEST-NET-3
+    if (a >= 224) return true;                                       // マルチキャスト・予約・ブロードキャスト
+    return false;
+}
+
+// IPv6 文字列を 8個の16bit値に展開（"::" 省略・末尾IPv4表記・ゼロ埋めの揺れに対応）。失敗したら null
+function _parseIPv6ToGroups(ip) {
+    let str = ip.toLowerCase();
+    const zone = str.indexOf('%');
+    if (zone >= 0) str = str.slice(0, zone);
+    if (str.includes('.')) {
+        const lastColon = str.lastIndexOf(':');
+        const v4 = str.slice(lastColon + 1);
+        if (!net.isIPv4(v4)) return null;
+        const p = v4.split('.').map(Number);
+        str = `${str.slice(0, lastColon + 1)}${((p[0] << 8) | p[1]).toString(16)}:${((p[2] << 8) | p[3]).toString(16)}`;
+    }
+    const halves = str.split('::');
+    if (halves.length > 2) return null;
+    const head = halves[0] ? halves[0].split(':') : [];
+    const rest = (halves.length === 2 && halves[1]) ? halves[1].split(':') : [];
+    let groups;
+    if (halves.length === 2) {
+        const fill = 8 - head.length - rest.length;
+        if (fill < 1) return null;
+        groups = [...head, ...Array(fill).fill('0'), ...rest];
+    } else {
+        groups = head;
+    }
+    if (groups.length !== 8) return null;
+    const out = groups.map(g => /^[0-9a-f]{1,4}$/.test(g) ? parseInt(g, 16) : NaN);
+    return out.some(Number.isNaN) ? null : out;
+}
+
+// SSRF対策: プライベート/ループバック/リンクローカル/メタデータ/マルチキャストIPの判定
 function isPrivateOrBlockedIp(ipStr) {
     if (!ipStr || typeof ipStr !== 'string') return true;
-    const ip = ipStr.trim();
-    if (net.isIPv4(ip)) {
-        const parts = ip.split('.').map(Number);
-        if (parts.length !== 4 || parts.some(p => isNaN(p) || p < 0 || p > 255)) return true;
-        if (parts[0] === 0) return true; // 0.0.0.0/8
-        if (parts[0] === 10) return true; // 10.0.0.0/8
-        if (parts[0] === 127) return true; // 127.0.0.0/8
-        if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true; // 100.64.0.0/10
-        if (parts[0] === 169 && parts[1] === 254) return true; // 169.254.0.0/16
-        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true; // 172.16.0.0/12
-        if (parts[0] === 192 && parts[1] === 0 && (parts[2] === 0 || parts[2] === 2)) return true;
-        if (parts[0] === 192 && parts[1] === 168) return true; // 192.168.0.0/16
-        if (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19)) return true;
-        if (parts[0] === 198 && parts[1] === 51 && parts[2] === 100) return true;
-        if (parts[0] === 203 && parts[1] === 0 && parts[2] === 113) return true;
-        if (parts[0] >= 224) return true; // 224.0.0.0+ (Multicast, Reserved, Broadcast)
-        return false;
-    }
+    let ip = ipStr.trim();
+    if (ip.startsWith('[') && ip.endsWith(']')) ip = ip.slice(1, -1);
+    if (net.isIPv4(ip)) return _isBlockedIPv4(ip);
     if (net.isIPv6(ip)) {
-        const lower = ip.toLowerCase();
-        if (lower === '::1' || lower === '::' || lower === '0:0:0:0:0:0:0:1' || lower === '0:0:0:0:0:0:0:0') return true;
-        if (lower.startsWith('::ffff:')) {
-            const mapped = lower.slice(7);
-            if (net.isIPv4(mapped)) return isPrivateOrBlockedIp(mapped);
-            return true;
-        }
-        if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // Unique local
-        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return true; // Link-local
+        const g = _parseIPv6ToGroups(ip);
+        if (!g) return true;
+        const zeros = (from, to) => g.slice(from, to).every(x => x === 0);
+        const v4 = (hi, lo) => `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+        if (zeros(0, 6)) return true;                                              // ::, ::1, ::a.b.c.d（IPv4互換）
+        if (zeros(0, 5) && g[5] === 0xffff) return _isBlockedIPv4(v4(g[6], g[7])); // ::ffff:a.b.c.d（IPv4射影）
+        if (g[0] === 0x64 && g[1] === 0xff9b && zeros(2, 6)) return _isBlockedIPv4(v4(g[6], g[7])); // NAT64
+        if (g[0] === 0x2002) return _isBlockedIPv4(v4(g[1], g[2]));                // 6to4
+        if (g[0] === 0x2001 && g[1] === 0) return true;                            // Teredo
+        if (g[0] === 0x2001 && g[1] === 0x0db8) return true;                       // ドキュメント用
+        if ((g[0] & 0xfe00) === 0xfc00) return true;                               // fc00::/7 ユニークローカル
+        if ((g[0] & 0xffc0) === 0xfe80) return true;                               // fe80::/10 リンクローカル
+        if ((g[0] & 0xffc0) === 0xfec0) return true;                               // fec0::/10 サイトローカル
+        if ((g[0] & 0xff00) === 0xff00) return true;                               // マルチキャスト
+        if (g[0] === 0x0100 && zeros(1, 4)) return true;                           // 100::/64
         return false;
     }
     return true;
 }
 
-// SSRF検証ヘルパー (DNS解決して全IPを検証)
+// 外向き通信で許可するポート（環境変数 SSRF_ALLOWED_PORTS で上書き可）
+const SSRF_ALLOWED_PORTS = new Set(
+    (process.env.SSRF_ALLOWED_PORTS || '80,443,8080,8443').split(',').map(x => Number(x.trim())).filter(Boolean)
+);
+const SSRF_BLOCKED_HOSTS = ['localhost', 'metadata.google.internal', 'metadata', 'instance-data', '169.254.169.254'];
+const SSRF_BLOCKED_SUFFIXES = ['.localhost', '.local', '.internal', '.lan', '.intranet', '.corp', '.home', '.home.arpa'];
+
+// SSRF検証ヘルパー (URL形式・ポート・ホスト名・DNS解決結果の全IPを検証)
 async function assertSafeUrl(rawUrl) {
-    if (!rawUrl || typeof rawUrl !== 'string') throw new Error('Invalid URL');
+    if (!rawUrl || typeof rawUrl !== 'string' || rawUrl.length > 4096) throw new SsrfError('Invalid URL');
     let parsed;
     try {
         parsed = new URL(rawUrl);
     } catch {
-        throw new Error('Invalid URL format');
+        throw new SsrfError('Invalid URL format');
     }
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
-        throw new Error('Only HTTP/HTTPS protocols are allowed');
-    }
-    if (parsed.username || parsed.password) {
-        throw new Error('URLs with embedded credentials are not allowed');
-    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new SsrfError('Only HTTP/HTTPS protocols are allowed');
+    if (parsed.username || parsed.password) throw new SsrfError('URLs with embedded credentials are not allowed');
 
-    const hostname = parsed.hostname.toLowerCase();
-    const blockedHostnames = ['localhost', 'metadata.google.internal', 'instance-data', '169.254.169.254'];
-    if (blockedHostnames.includes(hostname) || hostname.endsWith('.local') || hostname.endsWith('.internal')) {
-        throw new Error('Access to internal hostnames is blocked');
-    }
+    const port = parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80);
+    if (!SSRF_ALLOWED_PORTS.has(port)) throw new SsrfError('This port is not allowed');
 
-    const addresses = await dns.lookup(hostname, { all: true });
-    if (!addresses || addresses.length === 0) {
-        throw new Error('Could not resolve hostname');
+    let hostname = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+    if (hostname.startsWith('[') && hostname.endsWith(']')) hostname = hostname.slice(1, -1);
+    if (!hostname) throw new SsrfError('Invalid hostname');
+    if (SSRF_BLOCKED_HOSTS.includes(hostname) || SSRF_BLOCKED_SUFFIXES.some(sfx => hostname.endsWith(sfx))) {
+        throw new SsrfError('Access to internal hostnames is blocked');
     }
+    if (net.isIP(hostname)) {
+        if (isPrivateOrBlockedIp(hostname)) throw new SsrfError('Access to private/local IP is blocked');
+        return parsed;
+    }
+    const addresses = await dns.lookup(hostname, { all: true, verbatim: true });
+    if (!addresses || addresses.length === 0) throw new SsrfError('Could not resolve hostname');
     for (const record of addresses) {
-        if (isPrivateOrBlockedIp(record.address)) {
-            throw new Error(`Access to private/local IP (${record.address}) is blocked`);
-        }
+        if (isPrivateOrBlockedIp(record.address)) throw new SsrfError('Access to private/local IP is blocked');
     }
     return parsed;
 }
 
+// [SEC] DNSリバインディング対策: 「検証した時のDNS結果」と「実際に接続する時のDNS結果」が違う、という攻撃を防ぐため
+// 接続の瞬間に使うDNS解決そのものを検証付きにする（http/https Agent の lookup に差し込む）。
+function _ssrfSafeLookup(hostname, options, callback) {
+    if (typeof options === 'function') { callback = options; options = {}; }
+    options = options || {};
+    dnsCb.lookup(hostname, { family: options.family, hints: options.hints, all: true, verbatim: true }, (err, addrs) => {
+        if (err) return callback(err);
+        if (!addrs || addrs.length === 0 || addrs.some(a => isPrivateOrBlockedIp(a.address))) {
+            return callback(new SsrfError('Access to private/local IP is blocked'));
+        }
+        if (options.all) return callback(null, addrs);
+        callback(null, addrs[0].address, addrs[0].family);
+    });
+}
+const _ssrfHttpAgent = new http.Agent({ lookup: _ssrfSafeLookup });
+const _ssrfHttpsAgent = new https.Agent({ lookup: _ssrfSafeLookup });
+const _ssrfAgentFor = (parsedUrl) => parsedUrl.protocol === 'http:' ? _ssrfHttpAgent : _ssrfHttpsAgent;
+
+const SAFE_FETCH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36';
+
+// クライアントから渡された任意ヘッダーのうち、中継に不適切なものを除去する（大文字小文字の違いも吸収）
+const _OUTGOING_BLOCKED_HEADERS = new Set([
+    'host', 'origin', 'referer', 'content-length', 'connection', 'transfer-encoding', 'upgrade', 'te', 'trailer',
+    'keep-alive', 'expect', 'forwarded', 'via', 'x-real-ip', 'cf-connecting-ip', 'true-client-ip', 'x-client-ip',
+    'x-original-url', 'x-rewrite-url', 'x-http-method-override', 'user-agent',
+]);
+function _cleanOutgoingHeaders(input) {
+    const out = {};
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return out;
+    let n = 0;
+    for (const [k, v] of Object.entries(input)) {
+        if (++n > 50) break;
+        const name = String(k).toLowerCase();
+        if (!/^[a-z0-9!#$%&'*+.^_`|~-]{1,64}$/.test(name)) continue;
+        if (_OUTGOING_BLOCKED_HEADERS.has(name) || name.startsWith('proxy-') || name.startsWith('x-forwarded-') || name.startsWith('sec-')) continue;
+        if (typeof v !== 'string' || v.length > 4096 || /[\r\n\0]/.test(v)) continue;
+        out[name] = v;
+    }
+    return out;
+}
+
+// 検証つきfetch。リダイレクトは手動で1ホップずつ追い、毎回 assertSafeUrl を通す。
+// 返す finish() は、レスポンス本文を読み終えた/中断した時に必ず呼ぶ（全体タイムアウトの解除）。
+async function safeFetch(startUrl, { method = 'GET', headers = {}, body = null, maxRedirects = 5, timeoutMs = 15000 } = {}) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    const finish = () => clearTimeout(timer);
+    try {
+        let currentUrl = startUrl;
+        let m = method;
+        let b = body;
+        let h = { ...headers };
+        for (let hop = 0; hop <= maxRedirects; hop++) {
+            const parsed = await assertSafeUrl(currentUrl);
+            const response = await fetch(parsed.href, {
+                method: m,
+                headers: h,
+                body: (m === 'GET' || m === 'HEAD') ? undefined : (b || undefined),
+                redirect: 'manual',
+                agent: _ssrfAgentFor,
+                signal: ac.signal,
+                compress: true,
+            });
+            const loc = response.headers.get('location');
+            if (response.status >= 300 && response.status < 400 && loc) {
+                try { response.body.destroy(); } catch { /* ignore */ }
+                if (hop === maxRedirects) throw new SsrfError('Too many redirects');
+                const next = new URL(loc, parsed);
+                if (next.origin !== parsed.origin) {
+                    // 別オリジンへのリダイレクトでは認証情報・Cookieを持ち越さない
+                    h = { ...h };
+                    delete h['authorization']; delete h['cookie']; delete h['proxy-authorization'];
+                }
+                if (response.status === 303 || ((response.status === 301 || response.status === 302) && m === 'POST')) {
+                    m = 'GET'; b = null;
+                    h = { ...h }; delete h['content-type'];
+                }
+                currentUrl = next.href;
+                continue;
+            }
+            return { response, finalUrl: parsed.href, finish };
+        }
+        throw new SsrfError('Too many redirects');
+    } catch (e) {
+        finish();
+        throw e;
+    }
+}
+
+// 受信バイト数に上限をかけるTransform（上限超過でストリームをエラー終了させる）
+function _byteLimiter(maxBytes, onBytes) {
+    let total = 0;
+    return new Transform({
+        transform(chunk, _enc, cb) {
+            total += chunk.length;
+            if (onBytes) onBytes(chunk.length);
+            if (total > maxBytes) return cb(new Error('Response too large'));
+            cb(null, chunk);
+        },
+    });
+}
+async function _readBodyLimited(stream, maxBytes) {
+    const chunks = [];
+    let total = 0;
+    for await (const c of stream) {
+        total += c.length;
+        if (total > maxBytes) { try { stream.destroy(); } catch { /* ignore */ } throw new Error('Response too large'); }
+        chunks.push(c);
+    }
+    return Buffer.concat(chunks);
+}
+
+// 抽出したHTMLからスクリプト・イベントハンドラ・危険なURLを除去（XSS対策）
+function _sanitizeExtractedHtml(html) {
+    if (typeof html !== 'string') return html;
+    const dom = new JSDOM(`<body>${html}</body>`);
+    const doc = dom.window.document;
+    doc.querySelectorAll('script,style,iframe,frame,frameset,object,embed,applet,form,input,button,textarea,select,link,meta,base,svg,math,noscript,template')
+        .forEach(n => n.remove());
+    doc.querySelectorAll('*').forEach(el => {
+        for (const attr of Array.from(el.attributes)) {
+            const name = attr.name.toLowerCase();
+            if (name.startsWith('on') || name === 'style' || name === 'srcdoc' || name === 'formaction') { el.removeAttribute(attr.name); continue; }
+            if (['href', 'src', 'xlink:href', 'action', 'poster', 'data'].includes(name)) {
+                const compact = attr.value.replace(/[\u0000-\u0020\u007f-\u009f]/g, '').toLowerCase();
+                const okDataImg = name === 'src' && /^data:image\/(png|jpe?g|gif|webp);/.test(compact);
+                if (/^(javascript|vbscript|data):/.test(compact) && !okDataImg) el.removeAttribute(attr.name);
+            }
+        }
+    });
+    return doc.body.innerHTML;
+}
+
+// [SEC] "/" と "\" を含むメールはFirestoreのドキュメントパスを壊す（別パスを指せてしまう）ので受け付けない
 function isValidEmail(email) {
-    return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
+    return typeof email === 'string' && /^[^\s@\/\\]+@[^\s@\/\\]+\.[^\s@\/\\]+$/.test(email) && email.length <= 254;
 }
 
 function sanitizeString(str, maxLen) {
     return typeof str === 'string' ? str.trim().slice(0, maxLen) : '';
+}
+
+// [SEC] JWT検証は必ずアルゴリズムを固定する（alg 差し替え攻撃の余地を消す）。sign側は既定の HS256。
+function verifyJwt(token) {
+    return jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+}
+
+// [SEC] Firestoreのドキュメントidとして安全か（"/" や "." ".." "__x__" はパス/予約名になるため拒否）
+function _isSafeDocId(id) {
+    return typeof id === 'string' && id.length >= 1 && id.length <= 200
+        && !/[\/\\\u0000-\u001f\u007f]/.test(id) && id !== '.' && id !== '..' && !/^__.*__$/.test(id);
+}
+
+// 表示名などから制御文字と < > を除く（クライアントが innerHTML で描画しても事故らないように）
+function _cleanLabel(str, maxLen) {
+    return sanitizeString(str, maxLen * 2).replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, maxLen);
+}
+
+// 失敗回数ベースの制限（招待コードの総当たり対策）。成功は数えない。
+const _failMap = new Map();
+function _failBlocked(key, max, windowMs) {
+    const now = Date.now();
+    const arr = (_failMap.get(key) || []).filter(t => now - t < windowMs);
+    if (arr.length) _failMap.set(key, arr); else _failMap.delete(key);
+    return arr.length >= max;
+}
+function _failRecord(key) {
+    const arr = _failMap.get(key) || [];
+    arr.push(Date.now());
+    _failMap.set(key, arr);
+    if (_failMap.size > 5000) {
+        const now = Date.now();
+        for (const [k, ts] of _failMap.entries()) if (ts.every(t => now - t > 3_600_000)) _failMap.delete(k);
+    }
+}
+
+// 汎用の「キー単位」レート制限（ユーザー単位など）。_nearbyRateLimit と同じ仕組みを流用。
+const _keyedRateLimit = (key, action, maxRequests, windowMs) => _nearbyRateLimit(key, action, maxRequests, windowMs);
+
+// Socket.IO ハンドシェイクからクライアントIPを取る。trust proxy=1 なので、信頼できるのは
+// X-Forwarded-For の「いちばん右」（直前のプロキシが付けた値）。左側はクライアントが偽装できる。
+function _clientIpFromHandshake(handshake) {
+    const xff = handshake.headers?.['x-forwarded-for'];
+    if (typeof xff === 'string' && xff) {
+        const parts = xff.split(',').map(x => x.trim()).filter(Boolean);
+        if (parts.length) return parts[parts.length - 1];
+    }
+    return handshake.address || 'unknown';
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -165,6 +401,7 @@ const COLLAB_ROLES = ['viewer', 'commenter', 'editor', 'owner'];
 const COLLAB_ROLE_RANK = { viewer: 0, commenter: 1, editor: 2, owner: 3 };
 const COLLAB_INVITE_MAX_USES = 200;
 const COLLAB_INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 招待コードの既定有効期限: 7日
+const COLLAB_INVITE_MAX_ACTIVE_PER_DOC = 30;           // 1ドキュメントで同時に有効な招待コードの上限
 
 // [FIX] Firestoreの update({ 'collaborators.user@gmail.com': role }) は「.」をフィールドパスの区切りと
 // 解釈するため、実際には collaborators.user@gmail.com という入れ子 { 'user@gmail': { com: role } } で
@@ -266,6 +503,7 @@ async function _collabSetRole(docRef, docData, email, role) {
         const next = _collabNormalize(raw);
         if (role) next[email] = role; else delete next[email];
         await docRef.update({ collaborators: next, memberEmails: [docData.ownerEmail, ...Object.keys(next)], updatedAt: Date.now() });
+        _collabInvalidateRoles(docRef.id);
         return;
     }
     await docRef.update(
@@ -274,17 +512,26 @@ async function _collabSetRole(docRef, docData, email, role) {
         'memberEmails', role ? admin.firestore.FieldValue.arrayUnion(email) : admin.firestore.FieldValue.arrayRemove(email),
         'updatedAt', Date.now()
     );
+    _collabInvalidateRoles(docRef.id);
 }
+
+class CollabJoinError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
 
 // 招待コード or 共有リンクのコードから、参加先ドキュメントと付与する権限を解決する
 async function _collabResolveJoinCode(rawCode) {
     const code = sanitizeString(rawCode, 40).toUpperCase();
     if (!code) return { error: [400, '招待コードを入力してください'] };
+    // [SEC] コードはFirestoreのドキュメントidとして使うので、生成される文字種だけに絞る（"/" 等でパスを壊されない）
+    if (!/^[A-Z0-9-]{4,40}$/.test(code)) return { error: [404, '招待コードが無効です'] };
     const inviteSnap = await collabInvitesCol().doc(code).get();
     if (inviteSnap.exists) {
         const invite = inviteSnap.data();
-        if (invite.expiresAt < Date.now()) return { error: [410, '招待コードの有効期限が切れています'] };
-        if (invite.uses >= invite.maxUses) return { error: [410, '招待コードの利用上限に達しています'] };
+        // 数値でない/欠けている値は「無効」扱い（比較が常に false になって素通りするのを防ぐ）
+        if (!(Number(invite.expiresAt) >= Date.now())) return { error: [410, '招待コードの有効期限が切れています'] };
+        if (!((Number(invite.uses) || 0) < (Number(invite.maxUses) || 0))) return { error: [410, '招待コードの利用上限に達しています'] };
+        if (!COLLAB_LINK_ROLES.includes(invite.role) || invite.role === 'none' || !_isSafeDocId(invite.docId)) {
+            return { error: [404, '招待コードが無効です'] };
+        }
         const docRef = collabDocsCol().doc(invite.docId);
         const docSnap = await docRef.get();
         if (!docSnap.exists) return { error: [404, 'ドキュメントが見つかりません'] };
@@ -300,15 +547,36 @@ async function _collabResolveJoinCode(rawCode) {
 }
 
 // 解決済みの招待で email を参加させる（既存の権限より低くは下げない）。更新後のドキュメントを返す。
+// [SEC] 招待コードの使用回数は「権限を付ける前に」トランザクションで確保する。
+// 以前は「権限付与 → あとから +1」だったため、同時に何人も参加すると maxUses を超えて参加できた。
+// すでに同等以上の権限を持つ人（オーナー含む）は、使用回数を消費しない。
 async function _collabJoinWith(resolved, email) {
     const { docRef, docData, role, inviteRef } = resolved;
-    if (docData.ownerEmail !== email) {
-        const cur = _collabRoleOf(docData, email);
-        if (!cur || COLLAB_ROLE_RANK[role] > (COLLAB_ROLE_RANK[cur] ?? -1)) {
+    const cur = docData.ownerEmail === email ? 'owner' : _collabRoleOf(docData, email);
+    const needsGrant = !cur || COLLAB_ROLE_RANK[role] > (COLLAB_ROLE_RANK[cur] ?? -1);
+    if (needsGrant) {
+        if (inviteRef) {
+            const reserved = await db.runTransaction(async (tx) => {
+                const snap = await tx.get(inviteRef);
+                if (!snap.exists) return false;
+                const inv = snap.data();
+                const uses = Number(inv.uses) || 0;
+                if (!(Number(inv.expiresAt) >= Date.now()) || uses >= (Number(inv.maxUses) || 0)) return false;
+                tx.update(inviteRef, { uses: uses + 1 });
+                return true;
+            });
+            if (!reserved) throw new CollabJoinError(410, '招待コードの有効期限が切れているか、利用上限に達しています');
+            try {
+                await _collabSetRole(docRef, docData, email, role);
+            } catch (e) {
+                // 権限付与に失敗したら、確保した使用回数を返す
+                inviteRef.update({ uses: admin.firestore.FieldValue.increment(-1) }).catch(() => { });
+                throw e;
+            }
+        } else {
             await _collabSetRole(docRef, docData, email, role);
         }
     }
-    if (inviteRef) await inviteRef.update({ uses: admin.firestore.FieldValue.increment(1) });
     return (await docRef.get()).data();
 }
 
@@ -337,7 +605,92 @@ function _generateInviteCode() {
 // 共同編集: カーソル状態追跡 & オペレーション変換（OT競合解消）
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const _collabRoomCursors = new Map(); // docId -> Map<email, { docId, from, displayName, color, cursor, updatedAt }>
-const _collabDocStates = new Map();   // docId -> { pages: Map<pageIndex, { rev, opsHistory: [] }> }
+const _collabDocStates = new Map();   // docId -> { lastActive, pages: Map<pageIndex, { rev, opsHistory: [] }> }
+
+// [SEC] 共同編集のリアルタイム操作で使う入力の上限
+const COLLAB_MAX_PAGES = 500;                  // 1ドキュメントのページ数上限（PUT /content と同じ）
+const COLLAB_OP_MAX_HTML = 4_000_000;          // full 操作で送れるHTMLの最大文字数
+const COLLAB_OP_MAX_INSERT = 600_000;          // patch.insert の最大文字数（クライアントの閾値 500,000 に余裕を持たせた値）
+const COLLAB_SNAPSHOT_MAX_CHARS = 5_000_000;   // スナップショット全体の最大文字数
+const COLLAB_MAX_ROOMS_PER_SOCKET = 30;        // 1接続が同時に参加できるドキュメント数
+
+// [SEC] 権限を毎イベントFirestoreで読むと重いので、ごく短時間だけキャッシュする。
+// 権限を変える全ての経路（_collabSetRole / 一括操作 / 解除）で invalidate するので、反映の遅れは出ない。
+// （サーバーを複数台にする場合は、TTL（5秒）が最大の反映遅延になる）
+const COLLAB_ROLE_CACHE_TTL = 5000;
+const _collabRoleCache = new Map(); // `${docId}\n${email}` -> { role, exp }
+function _collabRoleCacheSet(docId, email, role) {
+    if (_collabRoleCache.size > 20000) _collabRoleCache.clear();
+    _collabRoleCache.set(`${docId}\n${email}`, { role, exp: Date.now() + COLLAB_ROLE_CACHE_TTL });
+}
+function _collabInvalidateRoles(docId) {
+    const prefix = `${docId}\n`;
+    for (const k of _collabRoleCache.keys()) if (k.startsWith(prefix)) _collabRoleCache.delete(k);
+}
+async function _collabGetRole(docId, email) {
+    const key = `${docId}\n${email}`;
+    const hit = _collabRoleCache.get(key);
+    if (hit && hit.exp > Date.now()) return hit.role;
+    const snap = await collabDocsCol().doc(docId).get();
+    const role = snap.exists ? _collabRoleOf(snap.data(), email) : null;
+    _collabRoleCacheSet(docId, email, role);
+    return role;
+}
+
+// 共有解除などで権限を失ったユーザーを、リアルタイムの部屋・カーソル表示から即座に外す
+function _collabKick(docId, email) {
+    _collabInvalidateRoles(docId);
+    io.in(_userRoom(email)).socketsLeave(`collab:${docId}`);
+    const rc = _collabRoomCursors.get(docId);
+    if (rc && rc.delete(email)) {
+        io.to(`collab:${docId}`).emit('collab_cursor_remove', { docId, from: email });
+        if (rc.size === 0) _collabRoomCursors.delete(docId);
+    }
+    io.to(`collab:${docId}`).emit('collab_presence_left', { docId, email });
+}
+
+// 誰もいない部屋の編集状態（リビジョン・履歴）がメモリに溜まり続けないよう、30分使われなければ捨てる
+setInterval(() => {
+    const now = Date.now();
+    for (const [docId, st] of _collabDocStates) {
+        const occupied = (io.sockets.adapter.rooms.get(`collab:${docId}`)?.size || 0) > 0;
+        if (!occupied && now - (st.lastActive || 0) > 30 * 60_000) _collabDocStates.delete(docId);
+    }
+}, 10 * 60_000).unref();
+
+// collab_op の中身を検証し、既知のフィールドだけを取り出した新しいオブジェクトを返す（不正なら null）
+function _collabValidateOp(op) {
+    if (!op || typeof op !== 'object' || Array.isArray(op)) return null;
+    const pageIndex = op.pageIndex === undefined ? 0 : op.pageIndex;
+    if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= COLLAB_MAX_PAGES) return null;
+    const clean = { pageIndex };
+    if (typeof op.clientOpId === 'string' && op.clientOpId.length <= 100) clean.clientOpId = op.clientOpId;
+    if (op.baseRev !== undefined && op.baseRev !== null) {
+        const b = Number(op.baseRev);
+        if (!Number.isInteger(b) || b < 0) return null;
+        clean.baseRev = b;
+    }
+    if (op.baseLen !== undefined && op.baseLen !== null) {
+        const bl = Number(op.baseLen);
+        if (Number.isFinite(bl) && bl >= 0) clean.baseLen = bl;
+    }
+    if (op.full) {
+        if (typeof op.html !== 'string' || op.html.length > COLLAB_OP_MAX_HTML) return null;
+        clean.full = true;
+        clean.html = op.html;
+        return clean;
+    }
+    const p = op.patch;
+    if (!p || typeof p !== 'object') return null;
+    const start = Number(p.start);
+    const delCount = Number(p.delCount ?? 0);
+    const insert = p.insert === undefined ? '' : p.insert;
+    if (!Number.isInteger(start) || start < 0 || start > 50_000_000) return null;
+    if (!Number.isInteger(delCount) || delCount < 0 || delCount > 50_000_000) return null;
+    if (typeof insert !== 'string' || insert.length > COLLAB_OP_MAX_INSERT) return null;
+    clean.patch = { start, delCount, insert };
+    return clean;
+}
 
 function _transformPatch(p1, p2) {
     if (!p1 || !p2) return p1;
@@ -594,7 +947,7 @@ function requireAuth(req, res, next) {
     if (!token) return res.status(401).json({ error: '認証が必要です' });
     if (!JWT_SECRET) return res.status(500).json({ error: 'サーバー設定エラー' });
     try {
-        req.user = jwt.verify(token, JWT_SECRET);
+        req.user = verifyJwt(token);
     } catch {
         return res.status(401).json({ error: 'トークンが無効または期限切れです' });
     }
@@ -609,7 +962,7 @@ function requireCollabAuth(req, res, next) {
     if (!token) return res.status(401).json({ error: '認証が必要です' });
     if (!JWT_SECRET) return res.status(500).json({ error: 'サーバー設定エラー' });
     try {
-        req.user = jwt.verify(token, JWT_SECRET);
+        req.user = verifyJwt(token);
         next();
     } catch {
         res.status(401).json({ error: 'トークンが無効または期限切れです' });
@@ -623,7 +976,7 @@ function optionalAuth(req, res, next) {
     const token = req.headers['authorization']?.replace('Bearer ', '');
     req.user = null;
     if (token && JWT_SECRET) {
-        try { req.user = jwt.verify(token, JWT_SECRET); if (req.user.guest) req.user = null; } catch { /* 未認証として扱う */ }
+        try { req.user = verifyJwt(token); if (req.user.guest) req.user = null; } catch { /* 未認証として扱う */ }
     }
     next();
 }
@@ -741,15 +1094,24 @@ app.post('/getSidebarData', requireAuth, async (req, res) => {
     } catch (e) { console.error('getSidebarData error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/getUsersData', async (req, res) => {
+// [SEC] 認証必須 + 「自分・友達・受信/送信中の友達申請」の相手だけに限定。
+// 以前は認証なしで任意のメールアドレス一覧を渡すと、表示名・アイコン・公開鍵をまとめて取得できた（アカウント列挙）。
+app.post('/getUsersData', requireAuth, async (req, res) => {
     try {
-        const { emails = [] } = req.body;
+        const me = req.user.email;
+        const raw = Array.isArray(req.body?.emails) ? req.body.emails : [];
+        const emails = [...new Set(raw.filter(isValidEmail))].slice(0, 100);
         const usersData = {};
         if (emails.length === 0) return res.json({ usersData });
+        if (!_keyedRateLimit(`u:${me}`, 'getUsersData', 60, 60_000)) return res.status(429).json({ error: 'リクエストが多すぎます' });
+
+        const meData = await getUser(me);
+        const allowed = new Set([me, ...(meData?.friends || []), ...(meData?.requests || []), ...(meData?.sentRequests || [])]);
+        const targets = emails.filter(e => allowed.has(e));
+
         const chunks = [];
-        for (let i = 0; i < emails.length; i += 30) chunks.push(emails.slice(i, i + 30));
+        for (let i = 0; i < targets.length; i += 30) chunks.push(targets.slice(i, i + 30));
         for (const chunk of chunks) {
-            if (chunk.length === 0) continue;
             const snaps = await usersCol().where(admin.firestore.FieldPath.documentId(), 'in', chunk).get();
             snaps.forEach(doc => {
                 const d = doc.data();
@@ -757,7 +1119,7 @@ app.post('/getUsersData', async (req, res) => {
             });
         }
         res.json({ usersData });
-    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+    } catch (e) { console.error('getUsersData error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/getMessageHistory', requireAuth, async (req, res) => {
@@ -812,7 +1174,8 @@ app.get('/search', async (req, res) => {
 });
 
 let totalDataProxied = 0;
-app.get('/getProxyStats', (req, res) => {
+// [SEC] 認証必須（以前は誰でも利用状況を取得できた）
+app.get('/getProxyStats', requireAuth, (req, res) => {
     res.json({ totalDataProxied, totalDataProxiedMB: (totalDataProxied / (1024 * 1024)).toFixed(2) });
 });
 
@@ -844,45 +1207,63 @@ app.get('/iframe-helper.js', (req, res) => {
     res.sendFile(path.join(__dirname, 'iframe-helper.js'));
 });
 
-app.post('/proxy', async (req, res) => {
+const PROXY_MAX_BYTES = 25 * 1024 * 1024;   // 1リクエストで中継するレスポンスの上限
+const PROXY_MAX_REQUEST_BODY = 1_400_000;    // 中継するリクエストボディ(base64文字数)の上限
+const _PROXY_ALLOWED_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS'];
+
+function _proxyHeadersJson(headers) {
+    const obj = {};
+    for (const [k, v] of headers) {
+        const lk = k.toLowerCase();
+        if (lk === 'set-cookie' || lk === 'set-cookie2') continue;   // 第三者サイトのCookieは中継しない
+        obj[lk] = v;
+    }
+    // HTTPヘッダーに載せられるよう ASCII にエスケープ（JSONとしては同じ内容）
+    let json = JSON.stringify(obj).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+    if (json.length > 8000) json = '{}';
+    return json;
+}
+
+// [SEC] 認証必須 + SSRF対策（DNSリバインディング・リダイレクト・ポート・サイズ/時間の上限）
+app.post('/proxy', requireAuth, async (req, res) => {
+    let finish = () => { };
     try {
-        const { url, method, headers, body } = req.body;
-        if (!url) return res.status(400).send('URL is required.');
-        if (!_rateLimit(req, 'proxy', 30)) return res.status(429).send('Rate limit exceeded.');
-
-        await assertSafeUrl(url);
-
-        const fetchOptions = {
-            method: (typeof method === 'string' && ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) ? method.toUpperCase() : 'GET',
-            headers: (headers && typeof headers === 'object' && !Array.isArray(headers)) ? { ...headers } : {},
-            body: (body && typeof body === 'string') ? Buffer.from(body, 'base64') : null,
-            redirect: 'manual'
-        };
-        delete fetchOptions.headers['host'];
-        delete fetchOptions.headers['origin'];
-        delete fetchOptions.headers['referer'];
-        delete fetchOptions.headers['content-length'];
-        fetchOptions.headers['user-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36';
-
-        let currentUrl = url;
-        let response;
-        for (let hop = 0; hop < 5; hop++) {
-            await assertSafeUrl(currentUrl);
-            response = await fetch(currentUrl, fetchOptions);
-            if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
-                const nextUrl = new URL(response.headers.get('location'), currentUrl).href;
-                await assertSafeUrl(nextUrl);
-                currentUrl = nextUrl;
-                continue;
-            }
-            break;
+        const { url, method, headers, body } = req.body || {};
+        if (!url || typeof url !== 'string') return res.status(400).send('URL is required.');
+        if (!_rateLimit(req, 'proxy', 30) || !_keyedRateLimit(`u:${req.user.email}`, 'proxy', 60, 60_000)) {
+            return res.status(429).send('Rate limit exceeded.');
         }
+        const m = (typeof method === 'string' && _PROXY_ALLOWED_METHODS.includes(method.toUpperCase())) ? method.toUpperCase() : 'GET';
+        let bodyBuf = null;
+        if (body && typeof body === 'string' && m !== 'GET' && m !== 'HEAD') {
+            if (body.length > PROXY_MAX_REQUEST_BODY) return res.status(413).send('Request body too large.');
+            bodyBuf = Buffer.from(body, 'base64');
+        }
+        const outHeaders = _cleanOutgoingHeaders(headers);
+        outHeaders['user-agent'] = SAFE_FETCH_UA;
 
-        res.setHeader('x-proxy-headers', JSON.stringify(Object.fromEntries(response.headers)));
-        response.body.pipe(res);
+        const r = await safeFetch(url, { method: m, headers: outHeaders, body: bodyBuf, maxRedirects: 5, timeoutMs: 20000 });
+        finish = r.finish;
+        const { response } = r;
+
+        res.setHeader('x-proxy-headers', _proxyHeadersJson(response.headers));
+        const ct = response.headers.get('content-type');
+        if (ct && /^[\x20-\x7e]{1,200}$/.test(ct)) res.setHeader('Content-Type', ct);
+        // 中継した第三者のHTMLがこのサーバーのオリジンでスクリプト実行されないよう、サンドボックス化する
+        res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+
+        pipeline(response.body, _byteLimiter(PROXY_MAX_BYTES, (n) => { totalDataProxied += n; }), res, (err) => {
+            finish();
+            if (err && err.message !== 'Premature close') console.warn('Proxy stream ended early:', err.message);
+        });
     } catch (e) {
+        finish();
         console.error('Proxy error:', e.message);
-        res.status(500).send(e.message || 'Proxy error');
+        if (res.headersSent) return res.end();
+        if (e instanceof SsrfError) return res.status(400).send('このURLにはアクセスできません。');
+        if (e && e.name === 'AbortError') return res.status(504).send('Upstream timeout.');
+        res.status(502).send('Proxy error');
     }
 });
 
@@ -902,32 +1283,49 @@ app.get('/youtube-search', async (req, res) => {
 
 const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
-app.get('/extract', async (req, res) => {
+const EXTRACT_MAX_BYTES = 5 * 1024 * 1024;
+// [SEC] 認証必須 + SSRF対策。以前は axios の beforeRedirect が async で、検証が待たれず
+// リダイレクト経由で内部アドレスに到達できた。safeFetch で1ホップずつ検証する方式に変更。
+// 返す content もスクリプト等を除去（サニタイズ）してから返す。
+app.get('/extract', requireAuth, async (req, res) => {
     const url = req.query.url;
     if (!url || typeof url !== 'string') return res.status(400).json({ error: 'URL parameter is required.' });
-    if (!_rateLimit(req, 'extract', 20)) return res.status(429).json({ error: 'Rate limit exceeded.' });
+    if (!_rateLimit(req, 'extract', 20) || !_keyedRateLimit(`u:${req.user.email}`, 'extract', 30, 60_000)) {
+        return res.status(429).json({ error: 'Rate limit exceeded.' });
+    }
+    let finish = () => { };
     try {
-        await assertSafeUrl(url);
-        const response = await axios.get(url, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-            timeout: 10000,
-            maxRedirects: 5,
-            maxContentLength: 5 * 1024 * 1024,
-            beforeRedirect: async (options, responseDetails) => {
-                const redirectUrl = new URL(responseDetails.headers.location, url).href;
-                await assertSafeUrl(redirectUrl);
-            }
+        const r = await safeFetch(url, {
+            headers: { 'user-agent': SAFE_FETCH_UA, 'accept': 'text/html,application/xhtml+xml' },
+            maxRedirects: 5, timeoutMs: 12000,
         });
-        const dom = new JSDOM(response.data, { url });
+        finish = r.finish;
+        const ct = (r.response.headers.get('content-type') || '').toLowerCase();
+        if (ct && !/^(text\/html|application\/xhtml\+xml|text\/plain)/.test(ct)) {
+            try { r.response.body.destroy(); } catch { /* ignore */ }
+            return res.status(415).json({ error: 'HTMLページ以外は読み込めません。' });
+        }
+        if (!r.response.ok) {
+            try { r.response.body.destroy(); } catch { /* ignore */ }
+            return res.status(502).json({ error: 'ページの読み込みまたは解析に失敗しました。' });
+        }
+        const html = (await _readBodyLimited(r.response.body, EXTRACT_MAX_BYTES)).toString('utf8');
+        const dom = new JSDOM(html, { url: r.finalUrl });
         const article = new Readability(dom.window.document).parse();
         if (article) {
-            res.json({ title: article.title, content: article.content, textContent: article.textContent, author: article.byline, length: article.length });
+            res.json({
+                title: article.title, content: _sanitizeExtractedHtml(article.content),
+                textContent: article.textContent, author: article.byline, length: article.length,
+            });
         } else {
             res.status(404).json({ error: '記事のコンテンツを抽出できませんでした。' });
         }
     } catch (e) {
         console.error('Extract error:', e.message);
+        if (e instanceof SsrfError) return res.status(400).json({ error: 'このURLにはアクセスできません。' });
         res.status(500).json({ error: 'ページの読み込みまたは解析に失敗しました。' });
+    } finally {
+        finish();
     }
 });
 
@@ -1303,17 +1701,50 @@ app.delete('/store/apps/:id/comments/:commentId', requireAuth, async (req, res) 
 // 認証済みでも「emailを名乗るだけで他人になりすませる」問題を防ぐため、
 // ここで検証したJWTのemailだけを socket.verifiedEmail として以後ずっと使う。
 // 接続時にトークンが無い/無効なクライアントは接続自体を拒否する。
-io.use((socket, next) => {
-    if (!JWT_SECRET) return next(new Error('サーバー設定エラー'));
-    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
-    if (!token) return next(new Error('認証が必要です'));
+// [SEC] 接続時の認証を強化:
+//  - トークンは handshake.auth だけから受け取る（URLのクエリは、アクセスログ・履歴にトークンが残るため廃止）
+//  - JWTのアルゴリズムを固定して検証
+//  - トークンの中身（email形式・guest フラグとメールドメインの整合）を検証
+//  - 「トークンは有効だがアカウント/ゲストがもう存在しない」接続を拒否（削除済みアカウントの居座り防止）
+//  - IPごとの接続試行回数・アカウントごとの同時接続数に上限
+const SOCKET_MAX_PER_USER = 20;
+const _authExistCache = new Map(); // email -> expireAt（Firestoreの読み取りを減らすための短いキャッシュ）
+async function _accountStillExists(email, isGuest) {
+    const hit = _authExistCache.get(email);
+    if (hit && hit > Date.now()) return true;
+    const snap = isGuest ? await collabGuestsCol().doc(email).get() : await usersCol().doc(email).get();
+    if (!snap.exists) return false;
+    if (_authExistCache.size > 5000) _authExistCache.clear();
+    _authExistCache.set(email, Date.now() + 60_000);
+    return true;
+}
+
+io.use(async (socket, next) => {
     try {
-        const payload = jwt.verify(token, JWT_SECRET);
+        if (!JWT_SECRET) return next(new Error('サーバー設定エラー'));
+        const ip = _clientIpFromHandshake(socket.handshake);
+        if (!_keyedRateLimit(`ip:${ip}`, 'socket-connect', 60, 60_000)) return next(new Error('接続の試行が多すぎます。しばらく待ってください'));
+
+        const token = socket.handshake.auth?.token;
+        if (!token || typeof token !== 'string' || token.length > 4096) return next(new Error('認証が必要です'));
+        let payload;
+        try { payload = verifyJwt(token); } catch { return next(new Error('トークンが無効または期限切れです')); }
+
+        const isGuest = payload.guest === true;
+        if (!isValidEmail(payload.email) || isGuest !== _collabIsGuestEmail(payload.email)) {
+            return next(new Error('トークンが無効または期限切れです'));
+        }
+        if (!(await _accountStillExists(payload.email, isGuest))) return next(new Error('トークンが無効または期限切れです'));
+        if ((io.sockets.adapter.rooms.get(_userRoom(payload.email))?.size || 0) >= SOCKET_MAX_PER_USER) {
+            return next(new Error('同時接続数の上限に達しています'));
+        }
         socket.verifiedEmail = payload.email;
-        socket.isGuest = !!payload.guest;
+        socket.isGuest = isGuest;
+        socket.tokenExpiresAt = payload.exp ? payload.exp * 1000 : null;
         next();
-    } catch {
-        next(new Error('トークンが無効または期限切れです'));
+    } catch (e) {
+        console.error('socket auth error:', e);
+        next(new Error('サーバーエラー'));
     }
 });
 
@@ -1328,6 +1759,42 @@ io.on('connection', (socket) => {
     if (socket.isGuest) {
         socket.use(([ev], next) => (typeof ev === 'string' && ev.startsWith('collab_')) ? next() : next(new Error('ゲストはこの操作を行えません')));
     }
+
+    // [SEC] イベントのレート制限（接続ごとのトークンバケット）。通常利用では到達しない余裕のある値にしてあり、
+    // 超えた分は黙って捨てる（ackがあれば rate_limited を返す）。メモリ・DB・帯域の浪費を防ぐ。
+    const _bucket = (capacity, refillPerSec) => {
+        let tokens = capacity, last = Date.now();
+        return () => {
+            const now = Date.now();
+            tokens = Math.min(capacity, tokens + ((now - last) / 1000) * refillPerSec);
+            last = now;
+            if (tokens >= 1) { tokens -= 1; return true; }
+            return false;
+        };
+    };
+    const allowAny = _bucket(300, 150);
+    const allowCollabOp = _bucket(100, 50);
+    const allowCollabCursor = _bucket(80, 40);
+    const allowCollabOther = _bucket(30, 10);
+    socket.use(([ev, ...args], next) => {
+        let ok = allowAny();
+        if (ok && typeof ev === 'string' && ev.startsWith('collab_')) {
+            ok = ev === 'collab_op' ? allowCollabOp() : ev === 'collab_cursor' ? allowCollabCursor() : allowCollabOther();
+        }
+        if (ok) return next();
+        const cb = args[args.length - 1];
+        if (typeof cb === 'function') { try { cb({ error: 'rate_limited' }); } catch (_) { } }
+    });
+
+    // [SEC] 接続したままトークンの期限が切れても居座れないよう、期限が来たら切断する
+    if (socket.tokenExpiresAt) {
+        const ms = socket.tokenExpiresAt - Date.now();
+        if (ms <= 0) { socket.disconnect(true); return; }
+        const expTimer = setTimeout(() => socket.disconnect(true), Math.min(ms, 2 ** 31 - 1));
+        expTimer.unref?.();
+        socket.on('disconnect', () => clearTimeout(expTimer));
+    }
+    socket.collabSnapReq = new Map(); // docId -> スナップショットを要求した時刻（collab_snapshot_response の検証用）
 
     const DEFAULT_ICE_SERVERS = [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -1389,15 +1856,42 @@ io.on('connection', (socket) => {
     // 共同編集（Office系アプリ共通基盤）: ルーム参加・操作同期・カーソル共有
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const _collabJoinedRooms = new Set(); // このsocketが参加中のdocIdの集合（disconnect時の後片付け用）
+    const _collabRoom = (docId) => `collab:${docId}`;
+
+    // [SEC] 全 collab_* ハンドラ共通のラッパー:
+    //  - payload が null・配列・関数などでも落ちない（分割代入の TypeError でプロセスごと落ちるのを防ぐ）
+    //  - ackコールバックが関数でない場合も安全に扱う
+    //  - 例外は握りつぶさずログに残し、ackがあれば Server error を返す
+    const onCollab = (event, handler) => {
+        socket.on(event, async (...args) => {
+            const cb = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+            const payload = (args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) ? args[0] : {};
+            try {
+                await handler(payload, cb);
+            } catch (e) {
+                console.error(`${event} error:`, e);
+                if (cb) { try { cb({ error: 'Server error' }); } catch (_) { } }
+            }
+        });
+    };
 
     const _cleanupCollabRoom = (docId) => {
-        socket.to(`collab:${docId}`).emit('collab_presence_left', { docId, email: currentUserEmail });
+        socket.to(_collabRoom(docId)).emit('collab_presence_left', { docId, email: currentUserEmail });
         const rc = _collabRoomCursors.get(docId);
         if (rc) {
             rc.delete(currentUserEmail);
             if (rc.size === 0) _collabRoomCursors.delete(docId);
         }
-        socket.to(`collab:${docId}`).emit('collab_cursor_remove', { docId, from: currentUserEmail });
+        socket.to(_collabRoom(docId)).emit('collab_cursor_remove', { docId, from: currentUserEmail });
+    };
+
+    // 権限を失っているのにまだ部屋に残っていた接続を、その場で外す（イベント到着時の自己修復）
+    const _dropFromRoom = (docId) => {
+        if (!_collabJoinedRooms.has(docId)) return;
+        socket.leave(_collabRoom(docId));
+        _collabJoinedRooms.delete(docId);
+        _cleanupCollabRoom(docId);
+        socket.emit('collab_permission_changed', { docId, role: null });
     };
 
     socket.on('disconnect', () => {
@@ -1412,142 +1906,149 @@ io.on('connection', (socket) => {
         _collabJoinedRooms.clear();
     });
 
-    socket.on('collab_join_room', async ({ docId }, callback) => {
-        try {
-            if (!docId || typeof docId !== 'string') return callback?.({ error: 'docId が不正です' });
-            const snap = await collabDocsCol().doc(docId).get();
-            if (!snap.exists) return callback?.({ error: 'ドキュメントが見つかりません' });
-            const data = snap.data();
-            const role = _collabRoleOf(data, currentUserEmail);
-            if (!role) return callback?.({ error: 'このドキュメントへのアクセス権がありません' });
-
-            socket.join(`collab:${docId}`);
-            _collabJoinedRooms.add(docId);
-
-            // 既に部屋にいる人たちのプレゼンスを新規参加者に返す
-            const roomSockets = await io.in(`collab:${docId}`).fetchSockets();
-            const peers = roomSockets
-                .filter(s => s.id !== socket.id)
-                .map(s => ({ email: s.email, role: _collabRoleOf(data, s.email) }));
-
-            // 既存参加者のカーソル一覧
-            const rc = _collabRoomCursors.get(docId);
-            const cursors = rc ? Array.from(rc.values()) : [];
-
-            // ページごとの現在リビジョン番号
-            const docState = _collabDocStates.get(docId);
-            const pageRevs = {};
-            if (docState) {
-                for (const [pIdx, pState] of docState.pages.entries()) {
-                    pageRevs[pIdx] = pState.rev;
-                }
-            }
-
-            socket.to(`collab:${docId}`).emit('collab_presence_joined', { docId, email: currentUserEmail, role });
-            callback?.({ success: true, role, peers, cursors, pageRevs });
-        } catch (e) {
-            console.error('collab_join_room error:', e);
-            callback?.({ error: 'Server error' });
+    // [SEC] 参加時は必ずFirestoreの最新の権限を確認する（キャッシュは使わない）。
+    onCollab('collab_join_room', async ({ docId }, callback) => {
+        const reply = (r) => { if (callback) callback(r); };
+        if (!_isSafeDocId(docId)) return reply({ error: 'docId が不正です' });
+        if (!_collabJoinedRooms.has(docId) && _collabJoinedRooms.size >= COLLAB_MAX_ROOMS_PER_SOCKET) {
+            return reply({ error: '同時に開けるドキュメント数の上限に達しています' });
         }
+        const snap = await collabDocsCol().doc(docId).get();
+        if (!snap.exists) return reply({ error: 'ドキュメントが見つかりません' });
+        const data = snap.data();
+        const role = _collabRoleOf(data, currentUserEmail);
+        if (!role) return reply({ error: 'このドキュメントへのアクセス権がありません' });
+        _collabRoleCacheSet(docId, currentUserEmail, role);
+
+        socket.join(_collabRoom(docId));
+        _collabJoinedRooms.add(docId);
+
+        // 既に部屋にいる人たちのプレゼンスを新規参加者に返す
+        const roomSockets = await io.in(_collabRoom(docId)).fetchSockets();
+        const peers = roomSockets
+            .filter(s => s.id !== socket.id)
+            .map(s => ({ email: s.email, role: _collabRoleOf(data, s.email) }));
+
+        // 既存参加者のカーソル一覧
+        const rc = _collabRoomCursors.get(docId);
+        const cursors = rc ? Array.from(rc.values()) : [];
+
+        // ページごとの現在リビジョン番号
+        const docState = _collabDocStates.get(docId);
+        const pageRevs = {};
+        if (docState) {
+            for (const [pIdx, pState] of docState.pages.entries()) {
+                pageRevs[pIdx] = pState.rev;
+            }
+        }
+
+        socket.to(_collabRoom(docId)).emit('collab_presence_joined', { docId, email: currentUserEmail, role });
+        reply({ success: true, role, peers, cursors, pageRevs });
     });
 
-    socket.on('collab_leave_room', ({ docId }) => {
-        socket.leave(`collab:${docId}`);
-        _collabJoinedRooms.delete(docId);
-        _cleanupCollabRoom(docId);
+    onCollab('collab_leave_room', async ({ docId }) => {
+        if (!_isSafeDocId(docId)) return;
+        socket.leave(_collabRoom(docId));
+        if (_collabJoinedRooms.delete(docId)) _cleanupCollabRoom(docId);
     });
 
-    // 実際の編集内容（セル変更・テキスト差分・図形の移動など）を同室の他ユーザーへ中継。
-    // [SEC] 権限チェックはサーバー側で必ず行う。
+    // 実際の編集内容（テキスト差分・全文置換）を同室の他ユーザーへ中継。
+    // [SEC] 「部屋に参加している」「今この瞬間 editor 以上」「中身の形式が正しい」を毎回サーバー側で確認する。
     // [OT] 競合対策: 送信元の baseRev を考慮し、サーバー間で発生した直近の操作と照らし合わせて位置を自動補正 (OT)
-    socket.on('collab_op', async ({ docId, op }) => {
-        try {
-            if (!docId || !op) return;
-            const snap = await collabDocsCol().doc(docId).get();
-            if (!snap.exists) return;
-            const role = _collabRoleOf(snap.data(), currentUserEmail);
-            if (!_collabHasAtLeast(role, 'editor')) return; // editor未満は変更を送れない
+    onCollab('collab_op', async ({ docId, op }) => {
+        if (!_isSafeDocId(docId) || !socket.rooms.has(_collabRoom(docId))) return;
+        const role = await _collabGetRole(docId, currentUserEmail);
+        if (!role) return _dropFromRoom(docId);
+        if (!_collabHasAtLeast(role, 'editor')) return; // editor未満は変更を送れない
+        const clean = _collabValidateOp(op);
+        if (!clean) return;
 
-            let docState = _collabDocStates.get(docId);
-            if (!docState) {
-                docState = { pages: new Map() };
-                _collabDocStates.set(docId, docState);
-            }
-            const pageIndex = op.pageIndex ?? 0;
-            let pageState = docState.pages.get(pageIndex);
-            if (!pageState) {
-                pageState = { rev: 0, opsHistory: [] };
-                docState.pages.set(pageIndex, pageState);
-            }
+        let docState = _collabDocStates.get(docId);
+        if (!docState) {
+            docState = { lastActive: Date.now(), pages: new Map() };
+            _collabDocStates.set(docId, docState);
+        }
+        docState.lastActive = Date.now();
+        const pageIndex = clean.pageIndex;
+        let pageState = docState.pages.get(pageIndex);
+        if (!pageState) {
+            pageState = { rev: 0, opsHistory: [] };
+            docState.pages.set(pageIndex, pageState);
+        }
 
-            if (op.full) {
-                pageState.rev++;
-                pageState.opsHistory = [];
-                socket.to(`collab:${docId}`).emit('collab_op', {
-                    docId,
-                    op: { ...op, rev: pageState.rev },
-                    from: currentUserEmail,
-                    at: Date.now()
-                });
-                return;
-            }
-
-            let effectivePatch = op.patch;
-            const baseRev = Number(op.baseRev ?? pageState.rev);
-
-            // OT変換: クライアントが古いリビジョンで打鍵していた場合、その間に起きたパッチで位置を補正
-            if (baseRev < pageState.rev && pageState.opsHistory.length > 0 && effectivePatch) {
-                const missedOps = pageState.opsHistory.filter(o => o.rev > baseRev);
-                for (const pastOp of missedOps) {
-                    if (pastOp.patch) {
-                        effectivePatch = _transformPatch(effectivePatch, pastOp.patch);
-                    }
-                }
-            }
-
+        if (clean.full) {
             pageState.rev++;
-            pageState.opsHistory.push({ rev: pageState.rev, patch: effectivePatch, from: currentUserEmail });
-            if (pageState.opsHistory.length > 100) pageState.opsHistory.shift();
-
-            const transformedOp = {
-                ...op,
-                patch: effectivePatch,
-                rev: pageState.rev,
-                baseRev: baseRev
-            };
-
-            socket.to(`collab:${docId}`).emit('collab_op', {
+            pageState.opsHistory = [];
+            socket.to(_collabRoom(docId)).emit('collab_op', {
                 docId,
-                op: transformedOp,
+                op: { ...clean, rev: pageState.rev },
                 from: currentUserEmail,
                 at: Date.now()
             });
+            return;
+        }
 
-            // 送信クライアントへ確定通知（ack）
-            socket.emit('collab_op_ack', {
-                docId,
-                pageIndex,
-                clientOpId: op.clientOpId,
-                rev: pageState.rev
-            });
-        } catch (e) { console.error('collab_op error:', e); }
+        let effectivePatch = clean.patch;
+        // クライアントが「未来のリビジョン」を主張しても、サーバーの現在値を上限とする
+        const baseRev = Math.min(clean.baseRev ?? pageState.rev, pageState.rev);
+
+        // OT変換: クライアントが古いリビジョンで打鍵していた場合、その間に起きたパッチで位置を補正
+        if (baseRev < pageState.rev && pageState.opsHistory.length > 0 && effectivePatch) {
+            const missedOps = pageState.opsHistory.filter(o => o.rev > baseRev);
+            for (const pastOp of missedOps) {
+                if (pastOp.patch) {
+                    effectivePatch = _transformPatch(effectivePatch, pastOp.patch);
+                }
+            }
+        }
+
+        pageState.rev++;
+        pageState.opsHistory.push({ rev: pageState.rev, patch: effectivePatch, from: currentUserEmail });
+        if (pageState.opsHistory.length > 100) pageState.opsHistory.shift();
+
+        const transformedOp = {
+            ...clean,
+            patch: effectivePatch,
+            rev: pageState.rev,
+            baseRev: baseRev
+        };
+
+        socket.to(_collabRoom(docId)).emit('collab_op', {
+            docId,
+            op: transformedOp,
+            from: currentUserEmail,
+            at: Date.now()
+        });
+
+        // 送信クライアントへ確定通知（ack）
+        socket.emit('collab_op_ack', {
+            docId,
+            pageIndex,
+            clientOpId: clean.clientOpId,
+            rev: pageState.rev
+        });
     });
 
     // コメント権限があればコメントの追加/返信も中継（編集はできないがコメントは可、を許容）
-    socket.on('collab_comment', async ({ docId, comment }) => {
-        try {
-            if (!docId || !comment) return;
-            const snap = await collabDocsCol().doc(docId).get();
-            if (!snap.exists) return;
-            const role = _collabRoleOf(snap.data(), currentUserEmail);
-            if (!_collabHasAtLeast(role, 'commenter')) return;
-            socket.to(`collab:${docId}`).emit('collab_comment', { docId, comment, from: currentUserEmail, at: Date.now() });
-        } catch (e) { console.error('collab_comment error:', e); }
+    onCollab('collab_comment', async ({ docId, comment }) => {
+        if (!_isSafeDocId(docId) || !socket.rooms.has(_collabRoom(docId))) return;
+        if (!comment || typeof comment !== 'object') return;
+        if (JSON.stringify(comment).length > 20000) return;
+        const role = await _collabGetRole(docId, currentUserEmail);
+        if (!role) return _dropFromRoom(docId);
+        if (!_collabHasAtLeast(role, 'commenter')) return;
+        socket.to(_collabRoom(docId)).emit('collab_comment', { docId, comment, from: currentUserEmail, at: Date.now() });
     });
 
     // カーソル位置・選択範囲の共有（閲覧権限だけでもOK。キャレットとテキスト選択ハイライト情報を含む）
-    socket.on('collab_cursor', async ({ docId, cursor, displayName, color }) => {
-        if (!docId || !socket.rooms.has(`collab:${docId}`)) return; // 参加していない部屋には送れない
+    // [SEC] 部屋に入っていて、かつ「今も」閲覧権限があること。表示名・色は検証/無害化して中継する。
+    onCollab('collab_cursor', async ({ docId, cursor, displayName, color }) => {
+        if (!_isSafeDocId(docId) || !socket.rooms.has(_collabRoom(docId))) return;
+        const role = await _collabGetRole(docId, currentUserEmail);
+        if (!role) return _dropFromRoom(docId);
+        if (cursor !== undefined && cursor !== null) {
+            if (typeof cursor !== 'object' || JSON.stringify(cursor).length > 20000) return;
+        }
         let rc = _collabRoomCursors.get(docId);
         if (!rc) {
             rc = new Map();
@@ -1556,33 +2057,43 @@ io.on('connection', (socket) => {
         const cursorData = {
             docId,
             from: currentUserEmail,
-            displayName: sanitizeString(displayName, 50) || currentUserEmail.split('@')[0],
-            color: color || '#3b82f6',
+            displayName: _cleanLabel(displayName, 50) || currentUserEmail.split('@')[0],
+            color: (typeof color === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(color)) ? color : '#3b82f6',
             cursor,
             updatedAt: Date.now()
         };
         rc.set(currentUserEmail, cursorData);
-        socket.to(`collab:${docId}`).emit('collab_cursor', cursorData);
+        socket.to(_collabRoom(docId)).emit('collab_cursor', cursorData);
     });
 
     // 新規参加者が「今の最新内容」を持っていないため、同室の他の人に一度だけ呼びかけて取り直す。
     // サーバーは中身を保持せず、あくまで橋渡しだけを行う（誰かがdocを開いていないと解決できない点に注意）。
-    socket.on('collab_request_snapshot', ({ docId }) => {
-        if (!docId || !socket.rooms.has(`collab:${docId}`)) return;
-        socket.to(`collab:${docId}`).emit('collab_snapshot_request', { docId, requesterSocketId: socket.id });
+    // [SEC] 要求した時刻を記録しておき、collab_snapshot_response は「実際に要求した相手」にだけ届ける。
+    onCollab('collab_request_snapshot', async ({ docId }) => {
+        if (!_isSafeDocId(docId) || !socket.rooms.has(_collabRoom(docId))) return;
+        const role = await _collabGetRole(docId, currentUserEmail);
+        if (!role) return _dropFromRoom(docId);
+        const last = socket.collabSnapReq.get(docId) || 0;
+        if (Date.now() - last < 2000) return; // 連打防止
+        socket.collabSnapReq.set(docId, Date.now());
+        socket.to(_collabRoom(docId)).emit('collab_snapshot_request', { docId, requesterSocketId: socket.id });
     });
-    // [SEC] 部屋に参加している編集者(editor以上)だけが、同じ部屋の相手にだけスナップショットを返せる
-    socket.on('collab_snapshot_response', async ({ docId, toSocketId, title, pages }) => {
-        try {
-            if (!docId || !toSocketId || !Array.isArray(pages)) return;
-            const room = `collab:${docId}`;
-            if (!socket.rooms.has(room)) return;
-            const target = io.sockets.sockets.get(toSocketId);
-            if (!target || !target.rooms.has(room)) return;
-            const snap = await collabDocsCol().doc(docId).get();
-            if (!snap.exists || !_collabHasAtLeast(_collabRoleOf(snap.data(), currentUserEmail), 'editor')) return;
-            io.to(toSocketId).emit('collab_snapshot', { docId, title, pages });
-        } catch (e) { console.error('collab_snapshot_response error:', e); }
+    // [SEC] 部屋に参加している編集者(editor以上)だけが、「要求してきた」同じ部屋の相手にだけスナップショットを返せる。
+    // 以前は、編集者が部屋内の誰にでも、頼まれていないスナップショットを送って内容を丸ごと差し替えられた。
+    onCollab('collab_snapshot_response', async ({ docId, toSocketId, title, pages }) => {
+        if (!_isSafeDocId(docId) || typeof toSocketId !== 'string' || !Array.isArray(pages)) return;
+        if (pages.length < 1 || pages.length > COLLAB_MAX_PAGES || pages.some(p => typeof p !== 'string')) return;
+        if (pages.reduce((n, p) => n + p.length, 0) > COLLAB_SNAPSHOT_MAX_CHARS) return;
+        const room = _collabRoom(docId);
+        if (!socket.rooms.has(room)) return;
+        const target = io.sockets.sockets.get(toSocketId);
+        if (!target || !target.rooms.has(room)) return;
+        const requestedAt = target.collabSnapReq?.get(docId);
+        if (!requestedAt || Date.now() - requestedAt > 30_000) return;
+        if (!_collabHasAtLeast(await _collabGetRole(docId, currentUserEmail), 'editor')) return;
+        if (!(await _collabGetRole(docId, target.email))) return;
+        target.collabSnapReq.delete(docId); // 1回の要求につき最初の1件だけ受け付ける
+        io.to(toSocketId).emit('collab_snapshot', { docId, title: sanitizeString(title, 200), pages });
     });
 
     const notifyUsers = (userEmails) => {
@@ -1744,6 +2255,7 @@ io.on('connection', (socket) => {
             const from = currentUserEmail;
             await usersCol().doc(from).update({ friends: admin.firestore.FieldValue.arrayRemove(to) });
             await usersCol().doc(to).update({ friends: admin.firestore.FieldValue.arrayRemove(from) });
+            _friendCacheInvalidate(from, to); // [SEC] 解除直後からファイル送信を許可しない
             const chatID = [from, to].sort().join('__');
             await chatsCol().doc(chatID).delete();
             deleteBlobs(chatID).catch(e => console.error('deleteBlobs error:', e));
@@ -1757,12 +2269,27 @@ io.on('connection', (socket) => {
         const to = payload && payload.to;
         if (!isValidEmail(to)) return reply({ ok: false, error: 'invalid_recipient' });
         const chatID = [from, to].sort().join('__');
-        const msgId = payload.id || `${Date.now()}_${nodeCrypto.randomBytes(4).toString('hex')}`;
+        // [SEC] クライアントが指定するidはFirestoreのドキュメントidになるため、パスを壊す文字を含むものは採用しない
+        const msgId = (typeof payload.id === 'string' && payload.id.length <= 200 && _isSafeDocId(payload.id))
+            ? payload.id : `${Date.now()}_${nodeCrypto.randomBytes(4).toString('hex')}`;
         const doc = { ...payload, from, id: msgId, read: false };
         if (doc.fileBlob) {
             const b = doc.fileBlob;
             if (typeof b !== 'object' || b.id !== msgId || !Number.isInteger(b.chunks) || b.chunks < 1 || b.chunks > BLOB_MAX_CHUNKS) {
                 return reply({ ok: false, error: 'invalid_blob' });
+            }
+            // [SEC] 添付は「自分がアップロードした、全チャンクが揃ったもの」だけ送れる。
+            // （他人のアップロードや、存在しないチャンクを指す添付メッセージを作れないようにする）
+            try {
+                const prior = await chatsCol().doc(chatID).collection('messages').doc(msgId).get();
+                if (prior.exists) {
+                    if (prior.data().from !== from) return reply({ ok: false, error: 'invalid_blob' }); // 他人のメッセージidは使えない
+                } else if (!(await _verifyBlobUpload(chatID, msgId, from, b.chunks))) {
+                    return reply({ ok: false, error: 'invalid_blob' });
+                }
+            } catch (e) {
+                console.error('blob verify error:', e);
+                return reply({ ok: false, error: 'persist_failed' });
             }
         }
 
@@ -2719,12 +3246,18 @@ app.get('/mail/unread-count', requireAuth, async (req, res) => {
 // 共同編集（Office系アプリ共通基盤）エンドポイント
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+// [SEC] URLの :docId は "%2F" で "/" を含められ、Firestoreのパスが別のドキュメントを指してしまうため、全ルート共通で検証する
+app.param('docId', (req, res, next, docId) => {
+    if (!_isSafeDocId(docId)) return res.status(400).json({ error: 'docId が不正です' });
+    next();
+});
+
 // ドキュメントの共同編集セッションを作成（まだ無ければ）。appType: 'cell' | 'docs' | 'slides' 等
 app.post('/collab/docs', requireAuth, async (req, res) => {
     try {
         const email = req.user.email;
         const { docId, appType, title } = req.body;
-        if (!docId || typeof docId !== 'string' || docId.length > 200) {
+        if (!_isSafeDocId(docId)) {
             return res.status(400).json({ error: 'docId が不正です' });
         }
         if (!['cell', 'docs', 'slides'].includes(appType)) {
@@ -2848,40 +3381,83 @@ app.post('/collab/docs/:docId/invite', requireAuth, async (req, res) => {
         if (!snap.exists) return res.status(404).json({ error: 'ドキュメントが見つかりません' });
         if (snap.data().ownerEmail !== email) return res.status(403).json({ error: 'オーナーのみ招待コードを発行できます' });
 
-        const code = _generateInviteCode();
-        await collabInvitesCol().doc(code).set({
-            code, docId: req.params.docId, role,
+        // [SEC] 有効な招待コードの数に上限を設け、期限切れのものはここで掃除する
+        const existing = await collabInvitesCol().where('docId', '==', req.params.docId).limit(100).get();
+        const nowTs = Date.now();
+        const expired = existing.docs.filter(d => !(Number(d.data().expiresAt) > nowTs));
+        if (expired.length) {
+            const cleanup = db.batch();
+            expired.forEach(d => cleanup.delete(d.ref));
+            await cleanup.commit().catch(() => { });
+        }
+        if (existing.size - expired.length >= COLLAB_INVITE_MAX_ACTIVE_PER_DOC) {
+            return res.status(429).json({ error: '有効な招待コードが多すぎます。不要なコードの期限が切れるのを待つか、共有リンクを使ってください' });
+        }
+
+        const record = {
+            docId: req.params.docId, role,
             createdBy: email,
-            createdAt: Date.now(),
-            expiresAt: Date.now() + COLLAB_INVITE_TTL_MS,
+            createdAt: nowTs,
+            expiresAt: nowTs + COLLAB_INVITE_TTL_MS,
             maxUses: Math.min(Math.max(Number(maxUses) || 20, 1), COLLAB_INVITE_MAX_USES),
             uses: 0,
-        });
-        res.json({ success: true, code, role, expiresAt: Date.now() + COLLAB_INVITE_TTL_MS });
+        };
+        // [SEC] 既存コードを上書きしないよう create()（衝突したら別のコードで再試行）
+        let code = null;
+        for (let attempt = 0; attempt < 5 && !code; attempt++) {
+            const candidate = _generateInviteCode();
+            try {
+                await collabInvitesCol().doc(candidate).create({ code: candidate, ...record });
+                code = candidate;
+            } catch (e) {
+                if (!(e && (e.code === 6 || /ALREADY_EXISTS/.test(String(e.message))))) throw e;
+            }
+        }
+        if (!code) throw new Error('invite code generation failed');
+        res.json({ success: true, code, role, expiresAt: record.expiresAt });
     } catch (e) { console.error('collab/invite error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
 // 招待コード or 共有リンクのコードでドキュメントに参加（Connect アカウント / ゲスト どちらでも可）
+// [SEC] コードの総当たり対策として、「失敗」だけを別枠で数えて制限する（成功は数えない）。
 app.post('/collab/join', requireCollabAuth, async (req, res) => {
     if (!_rateLimit(req, 'collab-join', 20)) return res.status(429).json({ error: 'リクエストが多すぎます' });
+    const failKeys = [`join-fail:ip:${req.ip}`, `join-fail:user:${req.user.email}`];
     try {
+        if (failKeys.some(k => _failBlocked(k, 15, 10 * 60_000))) {
+            return res.status(429).json({ error: '失敗が続いたため、しばらく待ってからお試しください' });
+        }
         const email = req.user.email;
-        const resolved = await _collabResolveJoinCode(req.body.code);
-        if (resolved.error) return res.status(resolved.error[0]).json({ error: resolved.error[1] });
+        const resolved = await _collabResolveJoinCode(req.body?.code);
+        if (resolved.error) {
+            failKeys.forEach(_failRecord);
+            return res.status(resolved.error[0]).json({ error: resolved.error[1] });
+        }
         const updated = await _collabJoinWith(resolved, email);
         res.json({ success: true, doc: _collabPublicDoc(resolved.docId, updated, email) });
         _collabNotifyJoined(resolved.docId, updated, email);
-    } catch (e) { console.error('collab/join error:', e); res.status(500).json({ error: 'Server error' }); }
+    } catch (e) {
+        if (e instanceof CollabJoinError) { failKeys.forEach(_failRecord); return res.status(e.status).json({ error: e.message }); }
+        console.error('collab/join error:', e); res.status(500).json({ error: 'Server error' });
+    }
 });
 
 // アカウントを持っていない人向け: 共有リンク/招待コードで、自動的に仮ユーザー（ゲスト）を作って参加する
 app.post('/collab/guest-join', async (req, res) => {
     if (!_rateLimit(req, 'collab-guest', 10)) return res.status(429).json({ error: 'リクエストが多すぎます。しばらくしてからお試しください' });
+    const failKey = `join-fail:ip:${req.ip}`;
+    let guest = null;
     try {
         if (!JWT_SECRET) return res.status(500).json({ error: 'サーバー設定エラー' });
+        if (_failBlocked(failKey, 15, 10 * 60_000)) {
+            return res.status(429).json({ error: '失敗が続いたため、しばらくしてからお試しください' });
+        }
         const resolved = await _collabResolveJoinCode(req.body?.code);
-        if (resolved.error) return res.status(resolved.error[0]).json({ error: resolved.error[1] });
-        const guest = await _collabCreateGuest(req.body?.name);
+        if (resolved.error) {
+            _failRecord(failKey);
+            return res.status(resolved.error[0]).json({ error: resolved.error[1] });
+        }
+        guest = await _collabCreateGuest(_cleanLabel(req.body?.name, 30));
         const updated = await _collabJoinWith(resolved, guest.email);
         res.json({
             success: true, token: guest.token,
@@ -2889,7 +3465,12 @@ app.post('/collab/guest-join', async (req, res) => {
             doc: _collabPublicDoc(resolved.docId, updated, guest.email),
         });
         _collabNotifyJoined(resolved.docId, updated, guest.email);
-    } catch (e) { console.error('collab/guest-join error:', e); res.status(500).json({ error: 'Server error' }); }
+    } catch (e) {
+        // 参加に失敗したら、作りかけのゲストを残さない
+        if (guest) collabGuestsCol().doc(guest.email).delete().catch(() => { });
+        if (e instanceof CollabJoinError) { _failRecord(failKey); return res.status(e.status).json({ error: e.message }); }
+        console.error('collab/guest-join error:', e); res.status(500).json({ error: 'Server error' });
+    }
 });
 
 // コラボレーターの権限を個別に変更、または削除（オーナーのみ）
@@ -2912,7 +3493,7 @@ app.post('/collab/docs/:docId/permission', requireAuth, async (req, res) => {
         }
 
         io.to(_userRoom(targetEmail)).emit('collab_permission_changed', { docId: req.params.docId, role: role || null });
-        if (!role) io.in(_userRoom(targetEmail)).socketsLeave(`collab:${req.params.docId}`); // 共有解除したら即座にルームから外す
+        if (!role) _collabKick(req.params.docId, targetEmail); // 共有解除したら即座にルームとカーソル表示から外す
         // 同じドキュメントを開いている全員に、コラボレーター一覧の更新を通知
         io.to(`collab:${req.params.docId}`).emit('collab_collaborators_updated', { docId: req.params.docId });
 
@@ -2967,9 +3548,10 @@ app.post('/collab/docs/:docId/members/bulk', requireAuth, async (req, res) => {
         const next = { ...cur };
         targets.forEach(e => { if (action === 'remove') delete next[e]; else next[e] = role; });
         await docRef.update({ collaborators: next, memberEmails: [data.ownerEmail, ...Object.keys(next)], updatedAt: Date.now() });
+        _collabInvalidateRoles(req.params.docId);
         targets.forEach(e => {
             io.to(_userRoom(e)).emit('collab_permission_changed', { docId: req.params.docId, role: action === 'remove' ? null : role });
-            if (action === 'remove') io.in(_userRoom(e)).socketsLeave(`collab:${req.params.docId}`);
+            if (action === 'remove') _collabKick(req.params.docId, e);
         });
         io.to(`collab:${req.params.docId}`).emit('collab_collaborators_updated', { docId: req.params.docId });
         res.json({ success: true, changed: targets.length });
@@ -3001,6 +3583,11 @@ app.post('/collab/docs/:docId/link', requireAuth, async (req, res) => {
 // サーバーは暗号化済みデータしか見えない（中身は読めない）。
 const BLOB_MAX_CHUNKS = 24;               // 24 × 約700KB ≒ 16MBまで
 const BLOB_CHUNK_LIMIT = 780 * 1024;      // 1チャンクの受付上限（Firestore 1MiB/doc に収まる範囲）
+const BLOB_MAX_TOTAL_BYTES = BLOB_MAX_CHUNKS * BLOB_CHUNK_LIMIT; // 1つの添付ファイル全体の上限
+const BLOB_MAX_PENDING_PER_USER = 8;      // 1人が同時に持てる「未送信のアップロード」数
+const BLOB_DAILY_QUOTA_BYTES = (Number(process.env.BLOB_DAILY_QUOTA_MB) || 1024) * 1024 * 1024; // 1人あたり24時間のアップロード上限
+const BLOB_ORPHAN_TTL_MS = 60 * 60 * 1000;
+
 const _friendCache = new Map();           // `${a}|${b}` → expireAt
 async function _isFriendOf(me, partner) {
     const key = `${me}|${partner}`, hit = _friendCache.get(key);
@@ -3013,6 +3600,10 @@ async function _isFriendOf(me, partner) {
     }
     return ok;
 }
+function _friendCacheInvalidate(a, b) {
+    _friendCache.delete(`${a}|${b}`);
+    _friendCache.delete(`${b}|${a}`);
+}
 function _blobParams(req) {
     const msgId = req.params.msgId, index = Number(req.params.index), partner = String(req.query.partner || '');
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(msgId)) return null;
@@ -3024,8 +3615,50 @@ const blobsCol = (chatID) => chatsCol().doc(chatID).collection('blobs');
 const uploadMarkersCol = () => db.collection('blob_uploads');
 const _markerId = (chatID, msgId) => `${chatID}__${msgId}`;
 
+// 1人あたりの24時間アップロード量の上限（メモリ上の概算。再起動でリセット）
+const _blobQuota = new Map(); // email -> { resetAt, bytes }
+function _blobQuotaTake(email, bytes) {
+    const now = Date.now();
+    let q = _blobQuota.get(email);
+    if (!q || q.resetAt < now) {
+        if (_blobQuota.size > 5000) for (const [k, v] of _blobQuota) if (v.resetAt < now) _blobQuota.delete(k);
+        q = { resetAt: now + 24 * 3600_000, bytes: 0 };
+        _blobQuota.set(email, q);
+    }
+    if (q.bytes + bytes > BLOB_DAILY_QUOTA_BYTES) return false;
+    q.bytes += bytes;
+    return true;
+}
+function _blobQuotaRefund(email, bytes) {
+    const q = _blobQuota.get(email);
+    if (q) q.bytes = Math.max(0, q.bytes - bytes);
+}
+
+// 「送信済みメッセージに紐づいたチャンクか」の確認（送信済みと分かったものだけ短時間キャッシュ）
+const _blobSentCache = new Map(); // `${chatID}__${msgId}` → expireAt
+async function _blobMessageSent(chatID, msgId) {
+    const key = _markerId(chatID, msgId), hit = _blobSentCache.get(key);
+    if (hit && hit > Date.now()) return true;
+    const snap = await chatsCol().doc(chatID).collection('messages').doc(msgId).get();
+    if (!snap.exists) return false;
+    if (_blobSentCache.size > 2000) _blobSentCache.clear();
+    _blobSentCache.set(key, Date.now() + 60_000);
+    return true;
+}
+
+// private_message で添付ファイルを送る時の確認: 本人がアップロードした全チャンクが揃っているか
+async function _verifyBlobUpload(chatID, msgId, uploader, chunks) {
+    const m = await uploadMarkersCol().doc(_markerId(chatID, msgId)).get();
+    if (!m.exists) return false;
+    const d = m.data();
+    if (d.uploader !== uploader) return false;
+    if (d.sizes === undefined) return true; // この修正より前に始まったアップロード（サイズ記録なし）は従来どおり通す
+    for (let i = 0; i < chunks; i++) if (!(Number(d.sizes[i]) > 0)) return false;
+    return true;
+}
+
 // 送信を途中でやめた時など、クライアントから「このアップロードを破棄して」と頼むための窓口。
-// すでにメッセージとして送信済みのものは消さない（409）。
+// すでにメッセージとして送信済みのものは消さない（409）。自分がアップロードした分だけ消せる。
 app.delete('/chat/blob/:msgId', requireAuth, async (req, res) => {
     try {
         if (!_rateLimit(req, 'blob', 600)) return res.status(429).json({ error: 'Too many requests' });
@@ -3041,7 +3674,10 @@ app.delete('/chat/blob/:msgId', requireAuth, async (req, res) => {
             mine.slice(i, i + 400).forEach(d => batch.delete(d.ref));
             await batch.commit();
         }
-        await uploadMarkersCol().doc(_markerId(chatID, msgId)).delete().catch(() => {});
+        // [SEC] 目印（marker）も、自分のものだけ消す（相手が消すと残骸の掃除が効かなくなる）
+        const markerRef = uploadMarkersCol().doc(_markerId(chatID, msgId));
+        const marker = await markerRef.get();
+        if (marker.exists && marker.data().uploader === req.user.email) await markerRef.delete().catch(() => { });
         res.json({ ok: true, deleted: mine.length });
     } catch (e) { console.error('blob discard error:', e); res.status(500).json({ error: 'Server error' }); }
 });
@@ -3050,55 +3686,108 @@ app.delete('/chat/blob/:msgId', requireAuth, async (req, res) => {
 // （ネットワーク断・ブラウザ強制終了・キャンセル直後に遅れて届いたチャンクなど、クライアントから消せなかった分）
 async function sweepOrphanBlobs() {
     try {
-        const cutoff = Date.now() - 60 * 60 * 1000;
-        const snap = await uploadMarkersCol().where('updatedAt', '<', cutoff).limit(50).get();
-        for (const m of snap.docs) {
-            const { chatID, msgId } = m.data();
-            try {
-                const sent = await chatsCol().doc(chatID).collection('messages').doc(msgId).get();
-                if (!sent.exists) await deleteBlobs(chatID, msgId);
-                await m.ref.delete();
-            } catch (e) { console.error('sweep item error:', e); }
+        const cutoff = Date.now() - BLOB_ORPHAN_TTL_MS;
+        for (let round = 0; round < 5; round++) {
+            const snap = await uploadMarkersCol().where('updatedAt', '<', cutoff).limit(100).get();
+            if (snap.empty) break;
+            for (const m of snap.docs) {
+                try {
+                    const { chatID, msgId } = m.data();
+                    if (!chatID || !msgId) { await m.ref.delete(); continue; } // 壊れた目印は捨てる
+                    const sent = await chatsCol().doc(chatID).collection('messages').doc(msgId).get();
+                    if (!sent.exists) await deleteBlobs(chatID, msgId);
+                    await m.ref.delete();
+                } catch (e) { console.error('sweep item error:', e); }
+            }
+            if (snap.size < 100) break;
         }
     } catch (e) { console.error('sweepOrphanBlobs error:', e); }
 }
 setInterval(sweepOrphanBlobs, 15 * 60 * 1000).unref();
 setTimeout(sweepOrphanBlobs, 60 * 1000).unref();
 
+// チャンクのアップロード。
+// [SEC] 以前は、会話の相手が「同じmsgId・同じindex」で上書きでき、送信済みの添付ファイルの中身まで差し替えられた。
+//  - すでにメッセージとして送信済みなら受け付けない（409）
+//  - 目印(marker)とチャンクの「アップロード者」を記録し、本人以外の上書きを拒否（403）
+//  - 添付1つの合計サイズ・同時進行数・1日の総量に上限
 app.post('/chat/blob/:msgId/:index', requireAuth, express.raw({ type: 'application/octet-stream', limit: BLOB_CHUNK_LIMIT }), async (req, res) => {
+    const me = req.user.email;
+    let taken = 0;
     try {
         if (!_rateLimit(req, 'blob', 600)) return res.status(429).json({ error: 'Too many requests' });
         const p = _blobParams(req);
         if (!p) return res.status(400).json({ error: 'Bad request' });
         if (!Buffer.isBuffer(req.body) || req.body.length === 0) return res.status(400).json({ error: 'Empty body' });
-        if (!(await _isFriendOf(req.user.email, p.partner))) return res.status(403).json({ error: '権限がありません' });
+        if (!(await _isFriendOf(me, p.partner))) return res.status(403).json({ error: '権限がありません' });
+
+        const markerRef = uploadMarkersCol().doc(_markerId(p.chatID, p.msgId));
+        const chunkRef = blobsCol(p.chatID).doc(`${p.msgId}_${p.index}`);
+        const msgRef = chatsCol().doc(p.chatID).collection('messages').doc(p.msgId);
+
+        // 新しいアップロードの開始時だけ、未送信のアップロード数の上限を確認する
+        const pre = await markerRef.get();
+        if (!pre.exists) {
+            const pending = await uploadMarkersCol().where('uploader', '==', me).limit(BLOB_MAX_PENDING_PER_USER).select().get();
+            if (pending.size >= BLOB_MAX_PENDING_PER_USER) {
+                return res.status(429).json({ error: '未送信のアップロードが多すぎます。送信またはキャンセルしてから再試行してください' });
+            }
+        }
+        if (!_blobQuotaTake(me, req.body.length)) {
+            return res.status(429).json({ error: '本日のアップロード上限に達しました' });
+        }
+        taken = req.body.length;
+
         const now = Date.now();
-        const batch = db.batch();
-        batch.set(blobsCol(p.chatID).doc(`${p.msgId}_${p.index}`), {
-            msgId: p.msgId, index: p.index, data: req.body, uploader: req.user.email, createdAt: now,
+        const result = await db.runTransaction(async (tx) => {
+            const [marker, chunk, sent] = await Promise.all([tx.get(markerRef), tx.get(chunkRef), tx.get(msgRef)]);
+            if (sent.exists) return 'sent';
+            if (marker.exists && marker.data().uploader !== me) return 'forbidden';
+            if (chunk.exists && chunk.data().uploader !== me) return 'forbidden';
+            const sizes = { ...((marker.exists && marker.data().sizes) || {}), [p.index]: req.body.length };
+            const total = Object.values(sizes).reduce((a, b) => a + Number(b || 0), 0);
+            if (total > BLOB_MAX_TOTAL_BYTES) return 'too_big';
+            tx.set(chunkRef, { msgId: p.msgId, index: p.index, data: req.body, uploader: me, createdAt: now });
+            // 「送信が完了していないアップロード」の目印。メッセージの保存に成功すると消える。
+            // 途中でやめた・アプリを閉じた場合に残るので、掃除処理がこれを頼りに残骸を消す。
+            tx.set(markerRef, {
+                chatID: p.chatID, msgId: p.msgId, uploader: me, updatedAt: now, sizes,
+                createdAt: (marker.exists && marker.data().createdAt) || now,
+            });
+            return 'ok';
         });
-        // 「送信が完了していないアップロード」の目印。メッセージの保存に成功すると消える。
-        // 途中でやめた・アプリを閉じた場合に残るので、掃除処理(下)がこれを頼りに残骸を消す。
-        batch.set(uploadMarkersCol().doc(`${p.chatID}__${p.msgId}`), {
-            chatID: p.chatID, msgId: p.msgId, uploader: req.user.email, updatedAt: now,
-        }, { merge: true });
-        await batch.commit();
+        if (result !== 'ok') {
+            _blobQuotaRefund(me, taken); taken = 0;
+            if (result === 'sent') return res.status(409).json({ error: 'Already sent' });
+            if (result === 'too_big') return res.status(413).json({ error: 'ファイルが大きすぎます' });
+            return res.status(403).json({ error: '権限がありません' });
+        }
+        taken = 0;
         res.json({ ok: true });
-    } catch (e) { console.error('blob upload error:', e); res.status(500).json({ error: 'Server error' }); }
+    } catch (e) {
+        if (taken) _blobQuotaRefund(me, taken);
+        console.error('blob upload error:', e); res.status(500).json({ error: 'Server error' });
+    }
 });
 
+// チャンクのダウンロード。
+// chatID は「認証済み本人 + 相手」から作るので、当事者以外は他人の会話のデータに到達できない。
+// [SEC] さらに、相手が「まだ送信していない（途中の）アップロード」は読めないようにする（本人のものか、送信済みのものだけ）。
 app.get('/chat/blob/:msgId/:index', requireAuth, async (req, res) => {
     try {
         if (!_rateLimit(req, 'blob', 600)) return res.status(429).json({ error: 'Too many requests' });
         const p = _blobParams(req);
         if (!p) return res.status(400).json({ error: 'Bad request' });
-        // chatID は「認証済み本人 + 相手」から作るので、当事者以外は他人の会話のデータに到達できない
         const snap = await blobsCol(p.chatID).doc(`${p.msgId}_${p.index}`).get();
         if (!snap.exists) return res.status(404).json({ error: 'Not found' });
-        const data = snap.data().data;
+        const meta = snap.data();
+        if (meta.uploader !== req.user.email && !(await _blobMessageSent(p.chatID, p.msgId))) {
+            return res.status(404).json({ error: 'Not found' });
+        }
         res.set('Content-Type', 'application/octet-stream');
+        res.set('X-Content-Type-Options', 'nosniff');
         res.set('Cache-Control', 'private, max-age=86400, immutable');
-        res.send(Buffer.from(data));
+        res.send(Buffer.from(meta.data));
     } catch (e) { console.error('blob download error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -3111,5 +3800,17 @@ async function deleteBlobs(chatID, msgId) {
         await batch.commit();
     }
 }
+
+// [SEC] 最後尾の共通エラーハンドラ: 想定外のエラーでスタックトレース等を返さない（サイズ超過/JSON不正は適切なステータスで返す）
+app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'データが大きすぎます' });
+    if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError)) return res.status(400).json({ error: 'リクエストの形式が正しくありません' });
+    console.error('Unhandled error:', err);
+    res.status(500).json({ error: 'Server error' });
+});
+
+// 想定外の非同期エラーでプロセスごと落ちないようにログだけ残す
+process.on('unhandledRejection', (reason) => console.error('[unhandledRejection]', reason));
 
 server.listen(PORT, () => console.log(`Rivift Connect Server v6.0 (Firebase) is running on port ${PORT}`));
