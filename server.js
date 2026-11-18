@@ -361,6 +361,26 @@ function _cleanLabel(str, maxLen) {
     return sanitizeString(str, maxLen * 2).replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, maxLen);
 }
 
+// [SEC] アイコン画像 / URL の安全検証（属性脱出文字や危険スキームを弾く）
+function _isSafeIconString(val, maxLen = 400000) {
+    if (typeof val !== 'string') return false;
+    const s = val.trim();
+    if (!s || s.length > maxLen) return false;
+    if (/[\u0000-\u001f\u007f<>"'`\\]/.test(s)) return false;
+    if (s.includes('..')) return false;
+    const lower = s.toLowerCase();
+    if (/^(javascript|vbscript|data:text\/html)/i.test(lower)) return false;
+    if (lower.startsWith('data:')) {
+        return /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon|svg\+xml)(?:;charset=[a-z0-9_-]+)?(?:;base64,[A-Za-z0-9+/=\s]+|,[^<>"'`\\]+)$/i.test(s);
+    }
+    if (/^https?:\/\//i.test(s)) return true;
+    if (/^(?:icons\/|\.\/icons\/)[A-Za-z0-9_.%\-\/\u3000-\u9fff\uff00-\uffef]+$/.test(s)) return true;
+    if (/^[A-Za-z0-9_.-]+\.(?:png|svg|webp|jpg|jpeg|gif|ico)$/i.test(s)) return true;
+    if (/^(?:fa[srbld]?|fa-[a-z0-9-]+)(?:\s+(?:fa[srbld]?|fa-[a-z0-9-]+))*$/i.test(s)) return true;
+    // 短い絵文字・テキストアイコン（URLスキームやパス文字は不可）
+    return s.length <= 16 && !/[/:()]/.test(s);
+}
+
 // 失敗回数ベースの制限（招待コードの総当たり対策）。成功は数えない。
 const _failMap = new Map();
 function _failBlocked(key, max, windowMs) {
@@ -783,9 +803,8 @@ const NEARBY_ANIMALS = [
 ];
 
 function _getNearbyGroupKey(handshake) {
-    // [SEC] プロキシ配下では handshake.address (trust proxy有効時) または x-forwarded-for を安全に参照
-    const raw = handshake.address || handshake.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
-    return raw;
+    // [SEC] X-Forwarded-For の左端はクライアント側で偽装できるため、信頼できる計算関数と揃える
+    return _clientIpFromHandshake(handshake);
 }
 
 function _generateNearbyNickname(existingNicknames) {
@@ -981,6 +1000,16 @@ function optionalAuth(req, res, next) {
     next();
 }
 
+// [SEC] サーバーのソースコード・設定ファイル・鍵ファイル等が静的配信されないよう遮断
+app.use((req, res, next) => {
+    let p;
+    try { p = decodeURIComponent(req.path || '/'); } catch { return res.status(400).send('Bad request'); }
+    const blocked = /(?:^|\/)(?:\.[^/]*|server[^/]*\.js|package(?:-lock)?\.json|tsconfig\.json|vite\.config\.[^/]+|metadata\.json|firebase[^/]*\.json|service[-_]?account[^/]*\.json|node_modules(?:\/|$)|\.aistudio(?:\/|$))/i;
+    if (blocked.test(p) || /\.(?:ts|tsx|map|log|env|bak)$/i.test(p)) {
+        return res.status(404).send('Not found');
+    }
+    next();
+});
 app.use(express.static(__dirname));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/ping', (req, res) => res.json({ ok: true }));
@@ -990,8 +1019,11 @@ app.post('/createUser', async (req, res) => {
     try {
         const { email, displayName, publicKeyJwk, encryptedPrivateKeyPayload, icon, passwordHash } = req.body;
         if (!isValidEmail(email)) return res.status(400).json({ error: 'メールアドレスが無効です' });
-        const safeDisplayName = sanitizeString(displayName, 50);
+        const safeDisplayName = _cleanLabel(displayName, 50);
         if (!safeDisplayName) return res.status(400).json({ error: '表示名は必須です' });
+        if (icon !== undefined && icon !== null && icon !== '' && !_isSafeIconString(icon, 400000)) {
+            return res.status(400).json({ error: 'アイコンの形式が無効です' });
+        }
         const existing = await getUser(email);
         if (existing) return res.status(400).json({ error: 'User already exists' });
         const userData = {
@@ -1333,23 +1365,33 @@ app.get('/extract', requireAuth, async (req, res) => {
 // Rivift App Store API
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+app.param('id', (req, res, next, id) => {
+    if (!_isSafeDocId(id)) return res.status(400).json({ error: 'IDが不正です' });
+    next();
+});
+
 app.get('/store/apps', async (req, res) => {
     try {
-        const { category = 'all', sort = 'newest', limit = 30, offset = 0 } = req.query;
-        const cacheKey = `${category}|${sort}|${limit}|${offset}`;
-        const cached = _cacheGet(cacheKey);
-        if (cached) return res.json({ apps: cached, _cached: true });
-
+        const category = typeof req.query.category === 'string' ? req.query.category : 'all';
+        const sort = typeof req.query.sort === 'string' ? req.query.sort : 'newest';
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+        const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
         const sortField = sort === 'popular' ? 'downloads' : sort === 'liked' ? 'likeCount' : 'createdAt';
-        const q = appsCol().orderBy(sortField, 'desc');
-        const snap = await q.get();
-        let apps = snap.docs.map(d => {
-            const { htmlContent, ...rest } = d.data();
-            return { id: d.id, ...rest };
-        });
+
+        // [SEC] limit/offset の組み合わせごとにキャッシュミス→全件読み取りになるDoSを防ぐため、ソート済み一覧自体をキャッシュする
+        let allApps = _cacheGet(`raw:${sortField}`);
+        if (!allApps) {
+            const q = appsCol().orderBy(sortField, 'desc');
+            const snap = await q.get();
+            allApps = snap.docs.map(d => {
+                const { htmlContent, ...rest } = d.data();
+                return { id: d.id, ...rest };
+            });
+            _cacheSet(`raw:${sortField}`, allApps);
+        }
+        let apps = allApps;
         if (category && category !== 'all') apps = apps.filter(a => a.category === category);
-        apps = apps.slice(Number(offset), Number(offset) + Number(limit));
-        _cacheSet(cacheKey, apps);
+        apps = apps.slice(offset, offset + limit);
         res.json({ apps });
     } catch (e) { console.error('store/apps error:', e); res.status(500).json({ error: 'Server error' }); }
 });
@@ -1373,31 +1415,39 @@ app.post('/store/apps', express.json({ limit: '10mb' }), requireAuth, async (req
     try {
         const email = req.user.email;
         const { title, description, category, htmlContent, htmlContentGz, iconEmoji, iconImage, version } = req.body;
-        if (!title || (!htmlContent && !htmlContentGz)) return res.status(400).json({ error: 'title, htmlContent は必須です' });
+        const safeTitle = sanitizeString(title, 60);
+        if (!safeTitle || (!htmlContent && !htmlContentGz)) return res.status(400).json({ error: 'title, htmlContent は必須です' });
+        if (iconImage && (!_isSafeIconString(iconImage, 400_000) || !/^data:image\//i.test(String(iconImage).trim()))) {
+            return res.status(400).json({ error: 'アイコン画像の形式が無効です' });
+        }
+        if (iconEmoji && !_isSafeIconString(iconEmoji, 16)) {
+            return res.status(400).json({ error: 'アイコン絵文字が無効です' });
+        }
         const user = await getUser(email);
         if (!user) return res.status(401).json({ error: 'Connectアカウントが見つかりません' });
         let compressedHtml;
         if (htmlContentGz) {
+            if (typeof htmlContentGz !== 'string') return res.status(400).json({ error: 'htmlContentGz が無効です' });
             const estimatedSize = Math.floor(htmlContentGz.length * 0.75);
             if (estimatedSize > APP_HTML_MAX_SIZE * 1.05) return res.status(400).json({ error: 'HTMLが大きすぎます（最大3MB）' });
             compressedHtml = 'gz:' + htmlContentGz;
         } else {
-            if (Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます（最大3MB）' });
+            if (typeof htmlContent !== 'string' || Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます（最大3MB）' });
             compressedHtml = await compressHtmlContent(htmlContent);
         }
         if (iconImage && Buffer.byteLength(iconImage, 'utf8') > 400_000) return res.status(400).json({ error: 'アイコン画像が大きすぎます（最大300KB）' });
         const now = Date.now();
         const docRef = appsCol().doc();
         await docRef.set({
-            title: title.slice(0, 60),
-            description: (description || '').slice(0, 500),
+            title: safeTitle,
+            description: sanitizeString(description, 500),
             category: ['tool', 'game', 'entertainment', 'other'].includes(category) ? category : 'other',
             authorEmail: email,
-            authorName: user.displayName || email,
+            authorName: _cleanLabel(user.displayName || email, 50) || email,
             htmlContent: compressedHtml,
-            iconEmoji: iconImage ? '' : (iconEmoji || '📦').slice(0, 2),
+            iconEmoji: iconImage ? '' : (_cleanLabel(iconEmoji || '📦', 4) || '📦').slice(0, 2),
             iconImage: iconImage || null,
-            version: (version || '1.0.0').slice(0, 20),
+            version: sanitizeString(version || '1.0.0', 20) || '1.0.0',
             downloads: 0,
             likeCount: 0,
             ratingSum: 0,
@@ -1414,32 +1464,42 @@ app.put('/store/apps/:id', express.json({ limit: '10mb' }), requireAuth, async (
     try {
         const email = req.user.email;
         const { title, description, category, htmlContent, iconEmoji, iconImage, version } = req.body;
+        if (iconImage !== undefined && iconImage !== null && iconImage !== '' && (!_isSafeIconString(iconImage, 400_000) || !/^data:image\//i.test(String(iconImage).trim()))) {
+            return res.status(400).json({ error: 'アイコン画像の形式が無効です' });
+        }
+        if (iconEmoji && !_isSafeIconString(iconEmoji, 16)) {
+            return res.status(400).json({ error: 'アイコン絵文字が無効です' });
+        }
         const snap = await appsCol().doc(req.params.id).get();
         if (!snap.exists) return res.status(404).json({ error: 'App not found' });
         if (snap.data().authorEmail !== email) return res.status(403).json({ error: '権限がありません' });
         const update = { updatedAt: Date.now() };
-        if (title) update.title = title.slice(0, 60);
-        if (description !== undefined) update.description = description.slice(0, 500);
+        if (title) {
+            const safeTitle = sanitizeString(title, 60);
+            if (safeTitle) update.title = safeTitle;
+        }
+        if (description !== undefined) update.description = sanitizeString(description, 500);
         if (category) update.category = ['tool', 'game', 'entertainment', 'other'].includes(category) ? category : 'other';
         const { htmlContentGz: putHtmlContentGz } = req.body;
         if (htmlContent || putHtmlContentGz) {
             if (putHtmlContentGz) {
+                if (typeof putHtmlContentGz !== 'string') return res.status(400).json({ error: 'htmlContentGz が無効です' });
                 const estimatedSize = Math.floor(putHtmlContentGz.length * 0.75);
                 if (estimatedSize > APP_HTML_MAX_SIZE * 1.05) return res.status(400).json({ error: 'HTMLが大きすぎます' });
                 update.htmlContent = 'gz:' + putHtmlContentGz;
             } else {
-                if (Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます' });
+                if (typeof htmlContent !== 'string' || Buffer.byteLength(htmlContent, 'utf8') > APP_HTML_MAX_SIZE) return res.status(400).json({ error: 'HTMLが大きすぎます' });
                 update.htmlContent = await compressHtmlContent(htmlContent);
             }
         }
         if (iconImage !== undefined) {
             if (iconImage && Buffer.byteLength(iconImage, 'utf8') > 400_000) return res.status(400).json({ error: 'アイコン画像が大きすぎます' });
             update.iconImage = iconImage || null;
-            update.iconEmoji = iconImage ? '' : (iconEmoji || '📦').slice(0, 2);
+            update.iconEmoji = iconImage ? '' : (_cleanLabel(iconEmoji || '📦', 4) || '📦').slice(0, 2);
         } else if (iconEmoji) {
-            update.iconEmoji = iconEmoji.slice(0, 2);
+            update.iconEmoji = (_cleanLabel(iconEmoji, 4) || '📦').slice(0, 2);
         }
-        if (version) update.version = version.slice(0, 20);
+        if (version) update.version = sanitizeString(version, 20) || '1.0.0';
         await appsCol().doc(req.params.id).update(update);
         _cacheInvalidate();
         res.json({ success: true });
@@ -1460,7 +1520,14 @@ app.delete('/store/apps/:id', requireAuth, async (req, res) => {
 
 app.post('/store/apps/:id/download', async (req, res) => {
     try {
-        await appsCol().doc(req.params.id).update({
+        const dlKey = `${req.ip || 'unknown'}:${req.params.id}`;
+        if (!_keyedRateLimit(dlKey, 'store-dl', 3, 3600_000)) {
+            return res.json({ success: true, throttled: true });
+        }
+        const ref = appsCol().doc(req.params.id);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ error: 'App not found' });
+        await ref.update({
             downloads: admin.firestore.FieldValue.increment(1)
         });
         _cacheInvalidate();
@@ -1470,8 +1537,9 @@ app.post('/store/apps/:id/download', async (req, res) => {
 
 app.get('/store/my-apps', async (req, res) => {
     try {
+        if (!_rateLimit(req, 'store-my-apps', 60)) return res.status(429).json({ error: 'Too many requests' });
         const { email } = req.query;
-        if (!email) return res.status(400).json({ error: 'email is required' });
+        if (!isValidEmail(email)) return res.status(400).json({ error: 'valid email is required' });
         const snap = await appsCol().where('authorEmail', '==', email).get();
         const apps = snap.docs.map(d => {
             const { htmlContent, iconImage, ...rest } = d.data();
@@ -1512,10 +1580,10 @@ app.post('/store/apps/:id/like', requireAuth, async (req, res) => {
     } catch (e) { console.error('like error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-app.get('/store/apps/:id/like', async (req, res) => {
+app.get('/store/apps/:id/like', optionalAuth, async (req, res) => {
     try {
-        const { email } = req.query;
-        if (!email) return res.status(400).json({ error: 'email is required' });
+        const email = req.user ? req.user.email : null;
+        if (!email) return res.json({ liked: false });
         const likeSnap = await appsCol().doc(req.params.id).collection('likes').doc(email).get();
         res.json({ liked: likeSnap.exists });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
@@ -1562,10 +1630,10 @@ app.post('/store/apps/:id/rating', requireAuth, async (req, res) => {
     } catch (e) { console.error('rating error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
-app.get('/store/apps/:id/rating', async (req, res) => {
+app.get('/store/apps/:id/rating', optionalAuth, async (req, res) => {
     try {
-        const { email } = req.query;
-        if (!email) return res.status(400).json({ myScore: null });
+        const email = req.user ? req.user.email : null;
+        if (!email) return res.json({ myScore: null });
         const snap = await appsCol().doc(req.params.id).collection('ratings').doc(email).get();
         res.json({ myScore: snap.exists ? snap.data().score : null });
     } catch (e) { res.status(500).json({ error: 'Server error' }); }
@@ -1613,25 +1681,23 @@ app.post('/store/apps/:id/report', optionalAuth, async (req, res) => {
 app.get('/store/apps/:id/comments', async (req, res) => {
     try {
         const appId = req.params.id;
-        const limit = Math.min(Number(req.query.limit) || 20, 50);
+        const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
         const before = req.query.before ? Number(req.query.before) : null;
 
-        const cacheKey = `${appId}:${limit}:${before || 'latest'}`;
-        const cached = _commentCacheGet(cacheKey);
-        if (cached) return res.json({ comments: cached, _cached: true });
+        let allComments = _commentCacheGet(`${appId}:all`);
+        if (!allComments) {
+            const snap = await commentsCol().where('appId', '==', appId).get();
+            allComments = snap.docs.map(d => {
+                const { email, ...rest } = d.data();
+                return { id: d.id, ...rest };
+            }).sort((a, b) => b.createdAt - a.createdAt);
+            _commentCacheSet(`${appId}:all`, allComments);
+        }
 
-        const snap = await commentsCol().where('appId', '==', appId).get();
-
-        let comments = snap.docs.map(d => {
-            const { email, ...rest } = d.data();
-            return { id: d.id, ...rest };
-        });
-
-        comments.sort((a, b) => b.createdAt - a.createdAt);
-        if (before) comments = comments.filter(c => c.createdAt < before);
+        let comments = allComments;
+        if (before && Number.isFinite(before)) comments = comments.filter(c => c.createdAt < before);
         comments = comments.slice(0, limit);
 
-        _commentCacheSet(cacheKey, comments);
         res.json({ comments });
     } catch (e) { console.error('comments GET error:', e); res.status(500).json({ error: 'Server error' }); }
 });
@@ -1679,6 +1745,7 @@ app.post('/store/apps/:id/comments', requireAuth, async (req, res) => {
 
 app.delete('/store/apps/:id/comments/:commentId', requireAuth, async (req, res) => {
     try {
+        if (!_isSafeDocId(req.params.commentId)) return res.status(400).json({ error: 'Comment ID が不正です' });
         const email = req.user.email;
 
         const commentRef = commentsCol().doc(req.params.commentId);
@@ -2106,11 +2173,12 @@ io.on('connection', (socket) => {
     // [SEC] 以降の全イベントで、"from"（自分側）は必ず currentUserEmail（JWT検証済み）を使う。
     // payloadに from が含まれていても無視し、他人になりすませないようにする。
 
-    socket.on('send_friend_request', async ({ to }, callback) => {
+    socket.on('send_friend_request', async (payload, callback) => {
         try {
+            const to = payload && payload.to;
             const from = (currentUserEmail || '').trim();
-            const target = (to || '').trim();
-            if (!target || !from || target.toLowerCase() === from.toLowerCase()) {
+            const target = (typeof to === 'string' ? to : '').trim();
+            if (!isValidEmail(target) || !from || target.toLowerCase() === from.toLowerCase()) {
                 if (typeof callback === 'function') callback({ error: '無効なメールアドレスです' });
                 return;
             }
@@ -2127,36 +2195,45 @@ io.on('connection', (socket) => {
             if (typeof callback === 'function') callback({ success: true });
         } catch (e) {
             console.error('send_friend_request error:', e);
-            if (typeof callback === 'function') callback({ error: e.message });
+            if (typeof callback === 'function') callback({ error: 'サーバーエラー' });
         }
     });
 
-    socket.on('accept_friend_request', async ({ from: requesterEmail }, callback) => {
+    socket.on('accept_friend_request', async (payload, callback) => {
         try {
+            const requesterEmail = payload && payload.from;
             const to = (currentUserEmail || '').trim();
-            const from = (requesterEmail || '').trim();
-            if (!from || !to || from.toLowerCase() === to.toLowerCase()) {
+            const from = (typeof requesterEmail === 'string' ? requesterEmail : '').trim();
+            if (!isValidEmail(from) || !to || from.toLowerCase() === to.toLowerCase()) {
                 if (typeof callback === 'function') callback({ error: '無効な申請です' });
                 return;
             }
             const fromLower = from.toLowerCase();
             const toLower = to.toLowerCase();
 
-            // 1. 自分のドキュメント: requestsから削除 & friendsに追加
+            // [SEC] 実際に申請が存在するか確認してから承諾する（無断友達追加の防止）
             const toDocRef = usersCol().doc(to);
             const toDoc = await toDocRef.get();
-            if (toDoc.exists) {
-                const curRequests = toDoc.data().requests || [];
-                const updatedRequests = curRequests.filter(e => (e || '').trim().toLowerCase() !== fromLower);
-                const curFriends = toDoc.data().friends || [];
-                const updatedFriends = curFriends.some(e => (e || '').trim().toLowerCase() === fromLower)
-                    ? curFriends
-                    : [...curFriends, from];
-                await toDocRef.update({
-                    requests: updatedRequests,
-                    friends: updatedFriends
-                });
+            if (!toDoc.exists) {
+                if (typeof callback === 'function') callback({ error: 'ユーザーが見つかりません' });
+                return;
             }
+            const curRequests = toDoc.data().requests || [];
+            const hasRequest = curRequests.some(e => (e || '').trim().toLowerCase() === fromLower);
+            if (!hasRequest) {
+                if (typeof callback === 'function') callback({ error: '友達申請が見つかりません' });
+                return;
+            }
+
+            const updatedRequests = curRequests.filter(e => (e || '').trim().toLowerCase() !== fromLower);
+            const curFriends = toDoc.data().friends || [];
+            const updatedFriends = curFriends.some(e => (e || '').trim().toLowerCase() === fromLower)
+                ? curFriends
+                : [...curFriends, from];
+            await toDocRef.update({
+                requests: updatedRequests,
+                friends: updatedFriends
+            });
 
             // 2. 相手のドキュメント: sentRequestsから削除 & friendsに追加
             const fromDocRef = usersCol().doc(from);
@@ -2164,13 +2241,13 @@ io.on('connection', (socket) => {
             if (fromDoc.exists) {
                 const curSent = fromDoc.data().sentRequests || [];
                 const updatedSent = curSent.filter(e => (e || '').trim().toLowerCase() !== toLower);
-                const curFriends = fromDoc.data().friends || [];
-                const updatedFriends = curFriends.some(e => (e || '').trim().toLowerCase() === toLower)
-                    ? curFriends
-                    : [...curFriends, to];
+                const curFriends2 = fromDoc.data().friends || [];
+                const updatedFriends2 = curFriends2.some(e => (e || '').trim().toLowerCase() === toLower)
+                    ? curFriends2
+                    : [...curFriends2, to];
                 await fromDocRef.update({
                     sentRequests: updatedSent,
-                    friends: updatedFriends
+                    friends: updatedFriends2
                 });
             }
 
@@ -2178,15 +2255,16 @@ io.on('connection', (socket) => {
             if (typeof callback === 'function') callback({ success: true });
         } catch (e) {
             console.error('accept_friend_request error:', e);
-            if (typeof callback === 'function') callback({ error: e.message });
+            if (typeof callback === 'function') callback({ error: 'サーバーエラー' });
         }
     });
 
-    socket.on('reject_friend_request', async ({ from: requesterEmail }, callback) => {
+    socket.on('reject_friend_request', async (payload, callback) => {
         try {
+            const requesterEmail = payload && payload.from;
             const to = (currentUserEmail || '').trim();
-            const from = (requesterEmail || '').trim();
-            if (!from || !to || from.toLowerCase() === to.toLowerCase()) return;
+            const from = (typeof requesterEmail === 'string' ? requesterEmail : '').trim();
+            if (!isValidEmail(from) || !to || from.toLowerCase() === to.toLowerCase()) return;
             const fromLower = from.toLowerCase();
             const toLower = to.toLowerCase();
 
@@ -2212,15 +2290,16 @@ io.on('connection', (socket) => {
             if (typeof callback === 'function') callback({ success: true });
         } catch (e) {
             console.error('reject_friend_request error:', e);
-            if (typeof callback === 'function') callback({ error: e.message });
+            if (typeof callback === 'function') callback({ error: 'サーバーエラー' });
         }
     });
 
-    socket.on('cancel_friend_request', async ({ to: targetEmail }, callback) => {
+    socket.on('cancel_friend_request', async (payload, callback) => {
         try {
+            const targetEmail = payload && payload.to;
             const from = (currentUserEmail || '').trim();
-            const target = (targetEmail || '').trim();
-            if (!target || !from || target.toLowerCase() === from.toLowerCase()) return;
+            const target = (typeof targetEmail === 'string' ? targetEmail : '').trim();
+            if (!isValidEmail(target) || !from || target.toLowerCase() === from.toLowerCase()) return;
             const fromLower = from.toLowerCase();
             const targetLower = target.toLowerCase();
 
@@ -2246,12 +2325,14 @@ io.on('connection', (socket) => {
             if (typeof callback === 'function') callback({ success: true });
         } catch (e) {
             console.error('cancel_friend_request error:', e);
-            if (typeof callback === 'function') callback({ error: e.message });
+            if (typeof callback === 'function') callback({ error: 'サーバーエラー' });
         }
     });
 
-    socket.on('delete_friend', async ({ to }) => {
+    socket.on('delete_friend', async (payload) => {
         try {
+            const to = payload && payload.to;
+            if (!isValidEmail(to)) return;
             const from = currentUserEmail;
             await usersCol().doc(from).update({ friends: admin.firestore.FieldValue.arrayRemove(to) });
             await usersCol().doc(to).update({ friends: admin.firestore.FieldValue.arrayRemove(from) });
@@ -2333,7 +2414,8 @@ io.on('connection', (socket) => {
     socket.on('read_receipt', async (payload) => {
         try {
             const readerEmail = currentUserEmail;
-            const writerEmail = payload.to;
+            const writerEmail = payload && payload.to;
+            if (!isValidEmail(writerEmail)) return;
             const chatID = [readerEmail, writerEmail].sort().join('__');
             const unreadSnap = await chatsCol().doc(chatID).collection('messages').where('to', '==', readerEmail).where('read', '==', false).get();
             const batch = db.batch();
@@ -2348,26 +2430,31 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('read_receipt error:', e); }
     });
 
-    socket.on('delete_message', async ({ to, messageId }) => {
+    socket.on('delete_message', async (payload) => {
         try {
+            const to = payload && payload.to;
+            const messageId = payload && payload.messageId;
+            if (!isValidEmail(to) || !_isSafeDocId(messageId)) return;
             const from = currentUserEmail;
             const chatID = [from, to].sort().join('__');
             const msgRef = chatsCol().doc(chatID).collection('messages').doc(messageId);
             const msgSnap = await msgRef.get();
-            if (msgSnap.exists && msgSnap.data().from === from) {
-                // メッセージをDBから完全に削除
-                const _hadBlob = !!msgSnap.data().fileBlob;
-                await msgRef.delete();
-                if (_hadBlob) deleteBlobs(chatID, messageId).catch(e => console.error('deleteBlobs error:', e));
-            }
+            if (!msgSnap.exists || msgSnap.data().from !== from) return;
+            // メッセージをDBから完全に削除し、送信者本人の削除成功時のみ相手へ通知する
+            const _hadBlob = !!msgSnap.data().fileBlob;
+            await msgRef.delete();
+            if (_hadBlob) deleteBlobs(chatID, messageId).catch(e => console.error('deleteBlobs error:', e));
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('message_deleted', { messageId });
             notifyUsers([from, to]);
         } catch (e) { console.error('delete_message error:', e); }
     });
 
-    socket.on('delete_chat', async ({ user1, user2 }) => {
+    socket.on('delete_chat', async (payload) => {
         try {
+            const user1 = payload && payload.user1;
+            const user2 = payload && payload.user2;
+            if (!isValidEmail(user1) || !isValidEmail(user2)) return;
             // [SEC] 自分が関与していないチャットを削除できないようにする
             if (currentUserEmail !== user1 && currentUserEmail !== user2) return;
             const chatID = [user1, user2].sort().join('__');
@@ -2381,22 +2468,29 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('delete_chat error:', e); }
     });
 
-    socket.on('edit_message', async ({ to, messageId, newText }) => {
+    socket.on('edit_message', async (payload) => {
         try {
+            const to = payload && payload.to;
+            const messageId = payload && payload.messageId;
+            const newText = payload && payload.newText;
+            if (!isValidEmail(to) || !_isSafeDocId(messageId) || typeof newText !== 'string' || newText.length === 0 || newText.length > 100000) return;
             const from = currentUserEmail;
             const chatID = [from, to].sort().join('__');
             const msgRef = chatsCol().doc(chatID).collection('messages').doc(messageId);
             const msgSnap = await msgRef.get();
-            if (msgSnap.exists && msgSnap.data().from === from) {
-                await msgRef.update({ editedText: newText, edited: true });
-            }
+            if (!msgSnap.exists || msgSnap.data().from !== from) return;
+            await msgRef.update({ editedText: newText, edited: true });
             const recipientSocketId = onlineUsers[to];
             if (recipientSocketId) io.to(recipientSocketId).emit('message_edited', { messageId, newText });
         } catch (e) { console.error('edit_message error:', e); }
     });
 
-    socket.on('add_reaction', async ({ to, messageId, emoji }) => {
+    socket.on('add_reaction', async (payload) => {
         try {
+            const to = payload && payload.to;
+            const messageId = payload && payload.messageId;
+            const emoji = payload && payload.emoji;
+            if (!isValidEmail(to) || !_isSafeDocId(messageId) || typeof emoji !== 'string' || emoji.length === 0 || emoji.length > 16) return;
             const from = currentUserEmail;
             const chatID = [from, to].sort().join('__');
             const msgRef = chatsCol().doc(chatID).collection('messages').doc(messageId);
@@ -2414,12 +2508,23 @@ io.on('connection', (socket) => {
         } catch (e) { console.error('add_reaction error:', e); }
     });
 
-    socket.on('update_profile', async ({ newDisplayName, newIcon }) => {
+    socket.on('update_profile', async (payload) => {
         try {
+            if (!payload || typeof payload !== 'object') return;
             const email = currentUserEmail; // なりすまし防止：自分のプロフィールしか更新できない
             const updateData = {};
-            if (newDisplayName) updateData.displayName = newDisplayName;
-            if (newIcon) updateData.icon = newIcon;
+            if (payload.newDisplayName !== undefined) {
+                const safeName = _cleanLabel(payload.newDisplayName, 50);
+                if (safeName) updateData.displayName = safeName;
+            }
+            if (payload.newIcon !== undefined) {
+                if (payload.newIcon === null || payload.newIcon === '') {
+                    updateData.icon = null;
+                } else if (_isSafeIconString(payload.newIcon, 400000)) {
+                    updateData.icon = payload.newIcon.trim();
+                }
+            }
+            if (Object.keys(updateData).length === 0) return;
             await usersCol().doc(email).update(updateData);
             const user = await getUser(email);
             if (user) notifyUsers([email, ...(user.friends || [])]);
@@ -2428,7 +2533,7 @@ io.on('connection', (socket) => {
 
     socket.on('webrtc-offer', (payload, ack) => {
         // [FIX] 届いたかどうかを発信側に返す（以前はオフラインだと黙って捨てていた）
-        const delivered = isUserOnline(payload && payload.to);
+        const delivered = !!(payload && isValidEmail(payload.to) && isUserOnline(payload.to));
         if (delivered) {
             io.to(_userRoom(payload.to)).emit('webrtc-offer', {
                 from: socket.email,
@@ -2439,47 +2544,83 @@ io.on('connection', (socket) => {
         if (typeof ack === 'function') ack({ delivered });
     });
     socket.on('webrtc-answer', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-answer', { from: socket.email, answer: payload.answer });
     });
     socket.on('webrtc-ice-candidate', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-ice-candidate', { from: socket.email, candidate: payload.candidate });
     });
     socket.on('webrtc-end-call', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-end-call', { from: socket.email });
     });
     socket.on('webrtc-reject-call', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-reject-call', { from: socket.email });
     });
     socket.on('webrtc-busy', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-busy', { from: socket.email });
     });
     socket.on('webrtc-glare-resolve', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-glare-resolve', { from: socket.email, winner: payload.winner });
     });
     socket.on('webrtc-turn-confirm-request', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-turn-confirm-request', { from: socket.email });
     });
     socket.on('mute_status_changed', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('mute_status_changed', { from: socket.email, isMuted: payload.isMuted });
     });
     socket.on('camera_status_changed', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('camera_status_changed', { from: socket.email, isCameraOff: payload.isCameraOff });
     });
+    socket.on('screen_share_status_changed', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('screen_share_status_changed', { from: socket.email, isSharing: !!payload.isSharing });
+    });
+    socket.on('webrtc-renegotiate-offer', (payload, ack) => {
+        if (!payload || !isValidEmail(payload.to) || !payload.offer) {
+            if (typeof ack === 'function') ack({ delivered: false });
+            return;
+        }
+        const delivered = isUserOnline(payload.to);
+        if (delivered) {
+            io.to(_userRoom(payload.to)).emit('webrtc-renegotiate-offer', {
+                from: socket.email,
+                offer: payload.offer,
+                reason: payload.reason || 'screen',
+            });
+        }
+        if (typeof ack === 'function') ack({ delivered });
+    });
+    socket.on('webrtc-renegotiate-answer', (payload) => {
+        if (!payload || !isValidEmail(payload.to) || !payload.answer) return;
+        const recipientSocketId = onlineUsers[payload.to];
+        if (recipientSocketId) io.to(recipientSocketId).emit('webrtc-renegotiate-answer', { from: socket.email, answer: payload.answer });
+    });
 
     socket.on('live_canvas_invite', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('live_canvas_invite', { from: socket.email });
     });
     socket.on('live_canvas_draw', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('live_canvas_draw', {
             from: socket.email, x: payload.x, y: payload.y,
@@ -2487,21 +2628,25 @@ io.on('connection', (socket) => {
         });
     });
     socket.on('live_canvas_clear', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('live_canvas_clear', { from: socket.email });
     });
 
     socket.on('typing_start', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('typing_start', { from: socket.email });
     });
 
     socket.on('typing_stop', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('typing_stop', { from: socket.email });
     });
 
     socket.on('proximity_offer', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_share_invite', {
             from: socket.email,
@@ -2516,6 +2661,7 @@ io.on('connection', (socket) => {
     // [ADD] 複数ファイル一括共有: 送信前にファイル一覧をまとめて相手に提示し、
     // 「受け取る（全部）」「拒否」「選択してダウンロード」をまとめて判断できるようにする。
     socket.on('proximity_batch_offer', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_batch_invite', {
             from: socket.email,
@@ -2526,6 +2672,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('proximity_batch_response', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (!recipientSocketId) return;
         io.to(recipientSocketId).emit('proximity_batch_response', {
@@ -2537,17 +2684,20 @@ io.on('connection', (socket) => {
     });
 
     socket.on('proximity_share_response', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (!recipientSocketId) return;
         io.to(recipientSocketId).emit('proximity_share_response', { from: socket.email, accepted: payload.accepted });
     });
 
     socket.on('proximity_ready', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_offer', { from: socket.email });
     });
 
     socket.on('proximity_do_answer', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_do_answer', {
             from: socket.email,
@@ -2556,6 +2706,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('proximity_answer', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_answer', {
             from: socket.email,
@@ -2564,6 +2715,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('proximity_ice', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_ice', {
             from: socket.email,
@@ -2572,6 +2724,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('proximity_received', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_received', {
             from: socket.email,
@@ -2580,6 +2733,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('proximity_cancel', (payload) => {
+        if (!payload || !isValidEmail(payload.to)) return;
         const recipientSocketId = onlineUsers[payload.to];
         if (recipientSocketId) io.to(recipientSocketId).emit('proximity_cancel', {
             from: socket.email,
@@ -2754,13 +2908,65 @@ app.post('/auth/verify', requireAuth, async (req, res) => {
     }
 });
 
-app.post('/auth/migrate-password', async (req, res) => {
-    if (!_rateLimit(req, 'migrate-password', 3)) return res.status(429).json({ error: 'リクエストが多すぎます' });
+// [SEC] 旧アカウント移行の本人確認チャレンジ（クライアントの riviftCreateLegacyMigrationProof と対）
+app.post('/auth/migration-challenge', async (req, res) => {
+    if (!_rateLimit(req, 'migration-challenge', 10)) return res.status(429).json({ error: 'リクエストが多すぎます' });
     try {
-        const { email, password } = req.body;
+        const { email } = req.body || {};
+        if (!isValidEmail(email)) return res.status(400).json({ error: 'メールアドレスが無効です' });
+        const user = await getUser(email);
+        if (!user || user.passwordHash || !user.publicKeyJwk) {
+            return res.status(400).json({ error: 'このアカウントは移行対象外です' });
+        }
+        const secretBytes = nodeCrypto.randomBytes(32);
+        const pubKeyObj = nodeCrypto.createPublicKey({ key: user.publicKeyJwk, format: 'jwk' });
+        const encryptedChallenge = nodeCrypto.publicEncrypt(
+            { key: pubKeyObj, padding: nodeCrypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
+            secretBytes
+        ).toString('base64');
+        const challengeId = nodeCrypto.randomBytes(16).toString('hex');
+        await authCodesCol().doc(`mig_${challengeId}`).set({
+            purpose: 'migrate-password',
+            email,
+            expectedProof: secretBytes.toString('hex'),
+            expireAt: Date.now() + 5 * 60_000,
+            attempts: 0,
+        });
+        res.json({ challengeId, encryptedChallenge });
+    } catch (e) { console.error('migration-challenge error:', e); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/migrate-password', async (req, res) => {
+    if (!_rateLimit(req, 'migrate-password', 5)) return res.status(429).json({ error: 'リクエストが多すぎます' });
+    try {
+        const { email, password, challengeId, proof } = req.body || {};
         if (!isValidEmail(email) || typeof password !== 'string' || password.length < 8) {
             return res.status(400).json({ error: '入力が無効です（パスワードは8文字以上必要です）' });
         }
+        if (typeof challengeId !== 'string' || !/^[a-f0-9]{16,64}$/.test(challengeId) || typeof proof !== 'string' || !/^[a-f0-9]{32,128}$/i.test(proof.trim())) {
+            return res.status(403).json({ error: '本人確認の証明が必要です' });
+        }
+
+        const chalRef = authCodesCol().doc(`mig_${challengeId}`);
+        const chalSnap = await chalRef.get();
+        if (!chalSnap.exists) return res.status(403).json({ error: '本人確認チャレンジが無効または期限切れです' });
+        const chal = chalSnap.data();
+        if (chal.purpose !== 'migrate-password' || chal.email !== email || Date.now() > Number(chal.expireAt) || (chal.attempts || 0) >= 5) {
+            await chalRef.delete().catch(() => {});
+            return res.status(403).json({ error: '本人確認チャレンジが無効または期限切れです' });
+        }
+
+        const proofBuf = Buffer.from(proof.trim().toLowerCase(), 'utf8');
+        const expectedBuf = Buffer.from(String(chal.expectedProof).toLowerCase(), 'utf8');
+        const ok = proofBuf.length === expectedBuf.length && nodeCrypto.timingSafeEqual(proofBuf, expectedBuf);
+        if (!ok) {
+            const nextAttempts = (chal.attempts || 0) + 1;
+            if (nextAttempts >= 5) await chalRef.delete().catch(() => {});
+            else await chalRef.update({ attempts: admin.firestore.FieldValue.increment(1) }).catch(() => {});
+            return res.status(403).json({ error: '本人確認に失敗しました' });
+        }
+        await chalRef.delete().catch(() => {});
+
         const user = await getUser(email);
         if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
         if (user.passwordHash) return res.status(400).json({ error: 'このアカウントは既に移行済みです' });
@@ -2955,11 +3161,12 @@ app.post('/auth/update-icon', requireAuth, async (req, res) => {
     try {
         const email = req.user.email;
         const { icon } = req.body;
-        if (typeof icon !== 'string' || icon.length > 400000) {
+        if (icon !== '' && icon !== null && !_isSafeIconString(icon, 400000)) {
             return res.status(400).json({ error: 'iconが無効です' });
         }
-        await usersCol().doc(email).update({ icon });
-        res.json({ success: true, icon });
+        const safeIcon = icon ? String(icon).trim() : null;
+        await usersCol().doc(email).update({ icon: safeIcon });
+        res.json({ success: true, icon: safeIcon });
     } catch (e) { console.error('update-icon error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -3175,7 +3382,7 @@ app.post('/mail/read', requireAuth, async (req, res) => {
     try {
         const email = req.user.email;
         const { messageId } = req.body;
-        if (!messageId) return res.status(400).json({ error: 'messageId は必須です' });
+        if (!_isSafeDocId(messageId)) return res.status(400).json({ error: 'messageId が不正です' });
 
         const ref = mailCol().doc(messageId);
         const snap = await ref.get();
@@ -3191,7 +3398,7 @@ app.post('/mail/trash', requireAuth, async (req, res) => {
     try {
         const email = req.user.email;
         const { messageId } = req.body;
-        if (!messageId) return res.status(400).json({ error: 'messageId は必須です' });
+        if (!_isSafeDocId(messageId)) return res.status(400).json({ error: 'messageId が不正です' });
 
         const ref = mailCol().doc(messageId);
         const snap = await ref.get();
@@ -3208,7 +3415,7 @@ app.post('/mail/delete', requireAuth, async (req, res) => {
     try {
         const email = req.user.email;
         const { messageId } = req.body;
-        if (!messageId) return res.status(400).json({ error: 'messageId は必須です' });
+        if (!_isSafeDocId(messageId)) return res.status(400).json({ error: 'messageId が不正です' });
 
         const ref = mailCol().doc(messageId);
         const snap = await ref.get();
