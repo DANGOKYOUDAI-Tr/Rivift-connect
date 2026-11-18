@@ -1871,6 +1871,12 @@ io.on('connection', (socket) => {
         { urls: 'stun:stun4.l.google.com:19302' }
     ];
 
+    // 通話中に一度でもビデオ/画面共有が使われたら、その通話ではTURN(中継)の認証情報を二度と発行しない
+    function _markCallVideoUsed(a, b) {
+        const s = _activeCallPeers.get(_callPairKey(a, b));
+        if (s) { s.videoUsed = true; s.turnConsent = {}; }
+    }
+
     socket.on('get-ice-servers', async (payload, callback) => {
         if (typeof callback !== 'function') return;
         // [COST/PRIVACY] デフォルトは通信料のかからないP2P+公開STUNのみを使用（明示的にTURN要求があった場合のみTwilioを使用）
@@ -1883,7 +1889,7 @@ io.on('connection', (socket) => {
         const _peer = payload.peer;
         const _sess = isValidEmail(_peer) ? _activeCallPeers.get(_callPairKey(currentUserEmail, _peer)) : null;
         const _consent = _sess && _sess.turnConsent;
-        if (!_sess || _sess.callType !== 'audio' || !_consent || _consent[currentUserEmail] !== true || _consent[_peer] !== true) {
+        if (!_sess || _sess.callType !== 'audio' || _sess.videoUsed || !_consent || _consent[currentUserEmail] !== true || _consent[_peer] !== true) {
             return callback({ iceServers: DEFAULT_ICE_SERVERS, mode: 'p2p-stun', turnDenied: true });
         }
         // [SEC] Twilio TURNクレデンシャルの無制限取得・帯域悪用を防ぐためレート制限と短期キャッシュを適用
@@ -2716,7 +2722,7 @@ io.on('connection', (socket) => {
         if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         const sess = _activeCallPeers.get(_callPairKey(from, to));
-        if (!sess || sess.callType !== 'audio') return; // 音声通話以外ではTURNの同意自体を受け付けない
+        if (!sess || sess.callType !== 'audio' || sess.videoUsed) return; // 音声通話以外(途中でビデオ/画面共有に切替済みを含む)ではTURNの同意自体を受け付けない
         sess.turnConsent = sess.turnConsent || {};
         sess.turnConsent[from] = true; // 依頼した側は同意済み
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('webrtc-turn-confirm-request', { from });
@@ -2729,6 +2735,7 @@ io.on('connection', (socket) => {
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         const sess = _activeCallPeers.get(_callPairKey(from, to));
         if (!sess || sess.callType !== 'audio') return;
+        if (sess.videoUsed) { sess.turnConsent = { [from]: false, [to]: false }; return; }
         sess.turnConsent = sess.turnConsent || {};
         const accepted = payload.accepted === true;
         sess.turnConsent[from] = accepted;
@@ -2749,6 +2756,7 @@ io.on('connection', (socket) => {
         const to = payload && payload.to;
         if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
+        if (!payload.isCameraOff) _markCallVideoUsed(from, to);
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('camera_status_changed', { from, isCameraOff: !!payload.isCameraOff });
     });
 
@@ -2758,6 +2766,7 @@ io.on('connection', (socket) => {
         if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
         if (!_keyedRateLimit(from, 'webrtc-screen-status', 60, 60_000)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
+        if (payload.isSharing) _markCallVideoUsed(from, to);
         if (isUserOnline(to)) {
             const out = { from, isSharing: !!payload.isSharing };
             const sSid = _sanitizeMediaTokenId(payload.screenStreamId);
@@ -2782,6 +2791,7 @@ io.on('connection', (socket) => {
         if (!offer || !_hasActiveCallSession(from, to)) return reply({ delivered: false });
         try { if (!(await _areFriends(from, to))) return reply({ delivered: false, error: 'forbidden' }); } catch (_) { return reply({ delivered: false }); }
         const reason = ALLOWED_RENEGOTIATE_REASONS.has(payload.reason) ? payload.reason : 'screen';
+        if (reason === 'screen' || reason === 'camera') _markCallVideoUsed(from, to);
         const delivered = isUserOnline(to);
         if (delivered) {
             const sess = _activeCallPeers.get(_callPairKey(from, to));
