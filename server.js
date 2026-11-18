@@ -2630,7 +2630,8 @@ io.on('connection', (socket) => {
         const delivered = isUserOnline(to);
         if (delivered) {
             if (_activeCallPeers.size > 5000) _cleanupExpiredCallSessions();
-            _activeCallPeers.set(_callPairKey(from, to), { users: [from, to], state: 'ringing', updatedAt: Date.now(), callType, turnConsent: {} });
+            _activeCallPeers.set(_callPairKey(from, to), { users: [from, to], state: 'ringing', updatedAt: Date.now(), callType, turnConsent: {},
+                offerRecipients: io.sockets.adapter.rooms.get(_userRoom(to))?.size || 1, busySockets: new Set() });
             const outOffer = { from, offer, callType, hasCamera };
             if (screenStreamId) outOffer.screenStreamId = screenStreamId;
             if (screenTrackId) outOffer.screenTrackId = screenTrackId;
@@ -2687,6 +2688,15 @@ io.on('connection', (socket) => {
         const to = payload && payload.to;
         if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
+        // [FIX] 着信は同じアカウントの全端末(全タブ)に届く。1台が「通話中」でも他の端末が着信中なら、発信を切らない。
+        // 着信を受け取った全ての端末が「通話中」と返した場合にだけ、発信側へ busy を伝える。
+        const _s = _activeCallPeers.get(_callPairKey(from, to));
+        if (_s && _s.state === 'ringing') {
+            _s.busySockets = _s.busySockets || new Set();
+            _s.busySockets.add(socket.id);
+            const stillOnline = io.sockets.adapter.rooms.get(_userRoom(from))?.size || 1;
+            if (_s.busySockets.size < Math.min(_s.offerRecipients || 1, stillOnline)) return;
+        }
         _activeCallPeers.delete(_callPairKey(from, to));
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('webrtc-busy', { from });
     });
