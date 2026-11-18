@@ -60,7 +60,13 @@ const collabGuestsCol = () => db.collection('collab_guests');       // { email, 
 const collabInvitesCol = () => db.collection('collab_invites');     // { code, docId, role, createdBy, expiresAt, maxUses, uses }
 
 async function getUser(email) {
-    const snap = await usersCol().doc(email).get();
+    if (!email || typeof email !== 'string') return null;
+    const trimmed = email.trim();
+    if (!trimmed) return null;
+    let snap = await usersCol().doc(trimmed).get();
+    if (!snap.exists && trimmed !== trimmed.toLowerCase()) {
+        snap = await usersCol().doc(trimmed.toLowerCase()).get();
+    }
     return snap.exists ? snap.data() : null;
 }
 
@@ -778,8 +784,12 @@ const authToken = process.env.TWILIO_AUTH_TOKEN;
 // 相手がオンラインなのにオフライン扱い（通話・メッセージが届かない）になっていた。
 // ルームは接続ごとに自動で出入りするので競合しない。複数タブ/複数端末にも同時に届く。
 // 既存コードの `onlineUsers[email]` → `io.to(...)` はそのまま動くよう Proxy で互換を保つ。
-const _userRoom = (email) => `user:${email}`;
-const isUserOnline = (email) => !!email && ((io.sockets.adapter.rooms.get(_userRoom(email))?.size || 0) > 0);
+const _normEmail = (email) => (typeof email === 'string' ? email.trim().toLowerCase() : '');
+const _userRoom = (email) => `user:${_normEmail(email)}`;
+const isUserOnline = (email) => {
+    const norm = _normEmail(email);
+    return !!norm && ((io.sockets.adapter.rooms.get(`user:${norm}`)?.size || 0) > 0);
+};
 const onlineUsers = new Proxy({}, {
     get: (_t, email) => (typeof email === 'string' && isUserOnline(email)) ? _userRoom(email) : undefined,
     set: () => true,
@@ -1889,7 +1899,7 @@ io.on('connection', (socket) => {
         const _peer = payload.peer;
         const _sess = isValidEmail(_peer) ? _activeCallPeers.get(_callPairKey(currentUserEmail, _peer)) : null;
         const _consent = _sess && _sess.turnConsent;
-        if (!_sess || _sess.callType !== 'audio' || _sess.videoUsed || !_consent || _consent[currentUserEmail] !== true || _consent[_peer] !== true) {
+        if (!_sess || _sess.callType !== 'audio' || _sess.videoUsed || !_consent || _consent[_normEmail(currentUserEmail)] !== true || _consent[_normEmail(_peer)] !== true) {
             return callback({ iceServers: DEFAULT_ICE_SERVERS, mode: 'p2p-stun', turnDenied: true });
         }
         // [SEC] Twilio TURNクレデンシャルの無制限取得・帯域悪用を防ぐためレート制限と短期キャッシュを適用
@@ -1935,8 +1945,10 @@ io.on('connection', (socket) => {
     if ((io.sockets.adapter.rooms.get(_userRoom(currentUserEmail))?.size || 0) === 1) {
         notifyFriendsOfStatusChange(currentUserEmail, true);
     }
+    _deliverPendingCallsForUser(currentUserEmail);
     socket.on('login', () => {
         socket.join(_userRoom(currentUserEmail)); // 冪等。念のための再参加
+        _deliverPendingCallsForUser(currentUserEmail);
     });
 
     socket.on('get_initial_statuses', async (payload, callback) => {
@@ -1994,13 +2006,14 @@ io.on('connection', (socket) => {
         if (currentUserEmail) {
             // 再接続の一瞬の切れ目で「オフライン」がチカチカしないよう、3秒待って本当に全接続が無い時だけ通知
             const _em = currentUserEmail;
+            const _emNorm = _normEmail(_em);
             setTimeout(() => {
                 if (!isUserOnline(_em)) {
                     notifyFriendsOfStatusChange(_em, false);
                     // 切断されたユーザーの未終了通話セッションを整理
                     for (const [pk, sess] of _activeCallPeers.entries()) {
-                        if (sess.users.includes(_em)) {
-                            const other = sess.users.find(u => u !== _em);
+                        if (sess.users.some(u => _normEmail(u) === _emNorm)) {
+                            const other = sess.users.find(u => _normEmail(u) !== _emNorm);
                             _activeCallPeers.delete(pk);
                             if (other && isUserOnline(other)) {
                                 io.to(_userRoom(other)).emit('webrtc-end-call', { from: _em });
@@ -2601,7 +2614,7 @@ io.on('connection', (socket) => {
             .then(() => handler(...args))
             .catch((e) => console.error(`[call-signal] ${ev} error:`, e));
     });
-    const _callPairKey = (a, b) => [a, b].sort().join('__');
+    const _callPairKey = (a, b) => [_normEmail(a), _normEmail(b)].sort().join('__');
     const _areFriends = async (a, b) => (await _isFriendOf(a, b)) && (await _isFriendOf(b, a));
     const _hasActiveCallSession = (a, b) => {
         const sess = _activeCallPeers.get(_callPairKey(a, b));
@@ -2618,7 +2631,7 @@ io.on('connection', (socket) => {
         const reply = (r) => { if (typeof ack === 'function') { try { ack(r); } catch (_) {} } };
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from) return reply({ delivered: false });
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from)) return reply({ delivered: false });
         if (!_keyedRateLimit(from, 'webrtc-offer', 20, 60_000)) return reply({ delivered: false, error: 'rate_limited' });
         const offer = _sanitizeSdpDesc(payload.offer, ['offer']);
         if (!offer) return reply({ delivered: false, error: 'invalid_offer' });
@@ -2633,48 +2646,70 @@ io.on('connection', (socket) => {
         } catch (e) {
             return reply({ delivered: false });
         }
-        const delivered = isUserOnline(to);
-        if (delivered) {
-            if (_activeCallPeers.size > 5000) _cleanupExpiredCallSessions();
-            _activeCallPeers.set(_callPairKey(from, to), { users: [from, to], state: 'ringing', updatedAt: Date.now(), callType, turnConsent: {},
-                offerRecipients: io.sockets.adapter.rooms.get(_userRoom(to))?.size || 1, busySockets: new Set() });
-            const outOffer = { from, offer, callType, hasCamera };
-            if (screenStreamId) outOffer.screenStreamId = screenStreamId;
-            if (screenTrackId) outOffer.screenTrackId = screenTrackId;
-            if (screenMid) outOffer.screenMid = screenMid;
-            if (screenMode) outOffer.screenMode = screenMode;
+        const onlineCount = io.sockets.adapter.rooms.get(_userRoom(to))?.size || 0;
+        const recipientOnline = onlineCount > 0;
+        if (_activeCallPeers.size > 5000) _cleanupExpiredCallSessions();
+        const outOffer = { from, offer, callType, hasCamera };
+        if (screenStreamId) outOffer.screenStreamId = screenStreamId;
+        if (screenTrackId) outOffer.screenTrackId = screenTrackId;
+        if (screenMid) outOffer.screenMid = screenMid;
+        if (screenMode) outOffer.screenMode = screenMode;
+        _activeCallPeers.set(_callPairKey(from, to), {
+            users: [from, to],
+            caller: from,
+            callee: to,
+            state: 'ringing',
+            updatedAt: Date.now(),
+            callType,
+            turnConsent: {},
+            offerRecipients: recipientOnline ? onlineCount : 0,
+            busySockets: new Set(),
+            pendingOffer: recipientOnline ? null : outOffer,
+            pendingIceCandidates: [],
+        });
+        if (recipientOnline) {
             io.to(_userRoom(to)).emit('webrtc-offer', outOffer);
         }
-        reply({ delivered });
+        reply({ delivered: true, recipientOnline, queued: !recipientOnline });
     });
 
     onCallSig('webrtc-answer', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from)) return;
         const answer = _sanitizeSdpDesc(payload.answer, ['answer']);
         if (!answer || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         const sess = _activeCallPeers.get(_callPairKey(from, to));
-        if (sess) { sess.state = 'active'; sess.updatedAt = Date.now(); }
+        if (sess) { sess.state = 'active'; sess.pendingOffer = null; sess.pendingIceCandidates = []; sess.updatedAt = Date.now(); }
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('webrtc-answer', { from, answer });
     });
 
     onCallSig('webrtc-ice-candidate', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from)) return;
         if (!_keyedRateLimit(from, 'webrtc-ice', 300, 60_000)) return;
         const candidate = _sanitizeIceCandidate(payload.candidate);
         if (!candidate || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
-        if (isUserOnline(to)) io.to(_userRoom(to)).emit('webrtc-ice-candidate', { from, candidate });
+        if (isUserOnline(to)) {
+            io.to(_userRoom(to)).emit('webrtc-ice-candidate', { from, candidate });
+        } else {
+            const sess = _activeCallPeers.get(_callPairKey(from, to));
+            if (sess && sess.state === 'ringing' && sess.pendingOffer && _normEmail(sess.caller) === _normEmail(from)) {
+                sess.pendingIceCandidates = sess.pendingIceCandidates || [];
+                if (sess.pendingIceCandidates.length < 200) {
+                    sess.pendingIceCandidates.push(candidate);
+                }
+            }
+        }
     });
 
     onCallSig('webrtc-end-call', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from) || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         _activeCallPeers.delete(_callPairKey(from, to));
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('webrtc-end-call', { from });
@@ -2683,7 +2718,7 @@ io.on('connection', (socket) => {
     onCallSig('webrtc-reject-call', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from) || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         _activeCallPeers.delete(_callPairKey(from, to));
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('webrtc-reject-call', { from });
@@ -2692,7 +2727,7 @@ io.on('connection', (socket) => {
     onCallSig('webrtc-busy', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from) || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         // [FIX] 着信は同じアカウントの全端末(全タブ)に届く。1台が「通話中」でも他の端末が着信中なら、発信を切らない。
         // 着信を受け取った全ての端末が「通話中」と返した場合にだけ、発信側へ busy を伝える。
@@ -2710,8 +2745,9 @@ io.on('connection', (socket) => {
     onCallSig('webrtc-glare-resolve', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
-        if (payload.winner !== from && payload.winner !== to) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from) || !_hasActiveCallSession(from, to)) return;
+        const wNorm = _normEmail(payload.winner);
+        if (wNorm !== _normEmail(from) && wNorm !== _normEmail(to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('webrtc-glare-resolve', { from, winner: payload.winner });
     });
@@ -2719,34 +2755,34 @@ io.on('connection', (socket) => {
     onCallSig('webrtc-turn-confirm-request', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from) || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         const sess = _activeCallPeers.get(_callPairKey(from, to));
         if (!sess || sess.callType !== 'audio' || sess.videoUsed) return; // 音声通話以外(途中でビデオ/画面共有に切替済みを含む)ではTURNの同意自体を受け付けない
         sess.turnConsent = sess.turnConsent || {};
-        sess.turnConsent[from] = true; // 依頼した側は同意済み
+        sess.turnConsent[_normEmail(from)] = true; // 依頼した側は同意済み
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('webrtc-turn-confirm-request', { from });
     });
 
     onCallSig('webrtc-turn-confirm-response', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from) || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         const sess = _activeCallPeers.get(_callPairKey(from, to));
         if (!sess || sess.callType !== 'audio') return;
-        if (sess.videoUsed) { sess.turnConsent = { [from]: false, [to]: false }; return; }
+        if (sess.videoUsed) { sess.turnConsent = { [_normEmail(from)]: false, [_normEmail(to)]: false }; return; }
         sess.turnConsent = sess.turnConsent || {};
         const accepted = payload.accepted === true;
-        sess.turnConsent[from] = accepted;
-        if (!accepted) sess.turnConsent[to] = false; // 一方でも拒否したら両者とも無効
+        sess.turnConsent[_normEmail(from)] = accepted;
+        if (!accepted) sess.turnConsent[_normEmail(to)] = false; // 一方でも拒否したら両者とも無効
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('webrtc-turn-confirm-response', { from, accepted });
     });
 
     onCallSig('mute_status_changed', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from) || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('mute_status_changed', { from, isMuted: !!payload.isMuted });
     });
@@ -2754,7 +2790,7 @@ io.on('connection', (socket) => {
     onCallSig('camera_status_changed', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from) || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         if (!payload.isCameraOff) _markCallVideoUsed(from, to);
         if (isUserOnline(to)) io.to(_userRoom(to)).emit('camera_status_changed', { from, isCameraOff: !!payload.isCameraOff });
@@ -2763,7 +2799,7 @@ io.on('connection', (socket) => {
     onCallSig('screen_share_status_changed', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from || !_hasActiveCallSession(from, to)) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from) || !_hasActiveCallSession(from, to)) return;
         if (!_keyedRateLimit(from, 'webrtc-screen-status', 60, 60_000)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
         if (payload.isSharing) _markCallVideoUsed(from, to);
@@ -2785,7 +2821,7 @@ io.on('connection', (socket) => {
         const reply = (r) => { if (typeof ack === 'function') { try { ack(r); } catch (_) {} } };
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from) return reply({ delivered: false });
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from)) return reply({ delivered: false });
         if (!_keyedRateLimit(from, 'webrtc-reneg', 30, 60_000)) return reply({ delivered: false, error: 'rate_limited' });
         const offer = _sanitizeSdpDesc(payload.offer, ['offer']);
         if (!offer || !_hasActiveCallSession(from, to)) return reply({ delivered: false });
@@ -2804,7 +2840,7 @@ io.on('connection', (socket) => {
     onCallSig('webrtc-renegotiate-answer', async (payload) => {
         const from = currentUserEmail;
         const to = payload && payload.to;
-        if (!isValidEmail(to) || to === from) return;
+        if (!isValidEmail(to) || _normEmail(to) === _normEmail(from)) return;
         const answer = _sanitizeSdpDesc(payload.answer, ['answer']);
         if (!answer || !_hasActiveCallSession(from, to)) return;
         try { if (!(await _areFriends(from, to))) return; } catch (_) { return; }
@@ -4034,11 +4070,37 @@ function _cleanupExpiredCallSessions() {
     }
 }
 
+function _deliverPendingCallsForUser(email) {
+    const normTarget = _normEmail(email);
+    if (!normTarget) return;
+    const now = Date.now();
+    for (const [pk, sess] of _activeCallPeers.entries()) {
+        if (!sess || sess.state !== 'ringing' || !sess.pendingOffer) continue;
+        if (now - sess.updatedAt > 60_000) {
+            _activeCallPeers.delete(pk);
+            continue;
+        }
+        if (_normEmail(sess.callee) !== normTarget) continue;
+        const recipients = io.sockets.adapter.rooms.get(_userRoom(normTarget))?.size || 0;
+        if (recipients <= 0) continue;
+        const offerToSend = sess.pendingOffer;
+        const candidatesToSend = Array.isArray(sess.pendingIceCandidates) ? sess.pendingIceCandidates.slice() : [];
+        sess.pendingOffer = null;
+        sess.pendingIceCandidates = [];
+        sess.offerRecipients = recipients;
+        io.to(_userRoom(normTarget)).emit('webrtc-offer', offerToSend);
+        for (const cand of candidatesToSend) {
+            io.to(_userRoom(normTarget)).emit('webrtc-ice-candidate', { from: offerToSend.from, candidate: cand });
+        }
+    }
+}
+
 async function _isFriendOf(me, partner) {
-    const key = `${me}|${partner}`, hit = _friendCache.get(key);
+    const meNorm = _normEmail(me), partnerNorm = _normEmail(partner);
+    const key = `${meNorm}|${partnerNorm}`, hit = _friendCache.get(key);
     if (hit && hit > Date.now()) return true;
     const u = await getUser(me);
-    const ok = !!(u && Array.isArray(u.friends) && u.friends.includes(partner));
+    const ok = !!(u && Array.isArray(u.friends) && u.friends.some(f => _normEmail(f) === partnerNorm));
     if (ok) {
         if (_friendCache.size > 2000) _friendCache.clear();
         _friendCache.set(key, Date.now() + 60_000);
@@ -4046,8 +4108,9 @@ async function _isFriendOf(me, partner) {
     return ok;
 }
 function _friendCacheInvalidate(a, b) {
-    _friendCache.delete(`${a}|${b}`);
-    _friendCache.delete(`${b}|${a}`);
+    const an = _normEmail(a), bn = _normEmail(b);
+    _friendCache.delete(`${an}|${bn}`);
+    _friendCache.delete(`${bn}|${an}`);
 }
 function _blobParams(req) {
     const msgId = req.params.msgId, index = Number(req.params.index), partner = String(req.query.partner || '');
